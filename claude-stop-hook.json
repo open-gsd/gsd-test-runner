@@ -1,0 +1,16 @@
+{
+  "_comment": "Merge the hooks block below into ~/.claude/settings.json. Runs gsd-test-both after Claude finishes a turn IF cwd is the get-shit-done project. Output is capped at 200KB.",
+  "hooks": {
+    "Stop": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "test -f package.json && grep -q '\"name\": \"get-shit-done-cc\"' package.json && gsd-test-both 2>&1 | tail -c 200000 || true"
+          }
+        ]
+      }
+    ]
+  }
+}
