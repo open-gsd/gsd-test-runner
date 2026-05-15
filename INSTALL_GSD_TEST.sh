@@ -176,11 +176,32 @@ pick_host() {
 HOST="$(pick_host)"
 log "host=$HOST  project=$PROJECT_DIR"
 
+# Resolve the remote user's uid/gid/login once — used both for the
+# pre-rsync poisoned-mirror probe and for the in-container chown-back.
+REMOTE_IDS="$(ssh "$HOST" 'printf "%s:%s:%s" "$(id -u)" "$(id -g)" "$(id -un)"')"
+REMOTE_UID="${REMOTE_IDS%%:*}"
+REMOTE_REST="${REMOTE_IDS#*:}"
+REMOTE_GID="${REMOTE_REST%%:*}"
+REMOTE_USER="${REMOTE_REST#*:}"
+
 if $RESET; then
   log "resetting mirror + npm cache on $HOST..."
   ssh "$HOST" "rm -rf ~/$MIRROR_DIR; docker volume rm $NPM_CACHE_VOLUME 2>/dev/null || true; mkdir -p ~/$MIRROR_DIR"
 else
   ssh "$HOST" "mkdir -p ~/$MIRROR_DIR"
+fi
+
+# Unstick poisoned mirrors. A previous run on this host may have written
+# root-owned artifacts into ~/$MIRROR_DIR (any container that ran without
+# --user and without chown-back-before-exec). The next rsync from local
+# would fail with "mkstemp ... Permission denied" because the leaf files
+# are root-owned even though the parent dir is owned by $REMOTE_USER.
+#
+# Probe cheaply; only invoke the privileged cleanup container when needed.
+if ssh "$HOST" "find ~/$MIRROR_DIR -maxdepth 4 ! -user $REMOTE_USER -print -quit 2>/dev/null | grep -q ." 2>/dev/null; then
+  log "mirror has non-$REMOTE_USER files on $HOST — running one-shot chown..."
+  ssh "$HOST" "docker run --rm -v \$HOME/$MIRROR_DIR:/work $IMAGE \
+    chown -R $REMOTE_UID:$REMOTE_GID /work" >/dev/null
 fi
 
 log "rsync → $HOST:~/$MIRROR_DIR"
@@ -235,6 +256,12 @@ echo '» npm ci...' 1>&2
 npm ci --no-audit --no-fund $NPM_FLAGS 1>&2
 $BUILD_BLOCK
 echo '» running tests...' 1>&2
+# Chown the mirror back to the host user before exec. The container runs
+# as root, so npm ci / build artifacts land as root and would poison the
+# bind-mounted mirror for the next rsync. Doing it before exec (not via
+# a trap) keeps the cleanup synchronous with normal exits; abnormal exits
+# are caught by the pre-rsync probe on the next run.
+chown -R $REMOTE_UID:$REMOTE_GID /work 2>/dev/null || true
 exec node --test --test-reporter=/tmp/reporter.mjs --test-concurrency=4 $TEST_TARGETS
 REMOTE_END
 )
