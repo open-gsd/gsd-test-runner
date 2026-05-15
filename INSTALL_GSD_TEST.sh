@@ -368,14 +368,22 @@ cat > "$DEST_BIN/gsd-test-both" <<'__GSDBOTH_END__'
 #   gsd-test-both --no-build            skip build:sdk on both
 #   gsd-test-both tests/foo.test.cjs    specific file(s) on both
 #
-# Output files (override with env vars LOCAL_OUT, DOCKER_OUT):
-#   /tmp/gsd-test-local.jsonl
-#   /tmp/gsd-test-docker.jsonl
+# Output files (override with env vars LOCAL_OUT, DOCKER_OUT, LOCAL_ERR, DOCKER_ERR):
+#   /tmp/gsd-test-local-<pid>.jsonl
+#   /tmp/gsd-test-docker-<pid>.jsonl
+#   /tmp/gsd-test-local-<pid>.err
+#   /tmp/gsd-test-docker-<pid>.err
+#
+# Defaults are per-invocation (suffixed with the shell PID) so concurrent
+# runs from multiple worktrees don't interleave bytes into a shared file
+# and crash the JSON-Lines parser on a split UTF-8 boundary.
 
 set -uo pipefail
 
-LOCAL_OUT="${LOCAL_OUT:-/tmp/gsd-test-local.jsonl}"
-DOCKER_OUT="${DOCKER_OUT:-/tmp/gsd-test-docker.jsonl}"
+LOCAL_OUT="${LOCAL_OUT:-/tmp/gsd-test-local-$$.jsonl}"
+DOCKER_OUT="${DOCKER_OUT:-/tmp/gsd-test-docker-$$.jsonl}"
+LOCAL_ERR="${LOCAL_ERR:-/tmp/gsd-test-local-$$.err}"
+DOCKER_ERR="${DOCKER_ERR:-/tmp/gsd-test-docker-$$.err}"
 
 echo "» local → $LOCAL_OUT" >&2
 echo "» docker → $DOCKER_OUT" >&2
@@ -383,9 +391,9 @@ echo "» docker → $DOCKER_OUT" >&2
 # Args that BOTH runners accept get passed through. Host-specific args (--host,
 # --reset) only make sense for the docker side; pass them via env vars or use
 # gsd-test directly if you need them.
-gsd-test-local "$@" > "$LOCAL_OUT" 2>/tmp/gsd-test-local.err &
+gsd-test-local "$@" > "$LOCAL_OUT" 2>"$LOCAL_ERR" &
 LPID=$!
-gsd-test "$@" > "$DOCKER_OUT" 2>/tmp/gsd-test-docker.err &
+gsd-test "$@" > "$DOCKER_OUT" 2>"$DOCKER_ERR" &
 DPID=$!
 
 wait $LPID; LRC=$?
@@ -396,14 +404,26 @@ echo "" >&2
 # Show stderr tails if either failed badly
 if [[ $LRC -ne 0 && $LRC -ne 1 ]]; then
   echo "--- local stderr (last 20 lines) ---" >&2
-  tail -20 /tmp/gsd-test-local.err >&2 || true
+  tail -20 "$LOCAL_ERR" >&2 || true
 fi
 if [[ $DRC -ne 0 && $DRC -ne 1 ]]; then
   echo "--- docker stderr (last 20 lines) ---" >&2
-  tail -20 /tmp/gsd-test-docker.err >&2 || true
+  tail -20 "$DOCKER_ERR" >&2 || true
 fi
 
 gsd-test-diff "$LOCAL_OUT" "$DOCKER_OUT"
+DIFF_RC=$?
+
+# Surface the actual paths so operators can dig with jq even when the
+# defaults are per-invocation.
+{
+  echo ""
+  echo "» outputs:"
+  echo "    local:  $LOCAL_OUT"
+  echo "    docker: $DOCKER_OUT"
+} >&2
+
+exit $DIFF_RC
 __GSDBOTH_END__
 chmod +x "$DEST_BIN/gsd-test-both"
 
