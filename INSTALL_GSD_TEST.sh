@@ -3,7 +3,7 @@
 #
 # Installs four runnable scripts, a shared JSON reporter, and a local config:
 #   ~/.local/bin/gsd-test          docker remote runner (rsync → Linux host → container)
-#   ~/.local/bin/gsd-test-local    local Mac runner (node --test directly)
+#   ~/.local/bin/gsd-test-local    local Mac runner (native node --test, resource-capped)
 #   ~/.local/bin/gsd-test-both     runs both in parallel + prints a diff
 #   ~/.local/bin/gsd-test-diff     python helper that diffs two JSON Lines outputs
 #   ~/.local/share/gsd-test/reporter.mjs   custom JSON reporter (shared)
@@ -274,16 +274,30 @@ ssh "$HOST" "docker run --rm -i -v ~/$MIRROR_DIR:/work -v $NPM_CACHE_VOLUME:/roo
 __GSDTEST_END__
 chmod +x "$DEST_BIN/gsd-test"
 
-# ---------- gsd-test-local (Mac native runner) ----------
+# ---------- gsd-test-local (Mac native runner, resource-capped) ----------
 echo "» writing gsd-test-local..."
 cat > "$DEST_BIN/gsd-test-local" <<'__GSDLOCAL_END__'
 #!/usr/bin/env bash
-# gsd-test-local — run the GSD test suite on this Mac with JSON Lines output.
+# gsd-test-local — run the GSD test suite on this Mac with JSON Lines output,
+# bounded by hard memory and process-count caps so a runaway test (or an
+# agent spawning hundreds of Node workers) can't blow up the developer's
+# session.
 #
-# Mirrors npm test's pretest chain (build:sdk + lint:skill-deps) so the
-# tested code matches what `npm test` would test. Then runs node --test
-# with the shared JSON reporter, producing the same output format as
-# the dockerized runner so they can be diffed.
+# Caps applied:
+#   - V8 heap per Node process       NODE_OPTIONS=--max-old-space-size=$GSD_NODE_HEAP_MB
+#   - Concurrent test workers        node --test-concurrency=$GSD_TEST_CONCURRENCY
+#   - Virtual memory (best-effort)   ulimit -v $((GSD_MEM_MB * 1024))
+#   - Max user processes             ulimit -u $GSD_PROC_MAX
+#   - Process-group cleanup on exit  setsid + trap → kill -- -$PGID
+#
+# Defaults (override via env):
+#   GSD_NODE_HEAP_MB=2048    # V8 heap cap per Node process (enforced by V8)
+#   GSD_TEST_CONCURRENCY=2   # node --test worker count (was 4)
+#   GSD_MEM_MB=4096          # ulimit -v cap (best-effort on macOS; RLIMIT_AS
+#                            # is honored for new allocations but not all
+#                            # macOS versions enforce strictly — V8 cap above
+#                            # is the reliable backstop)
+#   GSD_PROC_MAX=256         # ulimit -u; per-user, so don't set too low
 #
 # Usage:
 #   gsd-test-local                       all tests
@@ -296,6 +310,12 @@ cat > "$DEST_BIN/gsd-test-local" <<'__GSDLOCAL_END__'
 set -euo pipefail
 
 REPORTER="$HOME/.local/share/gsd-test/reporter.mjs"
+
+# Resource budgets — overridable via env.
+GSD_NODE_HEAP_MB="${GSD_NODE_HEAP_MB:-2048}"
+GSD_TEST_CONCURRENCY="${GSD_TEST_CONCURRENCY:-2}"
+GSD_MEM_MB="${GSD_MEM_MB:-4096}"
+GSD_PROC_MAX="${GSD_PROC_MAX:-256}"
 
 QUIET=false
 VERBOSE=false
@@ -310,7 +330,11 @@ while [[ $# -gt 0 ]]; do
     --help|-h)
       cat <<'USAGE_END' >&2
 Usage: gsd-test-local [--no-build] [--verbose] [--quiet] [test-file...]
-Runs Node tests locally on the Mac, emitting JSON Lines to stdout.
+Runs Node tests natively on the Mac, capped by ulimit + V8 heap caps so a
+runaway test cannot consume more than the configured budget.
+
+Override caps via env vars:
+  GSD_NODE_HEAP_MB, GSD_TEST_CONCURRENCY, GSD_MEM_MB, GSD_PROC_MAX
 USAGE_END
       exit 0 ;;
     *) PASSTHROUGH+=("$1"); shift ;;
@@ -330,6 +354,42 @@ if [[ ! -f "$PROJECT_DIR/package.json" ]]; then
   exit 2
 fi
 cd "$PROJECT_DIR"
+
+# Process-group containment: put this script and all children into a fresh
+# process group, then kill the whole group on exit. Without this, an orphaned
+# node worker can outlive the wrapper and keep eating RAM after Ctrl-C.
+#
+# `setsid` is the GNU coreutils version on macOS via Homebrew, but BSD setsid
+# is usually present too. Fall back to `set -m` (job control) + trap on PGID.
+if [[ -z "${GSD_TEST_GROUPED:-}" ]]; then
+  if command -v setsid >/dev/null 2>&1; then
+    export GSD_TEST_GROUPED=1
+    exec setsid -w "$0" "$@"
+  else
+    # No setsid — use job control. Less robust but better than nothing.
+    set -m
+    PGID=$$
+    trap 'kill -TERM -- -'"$PGID"' 2>/dev/null; sleep 1; kill -KILL -- -'"$PGID"' 2>/dev/null; exit' INT TERM
+  fi
+fi
+
+# Re-trap inside the re-execed copy so Ctrl-C tears down the whole group.
+trap 'pgid=$(ps -o pgid= -p $$ | tr -d " "); kill -TERM -- -"$pgid" 2>/dev/null; sleep 1; kill -KILL -- -"$pgid" 2>/dev/null; exit 130' INT TERM
+
+# Apply ulimit caps. Failures are warnings, not fatal — some macOS shells
+# disallow lowering certain limits if a higher one was already set.
+if ! ulimit -v "$((GSD_MEM_MB * 1024))" 2>/dev/null; then
+  log "warn: could not set ulimit -v $((GSD_MEM_MB * 1024)) KB (macOS RLIMIT_AS may not be enforced)"
+fi
+if ! ulimit -u "$GSD_PROC_MAX" 2>/dev/null; then
+  log "warn: could not set ulimit -u $GSD_PROC_MAX"
+fi
+
+# V8 heap cap — this is the reliable backstop. Enforced inside each Node
+# process regardless of macOS ulimit behavior.
+export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=$GSD_NODE_HEAP_MB"
+
+log "caps: heap=${GSD_NODE_HEAP_MB}MB  concurrency=$GSD_TEST_CONCURRENCY  vm=${GSD_MEM_MB}MB  procs=$GSD_PROC_MAX"
 
 if $VERBOSE; then NPM_FLAGS=""; else NPM_FLAGS="--silent"; fi
 
@@ -352,7 +412,10 @@ else
 fi
 
 log "running tests..."
-exec node --test --test-reporter="$REPORTER" --test-concurrency=4 "${TARGETS[@]}"
+exec node --test \
+  --test-reporter="$REPORTER" \
+  --test-concurrency="$GSD_TEST_CONCURRENCY" \
+  "${TARGETS[@]}"
 __GSDLOCAL_END__
 chmod +x "$DEST_BIN/gsd-test-local"
 
@@ -682,16 +745,41 @@ case-sensitive filesystem, missing system tools, etc. The Mac side is what catch
 bugs that depend on the developer's actual environment. Running both gives you the
 union of both safety nets.
 
+The Mac-side runner is **resource-capped** so an AI agent (or a runaway test) can't
+spawn unbounded Node workers and OOM the developer's session. See "Resource caps"
+below.
+
 ## Installed components
 
 | Path | What |
 |---|---|
 | `~/.local/bin/gsd-test` | Docker remote runner. Rsyncs working tree to a Linux host, runs tests in a one-shot container, returns JSON. |
-| `~/.local/bin/gsd-test-local` | Same tests, run directly on the Mac. |
+| `~/.local/bin/gsd-test-local` | Same tests, run natively on the Mac, capped by ulimit + V8 heap caps. |
 | `~/.local/bin/gsd-test-both` | Runs both in parallel and prints a diff. |
 | `~/.local/bin/gsd-test-diff` | Python helper that compares two JSON Lines outputs. |
 | `~/.local/share/gsd-test/reporter.mjs` | Custom Node test reporter producing JSON Lines (shared by both runners). |
 | `~/.config/gsd-test/hosts` | Your SSH host aliases, one per line. Never pushed. |
+
+## Resource caps (Mac runner)
+
+`gsd-test-local` applies four caps so a runaway test cannot consume the whole Mac:
+
+| Cap | Mechanism | Default | Env override |
+|---|---|---|---|
+| V8 heap per Node process | `NODE_OPTIONS=--max-old-space-size` | 2048 MB | `GSD_NODE_HEAP_MB` |
+| Concurrent test workers | `node --test-concurrency` | 2 | `GSD_TEST_CONCURRENCY` |
+| Virtual memory (best-effort) | `ulimit -v` | 4096 MB | `GSD_MEM_MB` |
+| Max user processes | `ulimit -u` | 256 | `GSD_PROC_MAX` |
+
+The V8 heap cap and `--test-concurrency` are the two reliable ones — V8 enforces
+heap caps internally, and `--test-concurrency` directly bounds the worker pool.
+`ulimit -v` (RLIMIT_AS) is best-effort on macOS — not all releases enforce it
+strictly — so treat it as a backstop, not the primary control.
+
+On startup the script also `setsid`'s into its own process group and traps INT/TERM
+to `kill -- -$PGID`, so Ctrl-C tears down every worker. Without this, orphaned Node
+workers can outlive the wrapper and keep eating RAM — the failure mode this whole
+thing exists to prevent.
 
 ## Configuration
 
@@ -726,9 +814,12 @@ From inside the get-shit-done project:
 
     gsd-test-both                       # run both, print diff (usual case)
     gsd-test                            # docker only
-    gsd-test-local                      # mac only
+    gsd-test-local                      # mac only (resource-capped)
     gsd-test tests/foo.test.cjs         # single test file on docker
     gsd-test-both --no-build            # skip build:sdk for a faster iteration
+
+    # tighten the Mac caps for a specific run:
+    GSD_NODE_HEAP_MB=1024 GSD_TEST_CONCURRENCY=1 gsd-test-local
 
 Output (default): JSON Lines on stdout, progress on stderr.
 With `gsd-test-both`: human diff summary on stdout, progress on stderr.
