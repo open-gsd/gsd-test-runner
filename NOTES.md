@@ -1,18 +1,29 @@
-# Implementation worktree: LegCheckImageVersion + ADR-0011
+# Implementation worktree: images.EnsurePresent + ADR-0012
 
 Slice scope:
-- ADR-0011 capturing the four decisions: sentinel mechanism (OCI label
-  `sh.gsd-test.image-version`), Pipeline→Bench transport (DOCKER_HOST=
-  ssh:// per command), expected-version source (caller-supplied to
-  Pipeline.New), docker abstraction (function-variable swap for tests).
-- internal/pipeline: replace runLegStub with a general runLeg helper
-  that wraps every leg's LegStart/ctx-check/work/LegSuccess/LegFailure
-  protocol. Migrate the 7 still-stubbed methods to runLeg.
-- Implement (p *Pipeline) CheckImageVersion for real:
-  - Compute DOCKER_HOST from bench.Host (empty if "local")
-  - Call dockerInspect (function variable) with the version-label format
-  - Classify result into nil / ImageVersionMismatch / ImageNotPresentError /
-    BenchDockerError
-- Pipeline.New gains an expectedVersion parameter.
+- ADR-0012 covering: Bench-side GHCR auth policy (pre-logged-in,
+  documented), fallback build location (on Bench via DOCKER_HOST=ssh://),
+  EnsurePresent's scope (presence-only — version verification stays in
+  Pipeline.CheckImageVersion per ADR-0011), Dockerfile layout convention
+  (top-level `dockerfiles/<os>.Dockerfile`).
+- internal/images: EnsurePresent function, dockerPull + dockerBuild +
+  dockerInspect function variables (deliberately duplicated from
+  internal/pipeline — see "Known duplication" below), typed errors
+  (PullAuthError, PullNotFoundError, PullDockerError, BuildError,
+  BenchDockerError).
+- internal/images/images_test.go: stub-based unit tests covering all
+  paths and error classifications.
 
-Not in scope: other legs (CopyWorktree, NpmCI, etc.) stay stubbed.
+Not in scope:
+- Real Dockerfile content. The `dockerfiles/` directory layout is
+  documented in ADR-0012 but creating actual Tester Image Dockerfiles
+  is its own concern (a build artifact, not engine logic). Will be a
+  separate slice.
+- internal/dockerexec extraction. The duplication between pipeline and
+  images is intentional for one more cycle — extract after a third leg
+  implementation cements the patterns.
+
+Known duplication: `dockerInspect`, `realDockerInspect`, and
+`dockerExecError` exist in both internal/pipeline and (new) internal/images.
+This is a deliberate Rule-of-Three violation — extract after the next
+leg lands so we have three concrete uses to design against.
