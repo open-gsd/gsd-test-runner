@@ -67,7 +67,7 @@ func resolveRef(t *testing.T, repo, ref string) string {
 // gitRun runs a git command in dir, fataling on error.
 func gitRun(t *testing.T, dir string, args ...string) {
 	t.Helper()
-	exitCode, stderr, err := runGit(context.Background(), dir, args...)
+	exitCode, _, stderr, err := runGit(context.Background(), dir, args...)
 	if err != nil {
 		t.Fatalf("git %v: %v (stderr: %s)", args, err, stderr)
 	}

@@ -175,29 +175,39 @@ func (e *MergeError) Error() string {
 	return fmt.Sprintf("git merge %s into %s failed (exit %d): %s", e.PRSHA, e.BaseSHA, e.ExitCode, strings.TrimSpace(e.Stderr))
 }
 
-// runGit runs git with the given args, returning exit code and combined
-// stderr. Honors ctx cancellation.
-func runGit(ctx context.Context, dir string, args ...string) (exitCode int, stderr string, err error) {
+// runGit runs git with the given args. Captures both stdout and stderr.
+// Returns exit code, captured streams, and any non-exit error (e.g., binary
+// not found). For non-zero git exit, exitCode is set but err is nil — the
+// caller interprets the exit code. Honors ctx cancellation: if ctx is
+// cancelled (pre or mid-exec), returns ctx.Err() directly per the
+// ADR-0014 dec 4 subprocess-cancellation convention.
+func runGit(ctx context.Context, dir string, args ...string) (exitCode int, stdout, stderr string, err error) {
 	cmd := exec.CommandContext(ctx, "git", args...)
 	if dir != "" {
 		cmd.Dir = dir
 	}
-	var stderrBuf bytes.Buffer
+	var stdoutBuf, stderrBuf bytes.Buffer
+	cmd.Stdout = &stdoutBuf
 	cmd.Stderr = &stderrBuf
 
 	runErr := cmd.Run()
+	stdout = stdoutBuf.String()
 	stderr = stderrBuf.String()
 
+	if ctx.Err() != nil {
+		return -1, stdout, stderr, ctx.Err()
+	}
+
 	if runErr == nil {
-		return 0, stderr, nil
+		return 0, stdout, stderr, nil
 	}
 
 	if exitErr, ok := runErr.(*exec.ExitError); ok {
-		return exitErr.ExitCode(), stderr, nil
+		return exitErr.ExitCode(), stdout, stderr, nil
 	}
 
-	// Non-exit error: binary not found, context canceled, etc.
-	return -1, stderr, runErr
+	// Non-exit error: binary not found, etc.
+	return -1, stdout, stderr, runErr
 }
 
 // Construct builds a PR-merged worktree. On success the returned
@@ -279,7 +289,7 @@ func Construct(ctx context.Context, opts Options) (*Worktree, error) {
 	// simplest approach: clone into a known sub-path of scratchPath.
 	cloneTarget := filepath.Join(scratchPath, "repo")
 
-	exitCode, stderr, runErr := runGit(ctx, "", "clone", "--local", opts.SourceRepo, cloneTarget)
+	exitCode, _, stderr, runErr := runGit(ctx, "", "clone", "--local", opts.SourceRepo, cloneTarget)
 	if runErr != nil {
 		return nil, cleanup(&ConstructError{
 			Stage: StageClone,
@@ -301,7 +311,7 @@ func Construct(ctx context.Context, opts Options) (*Worktree, error) {
 	// 4. git -C <cloneTarget> checkout <BaseSHA>
 	// The --local scratch clone has every object the source repo has, so
 	// BaseSHA is directly reachable without any fetch step.
-	exitCode, stderr, runErr = runGit(ctx, cloneTarget, "checkout", opts.BaseSHA)
+	exitCode, _, stderr, runErr = runGit(ctx, cloneTarget, "checkout", opts.BaseSHA)
 	if runErr != nil {
 		return nil, cleanup(&ConstructError{
 			Stage: StageCheckout,
@@ -323,7 +333,7 @@ func Construct(ctx context.Context, opts Options) (*Worktree, error) {
 	// needed: the --local clone already has every object from the source
 	// repo — see docs/adr/0010-prref-resolution-contract.md.
 	mergeMsg := fmt.Sprintf("PR merge of %s into %s", opts.PRSHA, opts.BaseSHA)
-	exitCode, stderr, runErr = runGit(ctx, cloneTarget, "merge", "--no-edit", "-m", mergeMsg, opts.PRSHA)
+	exitCode, _, stderr, runErr = runGit(ctx, cloneTarget, "merge", "--no-edit", "-m", mergeMsg, opts.PRSHA)
 	if runErr != nil {
 		return nil, cleanup(&ConstructError{
 			Stage: StageMerge,
@@ -332,7 +342,7 @@ func Construct(ctx context.Context, opts Options) (*Worktree, error) {
 	}
 	if exitCode != 0 {
 		// Try to list conflicting files.
-		_, conflictOut, _ := runGitWithStdout(ctx, cloneTarget, "diff", "--name-only", "--diff-filter=U")
+		_, conflictOut, _, _ := runGit(ctx, cloneTarget, "diff", "--name-only", "--diff-filter=U")
 		conflictFiles := parseLines(conflictOut)
 		if len(conflictFiles) > 0 {
 			return nil, cleanup(&ConstructError{
@@ -357,29 +367,6 @@ func Construct(ctx context.Context, opts Options) (*Worktree, error) {
 
 	// 6. Success.
 	return &Worktree{path: cloneTarget}, nil
-}
-
-// runGitWithStdout runs git and returns stdout. Used only for the conflict
-// file listing after a failed merge.
-func runGitWithStdout(ctx context.Context, dir string, args ...string) (exitCode int, stdout string, err error) {
-	cmd := exec.CommandContext(ctx, "git", args...)
-	if dir != "" {
-		cmd.Dir = dir
-	}
-	var stdoutBuf bytes.Buffer
-	cmd.Stdout = &stdoutBuf
-
-	runErr := cmd.Run()
-	stdout = stdoutBuf.String()
-
-	if runErr == nil {
-		return 0, stdout, nil
-	}
-
-	if exitErr, ok := runErr.(*exec.ExitError); ok {
-		return exitErr.ExitCode(), stdout, nil
-	}
-	return -1, stdout, runErr
 }
 
 // parseLines splits s on newlines and returns non-empty trimmed lines.
