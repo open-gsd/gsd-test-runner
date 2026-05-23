@@ -389,11 +389,26 @@ func TestClose_Idempotent(t *testing.T) {
 // An error of some kind must be returned; no orphan scratch dir should
 // remain. We do NOT assert on the exact error shape because cancellation
 // can land at any stage.
+//
+// BaseSHA and PRSHA are distinct so the merge is a real operation (not
+// a no-op "already up-to-date"). Previously both were the same SHA,
+// which meant a regression to mid-merge-only cancellation logic could
+// pass silently.
 func TestConstruct_ContextCanceled(t *testing.T) {
 	repo := initRepo(t)
+
+	// Commit A on main — this becomes BaseSHA.
 	commitFile(t, repo, "a.txt", "a", "init")
 
-	sha := resolveRef(t, repo, "main")
+	// PR branch: create feat from main, add commit B — this becomes PRSHA.
+	branch(t, repo, "feat")
+	commitFile(t, repo, "b.txt", "b", "add b")
+
+	// Switch back to main so HEAD is at baseSHA.
+	checkout(t, repo, "main")
+
+	baseSHA := resolveRef(t, repo, "main")
+	prSHA := resolveRef(t, repo, "feat")
 	scratchParent := t.TempDir()
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -401,8 +416,8 @@ func TestConstruct_ContextCanceled(t *testing.T) {
 
 	_, err := Construct(ctx, Options{
 		SourceRepo: repo,
-		BaseSHA:    sha,
-		PRSHA:      sha,
+		BaseSHA:    baseSHA,
+		PRSHA:      prSHA,
 		ScratchDir: scratchParent,
 	})
 	if err == nil {
