@@ -51,12 +51,7 @@ and update any internal import paths (none yet — packages are skeleton-only).
 | `internal/pipeline`    | 0008       | doc.go only |
 | `internal/plan`        | 0009       | doc.go only |
 | `internal/renderer`    | 0009       | doc.go only |
-| `internal/worktree`    | 0002       | doc.go only |
+| `internal/worktree`    | 0002       | Construct(): scratch clone + merge |
+| `internal/refs`        | 0010       | Resolve(): user ref → commit SHA |
 
-`go build ./...` succeeds; `go test ./...` is a no-op (no tests yet).
-
-## Next dispatch
-
-First real implementation should target `internal/worktree/` — it has
-zero internal dependencies, is a leaf node, and writing it will
-surface the remaining open questions from deepening candidate #3.
+`go build ./...` succeeds; `go test ./internal/refs/...` and `go test ./internal/worktree/...` pass.
