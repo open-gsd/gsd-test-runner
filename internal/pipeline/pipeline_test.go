@@ -62,10 +62,11 @@ func TestNew_NilEventChannelOK(t *testing.T) {
 }
 
 // TestPipeline_StepMethods_ReturnLegErrorWithNotImplemented table-tests the
-// 5 still-stubbed step methods: each must return a *LegError whose Cause is
+// 3 still-stubbed step methods: each must return a *LegError whose Cause is
 // ErrNotImplemented and whose Leg field matches the expected leg constant.
 // CheckImageVersion is excluded — it has its own dedicated tests below.
-// Drain and Parse are excluded — they are implemented in this slice.
+// Drain and Parse are excluded — they are implemented in an earlier slice.
+// StartContainer and CopyWorktree are excluded — they are implemented in G1.
 func TestPipeline_StepMethods_ReturnLegErrorWithNotImplemented(t *testing.T) {
 	type stepCase struct {
 		name     string
@@ -73,8 +74,6 @@ func TestPipeline_StepMethods_ReturnLegErrorWithNotImplemented(t *testing.T) {
 		callStep func(*Pipeline, context.Context) error
 	}
 	cases := []stepCase{
-		{"CopyWorktree", LegCopyWorktree, (*Pipeline).CopyWorktree},
-		{"StartContainer", LegStartContainer, (*Pipeline).StartContainer},
 		{"NpmCI", LegNpmCI, (*Pipeline).NpmCI},
 		{"Build", LegBuild, (*Pipeline).Build},
 		{"RunTests", LegRunTests, (*Pipeline).RunTests},
@@ -644,6 +643,254 @@ func TestDrain_PopulatesDiagPath_OnDockerCpFailure(t *testing.T) {
 	// Clean up the temp file that Drain left on disk (kept for diagnosis).
 	if legErr.DiagPath != "" {
 		os.Remove(legErr.DiagPath)
+	}
+}
+
+// stubDockerRun swaps the package-level dockerRun for a function returning
+// the given output/error. Restored via t.Cleanup.
+func stubDockerRun(t *testing.T, out string, err error) {
+	t.Helper()
+	original := dockerRun
+	dockerRun = func(ctx context.Context, b bench.Bench, args []string) (string, error) {
+		return out, err
+	}
+	t.Cleanup(func() { dockerRun = original })
+}
+
+// stubDockerRmCapture swaps dockerRm for a stub that records the args it was
+// called with. Restored via t.Cleanup.
+func stubDockerRmCapture(t *testing.T) *[][]string {
+	t.Helper()
+	original := dockerRm
+	var calls [][]string
+	dockerRm = func(ctx context.Context, b bench.Bench, args []string) (string, error) {
+		calls = append(calls, args)
+		return "", nil
+	}
+	t.Cleanup(func() { dockerRm = original })
+	return &calls
+}
+
+// --- StartContainer dedicated tests ---
+
+// TestStartContainer_Success verifies that when dockerRun succeeds,
+// p.containerID is set to the trimmed stdout and the leg returns nil.
+func TestStartContainer_Success(t *testing.T) {
+	stubDockerRun(t, "abc123def456\n", nil)
+	stubDockerRmCapture(t) // suppress real docker rm in deferred cleanup
+
+	p, _ := newTestPipeline(t, 16)
+	err := p.StartContainer(context.Background())
+	if err != nil {
+		t.Fatalf("expected nil error, got: %v", err)
+	}
+	if p.containerID != "abc123def456" {
+		t.Errorf("expected containerID=%q, got %q", "abc123def456", p.containerID)
+	}
+}
+
+// TestStartContainer_NoSuchImage verifies that when dockerRun returns an
+// ExecError with an image-not-found stderr, the leg returns a *LegError
+// wrapping *ContainerStartError.
+func TestStartContainer_NoSuchImage(t *testing.T) {
+	execErr := &dockerexec.ExecError{
+		Args:     []string{"run", "--rm", "-d"},
+		Stderr:   "Unable to find image 'foo:bar' locally",
+		ExitCode: 125,
+	}
+	stubDockerRun(t, "", execErr)
+	stubDockerRmCapture(t)
+
+	p, _ := newTestPipeline(t, 16)
+	err := p.StartContainer(context.Background())
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	var legErr *LegError
+	if !errors.As(err, &legErr) {
+		t.Fatalf("expected *LegError, got %T: %v", err, err)
+	}
+	if legErr.Leg != LegStartContainer {
+		t.Errorf("expected Leg=LegStartContainer, got %v", legErr.Leg)
+	}
+	var startErr *ContainerStartError
+	if !errors.As(legErr.Cause, &startErr) {
+		t.Fatalf("expected Cause=*ContainerStartError, got %T: %v", legErr.Cause, legErr.Cause)
+	}
+}
+
+// TestStartContainer_DaemonDown verifies that when dockerRun returns an
+// ExecError containing "Cannot connect to the Docker daemon", the leg
+// returns a *LegError wrapping *BenchDockerError.
+func TestStartContainer_DaemonDown(t *testing.T) {
+	execErr := &dockerexec.ExecError{
+		Args:     []string{"run", "--rm", "-d"},
+		Stderr:   "Cannot connect to the Docker daemon at unix:///var/run/docker.sock. Is the docker daemon running?",
+		ExitCode: 1,
+	}
+	stubDockerRun(t, "", execErr)
+	stubDockerRmCapture(t)
+
+	p, _ := newTestPipeline(t, 16)
+	err := p.StartContainer(context.Background())
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	var legErr *LegError
+	if !errors.As(err, &legErr) {
+		t.Fatalf("expected *LegError, got %T: %v", err, err)
+	}
+	var benchErr *BenchDockerError
+	if !errors.As(legErr.Cause, &benchErr) {
+		t.Fatalf("expected Cause=*BenchDockerError, got %T: %v", legErr.Cause, legErr.Cause)
+	}
+}
+
+// --- CopyWorktree dedicated tests ---
+
+// TestCopyWorktree_Success seeds containerID and work, stubs dockerCp to
+// succeed, and asserts no error is returned.
+func TestCopyWorktree_Success(t *testing.T) {
+	p, _ := newTestPipeline(t, 16)
+	p.containerID = "test-container-xyz"
+	// p.work is already set to "/tmp/worktree" by newTestPipeline via New().
+
+	stubDockerCp(t, "", nil)
+
+	err := p.CopyWorktree(context.Background())
+	if err != nil {
+		t.Fatalf("expected nil error, got: %v", err)
+	}
+}
+
+// TestCopyWorktree_NoContainerID verifies that calling CopyWorktree without a
+// containerID returns a *LegError wrapping *CopyInError whose Cause mentions
+// "containerID is empty".
+func TestCopyWorktree_NoContainerID(t *testing.T) {
+	p, _ := newTestPipeline(t, 16)
+	// containerID is empty — StartContainer was never called.
+
+	err := p.CopyWorktree(context.Background())
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	var legErr *LegError
+	if !errors.As(err, &legErr) {
+		t.Fatalf("expected *LegError, got %T: %v", err, err)
+	}
+	if legErr.Leg != LegCopyWorktree {
+		t.Errorf("expected Leg=LegCopyWorktree, got %v", legErr.Leg)
+	}
+	var copyErr *CopyInError
+	if !errors.As(legErr.Cause, &copyErr) {
+		t.Fatalf("expected Cause=*CopyInError, got %T: %v", legErr.Cause, legErr.Cause)
+	}
+	if !strings.Contains(copyErr.Error(), "containerID is empty") {
+		t.Errorf("expected error message to mention 'containerID is empty', got: %v", copyErr)
+	}
+}
+
+// TestCopyWorktree_DockerCpFails verifies that when dockerCp fails, the leg
+// returns a *LegError wrapping *CopyInError that wraps the docker error.
+func TestCopyWorktree_DockerCpFails(t *testing.T) {
+	execErr := &dockerexec.ExecError{
+		Args:     []string{"cp", "/tmp/worktree/.", "test-container:/work"},
+		Stderr:   "Error: No such container: test-container",
+		ExitCode: 1,
+	}
+	stubDockerCp(t, "", execErr)
+
+	p, _ := newTestPipeline(t, 16)
+	p.containerID = "test-container"
+
+	err := p.CopyWorktree(context.Background())
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	var legErr *LegError
+	if !errors.As(err, &legErr) {
+		t.Fatalf("expected *LegError, got %T: %v", err, err)
+	}
+	var copyErr *CopyInError
+	if !errors.As(legErr.Cause, &copyErr) {
+		t.Fatalf("expected Cause=*CopyInError, got %T: %v", legErr.Cause, legErr.Cause)
+	}
+	var gotExecErr *dockerexec.ExecError
+	if !errors.As(copyErr.Cause, &gotExecErr) {
+		t.Fatalf("expected CopyInError.Cause=*dockerexec.ExecError, got %T: %v", copyErr.Cause, copyErr.Cause)
+	}
+}
+
+// --- RunAll cleanup tests ---
+
+// TestRunAll_CleanupRunsAfterSuccess verifies that the Cleanup method invokes
+// dockerRm with the container ID when containerID is non-empty.
+func TestRunAll_CleanupRunsAfterSuccess(t *testing.T) {
+	rmCalls := stubDockerRmCapture(t)
+
+	p, _ := newTestPipeline(t, 16)
+	p.containerID = "container-to-clean"
+
+	p.Cleanup(context.Background())
+
+	if len(*rmCalls) != 1 {
+		t.Fatalf("expected dockerRm called once, got %d times", len(*rmCalls))
+	}
+	found := false
+	for _, arg := range (*rmCalls)[0] {
+		if arg == "container-to-clean" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("expected dockerRm to be called with container ID 'container-to-clean', got args: %v", (*rmCalls)[0])
+	}
+}
+
+// TestRunAll_CleanupRunsAfterFailure verifies that RunAll defers cleanup even
+// when StartContainer succeeds but a later leg fails. We stub dockerRun to
+// return a container ID, stub dockerCp to fail so CopyWorktree fails, and
+// assert dockerRm is still called with the container ID.
+func TestRunAll_CleanupRunsAfterFailure(t *testing.T) {
+	stubDockerRun(t, "cleanup-test-container\n", nil)
+	rmCalls := stubDockerRmCapture(t)
+	// stub dockerInspect so CheckImageVersion passes
+	stubDocker(t, "v0.0.0-test\n", nil)
+	// stub dockerCp to fail so CopyWorktree fails
+	stubDockerCp(t, "", &dockerexec.ExecError{
+		Args:     []string{"cp"},
+		Stderr:   "no such container",
+		ExitCode: 1,
+	})
+
+	p, ch := newTestPipeline(t, 64)
+	// Drain the event channel so Pipeline doesn't block.
+	go func() {
+		for range ch {
+		}
+	}()
+
+	_, err := p.RunAll(context.Background())
+	close(ch)
+
+	if err == nil {
+		t.Fatal("expected error from RunAll (CopyWorktree should fail), got nil")
+	}
+
+	// dockerRm must have been called (by the deferred cleanup in RunAll).
+	if len(*rmCalls) == 0 {
+		t.Fatal("expected dockerRm to be called by RunAll deferred cleanup, got 0 calls")
+	}
+	found := false
+	for _, arg := range (*rmCalls)[0] {
+		if arg == "cleanup-test-container" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("expected dockerRm to be called with 'cleanup-test-container', got args: %v", (*rmCalls)[0])
 	}
 }
 

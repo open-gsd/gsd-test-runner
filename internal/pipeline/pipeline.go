@@ -228,6 +228,58 @@ var dockerCp = func(ctx context.Context, b bench.Bench, args []string) (string, 
 	return dockerexec.Run(ctx, b, append([]string{"cp"}, args...))
 }
 
+// dockerRun is a package-level variable for testability (matches the
+// dockerInspect and dockerCp pattern). Tests swap it for a stub via t.Cleanup.
+// Real implementation delegates to dockerexec.Run for docker run operations.
+// Per ADR-0014 decision 3: one stub per docker subcommand.
+var dockerRun = func(ctx context.Context, b bench.Bench, args []string) (string, error) {
+	return dockerexec.Run(ctx, b, args)
+}
+
+// dockerRm is a package-level variable for testability. Tests swap it for a
+// stub via t.Cleanup. Real implementation delegates to dockerexec.Run for
+// docker rm operations.
+var dockerRm = func(ctx context.Context, b bench.Bench, args []string) (string, error) {
+	return dockerexec.Run(ctx, b, args)
+}
+
+// ContainerStartError is the typed Cause for LegError when StartContainer
+// fails for image-specific reasons (no such image, bad image reference, etc.).
+// Distinct from BenchDockerError which covers transport/daemon failures.
+type ContainerStartError struct {
+	Image    string
+	Stderr   string
+	ExitCode int
+}
+
+func (e *ContainerStartError) Error() string {
+	return fmt.Sprintf("container start failed for image %s (exit=%d): %s",
+		e.Image, e.ExitCode, strings.TrimSpace(e.Stderr))
+}
+
+// CopyInError is the typed Cause for LegError when the CopyWorktree leg fails.
+type CopyInError struct {
+	Cause error
+}
+
+func (e *CopyInError) Error() string {
+	return fmt.Sprintf("copy worktree to container failed: %v", e.Cause)
+}
+
+func (e *CopyInError) Unwrap() error { return e.Cause }
+
+// isBenchInfraFailure returns true when the ExecError's stderr indicates a
+// Bench infrastructure failure (daemon down, SSH refused, permission denied)
+// rather than an image-specific failure (no such image, bad tag, etc.).
+func isBenchInfraFailure(e *dockerexec.ExecError) bool {
+	s := strings.ToLower(e.Stderr)
+	return strings.Contains(s, "cannot connect to the docker daemon") ||
+		strings.Contains(s, "is the docker daemon running") ||
+		strings.Contains(s, "connection refused") ||
+		strings.Contains(s, "permission denied") ||
+		strings.Contains(s, "ssh:") // ssh errors include "ssh: connect to host..."
+}
+
 // DrainError is the typed Cause for LegError when the Drain leg fails.
 // Stage discriminates the failure point within the leg.
 type DrainError struct {
@@ -334,16 +386,63 @@ func (p *Pipeline) checkImageVersionWork(ctx context.Context) func(context.Conte
 	}
 }
 
-// CopyWorktree copies the PR-merged worktree into a fresh container
-// on the Bench (ADR-0002: no bind-mounts).
+// CopyWorktree copies the PR-merged worktree into the running container
+// on the Bench using `docker cp` (ADR-0002: no bind-mounts). StartContainer
+// must have run first (p.containerID must be non-empty). The trailing /.
+// on the source path copies directory contents into /work, preserving dotfiles.
 func (p *Pipeline) CopyWorktree(ctx context.Context) error {
-	return p.runLeg(ctx, LegCopyWorktree, func(_ context.Context) (string, error) { return "", ErrNotImplemented })
+	return p.runLeg(ctx, LegCopyWorktree, func(_ context.Context) (string, error) {
+		if p.containerID == "" {
+			return "", &CopyInError{Cause: errors.New("StartContainer did not run; containerID is empty")}
+		}
+		if p.work == "" {
+			return "", &CopyInError{Cause: errors.New("worktreePath is empty")}
+		}
+		// Trailing /. copies directory contents into /work, preserving dotfiles.
+		src := p.work + "/."
+		dst := p.containerID + ":/work"
+		_, err := dockerCp(ctx, p.bench, []string{src, dst})
+		if err != nil {
+			return "", &CopyInError{Cause: err}
+		}
+		return "", nil
+	})
 }
 
-// StartContainer launches the fresh container with the copied
-// worktree mounted at the expected in-image path.
+// StartContainer launches a fresh idle container on the Bench from the
+// Tester Image. The container runs `sleep infinity` so subsequent legs
+// can docker exec into it. --rm ensures docker removes it on stop, and
+// RunAll additionally defers a `docker rm -f` to handle the running case.
 func (p *Pipeline) StartContainer(ctx context.Context) error {
-	return p.runLeg(ctx, LegStartContainer, func(_ context.Context) (string, error) { return "", ErrNotImplemented })
+	return p.runLeg(ctx, LegStartContainer, func(_ context.Context) (string, error) {
+		imageRef := string(p.image)
+		stdout, err := dockerRun(ctx, p.bench, []string{
+			"run", "--rm", "-d", "--workdir", "/work",
+			imageRef,
+			"sleep", "infinity",
+		})
+		if err != nil {
+			var execErr *dockerexec.ExecError
+			if errors.As(err, &execErr) {
+				if isBenchInfraFailure(execErr) {
+					return "", &BenchDockerError{
+						Bench:    p.bench.Name,
+						Args:     execErr.Args,
+						Stderr:   execErr.Stderr,
+						ExitCode: execErr.ExitCode,
+					}
+				}
+				return "", &ContainerStartError{
+					Image:    imageRef,
+					Stderr:   execErr.Stderr,
+					ExitCode: execErr.ExitCode,
+				}
+			}
+			return "", err
+		}
+		p.containerID = strings.TrimSpace(stdout)
+		return "", nil
+	})
 }
 
 // NpmCI runs `npm ci` inside the container.
@@ -420,14 +519,34 @@ func (p *Pipeline) Parse(ctx context.Context) error {
 // successful Parse (or after RunAll returns nil).
 func (p *Pipeline) Report() report.Report { return p.result }
 
+// Cleanup force-removes the running container if StartContainer ran
+// successfully. Called by RunAll via defer; safe to call with an empty
+// containerID (no-op). Cleanup errors are intentionally discarded — the
+// container was started with --rm so it will be removed when it stops
+// naturally; docker rm -f handles the running case.
+func (p *Pipeline) Cleanup(ctx context.Context) {
+	if p.containerID != "" {
+		_, _ = dockerRm(ctx, p.bench, []string{"rm", "-f", p.containerID})
+	}
+}
+
 // RunAll executes all 8 legs in order, short-circuiting on the first
 // LegError. Returns the Report and nil on success, or a zero Report
-// and the LegError of the first failed leg.
+// and the LegError of the first failed leg. Defers container cleanup so
+// the idle container started by StartContainer is removed even on failure.
 func (p *Pipeline) RunAll(ctx context.Context) (report.Report, error) {
+	// Defer cleanup before legs run so it fires even if a leg panics or fails.
+	// context.Background() is used so cleanup runs even after ctx is canceled.
+	defer func() {
+		if p.containerID != "" {
+			_, _ = dockerRm(context.Background(), p.bench, []string{"rm", "-f", p.containerID})
+		}
+	}()
+
 	legs := []func(context.Context) error{
 		p.CheckImageVersion,
-		p.CopyWorktree,
 		p.StartContainer,
+		p.CopyWorktree,
 		p.NpmCI,
 		p.Build,
 		p.RunTests,
