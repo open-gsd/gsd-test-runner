@@ -7,7 +7,6 @@
 // Worktree handle (Close-on-defer ownership) is established by
 // docs/adr/0009-local-engine-top-level-orchestration.md.
 //
-// The exact failure envelope for "merge conflict" vs "base-fetch
-// failed" vs "scratch-clone setup failed" is the open question
-// deepening candidate #3 will close in a future ADR.
+// Per ADR-0010, the worktree module takes full commit SHAs (resolved via
+// internal/refs), not symbolic refs.
 package worktree

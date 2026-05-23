@@ -16,17 +16,19 @@ import (
 // ScratchDir are required.
 type Options struct {
 	// SourceRepo is the path to the developer's local git repo (the one
-	// the Local Engine is being invoked from). Must contain BaseRef and
-	// PRRef as resolvable git refs.
+	// the Local Engine is being invoked from). Must contain BaseSHA and
+	// PRSHA as objects reachable in the repo.
 	SourceRepo string
 
-	// BaseRef is the target branch the PR merges into (e.g. "main",
-	// "release/v2"). The scratch clone checks this ref out first.
-	BaseRef string
+	// BaseSHA is the full 40-character commit SHA of the target branch the
+	// PR merges into. Resolved from a symbolic ref via internal/refs before
+	// calling Construct — see docs/adr/0010-prref-resolution-contract.md.
+	BaseSHA string
 
-	// PRRef is the branch or commit to merge into BaseRef (e.g.
-	// "feat/foo", a SHA, "origin/feat/foo").
-	PRRef string
+	// PRSHA is the full 40-character commit SHA to merge into BaseSHA.
+	// Resolved from a symbolic ref via internal/refs before calling
+	// Construct — see docs/adr/0010-prref-resolution-contract.md.
+	PRSHA string
 
 	// ScratchDir is the parent directory under which the scratch clone
 	// is created. If empty, os.TempDir() is used. The actual clone goes
@@ -115,7 +117,7 @@ func (e *ConstructError) Unwrap() error { return e.Cause }
 // InvalidOptionsError reports a pre-flight failure: required Options
 // field missing or SourceRepo is not a git repo.
 type InvalidOptionsError struct {
-	Field  string // "SourceRepo", "BaseRef", "PRRef", or "SourceRepo (not a git repo)"
+	Field  string // "SourceRepo", "BaseSHA", "PRSHA", or "SourceRepo (not a git repo)"
 	Detail string
 }
 
@@ -135,42 +137,42 @@ func (e *CloneError) Error() string {
 	return fmt.Sprintf("git clone --local %s %s failed (exit %d): %s", e.SourceRepo, e.ScratchDir, e.ExitCode, strings.TrimSpace(e.Stderr))
 }
 
-// CheckoutError reports that `git checkout <BaseRef>` failed in the
-// scratch clone. Typically means BaseRef is not resolvable in the source
-// repo.
+// CheckoutError reports that `git checkout <BaseSHA>` failed in the
+// scratch clone. Typically means BaseSHA is not a valid object in the
+// source repo.
 type CheckoutError struct {
-	Ref      string
+	SHA      string
 	ExitCode int
 	Stderr   string
 }
 
 func (e *CheckoutError) Error() string {
-	return fmt.Sprintf("git checkout %s failed (exit %d): %s", e.Ref, e.ExitCode, strings.TrimSpace(e.Stderr))
+	return fmt.Sprintf("git checkout %s failed (exit %d): %s", e.SHA, e.ExitCode, strings.TrimSpace(e.Stderr))
 }
 
-// MergeConflictError reports that `git merge <PRRef>` produced conflicts.
+// MergeConflictError reports that `git merge <PRSHA>` produced conflicts.
 // Files lists the conflicting paths (relative to the worktree root).
 type MergeConflictError struct {
-	BaseRef string
-	PRRef   string
+	BaseSHA string
+	PRSHA   string
 	Files   []string
 }
 
 func (e *MergeConflictError) Error() string {
-	return fmt.Sprintf("merge of %s into %s produced %d conflicting file(s): %s", e.PRRef, e.BaseRef, len(e.Files), strings.Join(e.Files, ", "))
+	return fmt.Sprintf("merge of %s into %s produced %d conflicting file(s): %s", e.PRSHA, e.BaseSHA, len(e.Files), strings.Join(e.Files, ", "))
 }
 
-// MergeError reports a non-conflict merge failure (e.g., PRRef does not
-// resolve, merge aborted for an unexpected reason).
+// MergeError reports a non-conflict merge failure (e.g., PRSHA does not
+// exist as a reachable object, merge aborted for an unexpected reason).
 type MergeError struct {
-	BaseRef  string
-	PRRef    string
+	BaseSHA  string
+	PRSHA    string
 	ExitCode int
 	Stderr   string
 }
 
 func (e *MergeError) Error() string {
-	return fmt.Sprintf("git merge %s into %s failed (exit %d): %s", e.PRRef, e.BaseRef, e.ExitCode, strings.TrimSpace(e.Stderr))
+	return fmt.Sprintf("git merge %s into %s failed (exit %d): %s", e.PRSHA, e.BaseSHA, e.ExitCode, strings.TrimSpace(e.Stderr))
 }
 
 // runGit runs git with the given args, returning exit code and combined
@@ -211,16 +213,16 @@ func Construct(ctx context.Context, opts Options) (*Worktree, error) {
 			Cause: &InvalidOptionsError{Field: "SourceRepo", Detail: "must not be empty"},
 		}
 	}
-	if opts.BaseRef == "" {
+	if opts.BaseSHA == "" {
 		return nil, &ConstructError{
 			Stage: StageValidate,
-			Cause: &InvalidOptionsError{Field: "BaseRef", Detail: "must not be empty"},
+			Cause: &InvalidOptionsError{Field: "BaseSHA", Detail: "must not be empty"},
 		}
 	}
-	if opts.PRRef == "" {
+	if opts.PRSHA == "" {
 		return nil, &ConstructError{
 			Stage: StageValidate,
-			Cause: &InvalidOptionsError{Field: "PRRef", Detail: "must not be empty"},
+			Cause: &InvalidOptionsError{Field: "PRSHA", Detail: "must not be empty"},
 		}
 	}
 
@@ -296,8 +298,10 @@ func Construct(ctx context.Context, opts Options) (*Worktree, error) {
 		})
 	}
 
-	// 4. git -C <cloneTarget> checkout <BaseRef>
-	exitCode, stderr, runErr = runGit(ctx, cloneTarget, "checkout", opts.BaseRef)
+	// 4. git -C <cloneTarget> checkout <BaseSHA>
+	// The --local scratch clone has every object the source repo has, so
+	// BaseSHA is directly reachable without any fetch step.
+	exitCode, stderr, runErr = runGit(ctx, cloneTarget, "checkout", opts.BaseSHA)
 	if runErr != nil {
 		return nil, cleanup(&ConstructError{
 			Stage: StageCheckout,
@@ -308,40 +312,18 @@ func Construct(ctx context.Context, opts Options) (*Worktree, error) {
 		return nil, cleanup(&ConstructError{
 			Stage: StageCheckout,
 			Cause: &CheckoutError{
-				Ref:      opts.BaseRef,
+				SHA:      opts.BaseSHA,
 				ExitCode: exitCode,
 				Stderr:   stderr,
 			},
 		})
 	}
 
-	// 5. Fetch PRRef into FETCH_HEAD so it is always resolvable in the
-	// scratch clone regardless of whether PRRef is a local branch name,
-	// remote tracking ref, SHA, or tag. A plain `git merge <PRRef>` would
-	// only work for SHAs and tags; local branch names appear as
-	// origin/<name> in the clone after --local clone.
-	exitCode, stderr, runErr = runGit(ctx, cloneTarget, "fetch", "origin", opts.PRRef)
-	if runErr != nil {
-		return nil, cleanup(&ConstructError{
-			Stage: StageMerge,
-			Cause: runErr,
-		})
-	}
-	if exitCode != 0 {
-		return nil, cleanup(&ConstructError{
-			Stage: StageMerge,
-			Cause: &MergeError{
-				BaseRef:  opts.BaseRef,
-				PRRef:    opts.PRRef,
-				ExitCode: exitCode,
-				Stderr:   stderr,
-			},
-		})
-	}
-
-	// Merge FETCH_HEAD (the just-fetched PRRef commit).
-	mergeMsg := fmt.Sprintf("PR merge of %s into %s", opts.PRRef, opts.BaseRef)
-	exitCode, stderr, runErr = runGit(ctx, cloneTarget, "merge", "--no-edit", "-m", mergeMsg, "FETCH_HEAD")
+	// 5. Merge PRSHA directly into the checked-out BaseSHA. No fetch step
+	// needed: the --local clone already has every object from the source
+	// repo — see docs/adr/0010-prref-resolution-contract.md.
+	mergeMsg := fmt.Sprintf("PR merge of %s into %s", opts.PRSHA, opts.BaseSHA)
+	exitCode, stderr, runErr = runGit(ctx, cloneTarget, "merge", "--no-edit", "-m", mergeMsg, opts.PRSHA)
 	if runErr != nil {
 		return nil, cleanup(&ConstructError{
 			Stage: StageMerge,
@@ -356,8 +338,8 @@ func Construct(ctx context.Context, opts Options) (*Worktree, error) {
 			return nil, cleanup(&ConstructError{
 				Stage: StageMerge,
 				Cause: &MergeConflictError{
-					BaseRef: opts.BaseRef,
-					PRRef:   opts.PRRef,
+					BaseSHA: opts.BaseSHA,
+					PRSHA:   opts.PRSHA,
 					Files:   conflictFiles,
 				},
 			})
@@ -365,8 +347,8 @@ func Construct(ctx context.Context, opts Options) (*Worktree, error) {
 		return nil, cleanup(&ConstructError{
 			Stage: StageMerge,
 			Cause: &MergeError{
-				BaseRef:  opts.BaseRef,
-				PRRef:    opts.PRRef,
+				BaseSHA:  opts.BaseSHA,
+				PRSHA:    opts.PRSHA,
 				ExitCode: exitCode,
 				Stderr:   stderr,
 			},

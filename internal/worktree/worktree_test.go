@@ -4,7 +4,9 @@ import (
 	"context"
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -47,6 +49,19 @@ func branch(t *testing.T, repo, name string) {
 func checkout(t *testing.T, repo, ref string) {
 	t.Helper()
 	gitRun(t, repo, "checkout", ref)
+}
+
+// resolveRef runs `git -C repo rev-parse <ref>^{commit}` and returns the
+// full 40-char SHA. Kept inline (not importing internal/refs) to keep
+// the worktree unit tests self-contained at the package level.
+func resolveRef(t *testing.T, repo, ref string) string {
+	t.Helper()
+	cmd := exec.Command("git", "-C", repo, "rev-parse", "--verify", ref+"^{commit}")
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("resolveRef %q in %s: %v", ref, repo, err)
+	}
+	return strings.TrimSpace(string(out))
 }
 
 // gitRun runs a git command in dir, fataling on error.
@@ -94,13 +109,16 @@ func TestHappyPath_CleanMerge(t *testing.T) {
 	branch(t, repo, "feat")
 	commitFile(t, repo, "b.txt", "from B", "add b.txt")
 
-	// Switch back to main so BaseRef is main.
+	// Switch back to main so BaseSHA is main tip.
 	checkout(t, repo, "main")
+
+	baseSHA := resolveRef(t, repo, "main")
+	prSHA := resolveRef(t, repo, "feat")
 
 	wt, err := Construct(context.Background(), Options{
 		SourceRepo: repo,
-		BaseRef:    "main",
-		PRRef:      "feat",
+		BaseSHA:    baseSHA,
+		PRSHA:      prSHA,
 	})
 	if err != nil {
 		t.Fatalf("Construct: %v", err)
@@ -146,11 +164,14 @@ func TestHappyPath_FastForwardMerge(t *testing.T) {
 	commitFile(t, repo, "b.txt", "from B", "add b.txt")
 
 	// Keep HEAD on feat — base is main (which is still at A).
-	// Construct: BaseRef=main, PRRef=feat → fast-forward merge.
+	baseSHA := resolveRef(t, repo, "main")
+	prSHA := resolveRef(t, repo, "feat")
+
+	// Construct: BaseSHA=main tip, PRSHA=feat tip → fast-forward merge.
 	wt, err := Construct(context.Background(), Options{
 		SourceRepo: repo,
-		BaseRef:    "main",
-		PRRef:      "feat",
+		BaseSHA:    baseSHA,
+		PRSHA:      prSHA,
 	})
 	if err != nil {
 		t.Fatalf("Construct: %v", err)
@@ -169,8 +190,8 @@ func TestInvalidOptions_EmptySourceRepo(t *testing.T) {
 	ce := assertConstructError(t, func() error {
 		_, err := Construct(context.Background(), Options{
 			SourceRepo: "",
-			BaseRef:    "main",
-			PRRef:      "feat",
+			BaseSHA:    "0000000000000000000000000000000000000000",
+			PRSHA:      "ffffffffffffffffffffffffffffffffffffffff",
 		})
 		return err
 	}(), StageValidate)
@@ -192,8 +213,8 @@ func TestInvalidOptions_NotAGitRepo(t *testing.T) {
 	ce := assertConstructError(t, func() error {
 		_, err := Construct(context.Background(), Options{
 			SourceRepo: dir,
-			BaseRef:    "main",
-			PRRef:      "feat",
+			BaseSHA:    "0000000000000000000000000000000000000000",
+			PRSHA:      "ffffffffffffffffffffffffffffffffffffffff",
 		})
 		return err
 	}(), StageValidate)
@@ -212,8 +233,8 @@ func TestClone_BadSourcePath(t *testing.T) {
 	ce := assertConstructError(t, func() error {
 		_, err := Construct(context.Background(), Options{
 			SourceRepo: nonExistent,
-			BaseRef:    "main",
-			PRRef:      "feat",
+			BaseSHA:    "0000000000000000000000000000000000000000",
+			PRSHA:      "ffffffffffffffffffffffffffffffffffffffff",
 		})
 		return err
 	}(), StageValidate)
@@ -224,9 +245,10 @@ func TestClone_BadSourcePath(t *testing.T) {
 	}
 }
 
-// Checkout_UnknownBaseRef: valid source repo, but BaseRef does not exist.
-// Should fail at StageCheckout with CheckoutError; scratch dir cleaned up.
-func TestCheckout_UnknownBaseRef(t *testing.T) {
+// Checkout_BogusBaseSHA: valid source repo, but BaseSHA is a
+// syntactically-valid but nonexistent SHA. Should fail at StageCheckout
+// with CheckoutError; scratch dir cleaned up.
+func TestCheckout_BogusBaseSHA(t *testing.T) {
 	repo := initRepo(t)
 	commitFile(t, repo, "a.txt", "a", "init")
 
@@ -235,8 +257,8 @@ func TestCheckout_UnknownBaseRef(t *testing.T) {
 	ce := assertConstructError(t, func() error {
 		_, err := Construct(context.Background(), Options{
 			SourceRepo: repo,
-			BaseRef:    "does-not-exist",
-			PRRef:      "main",
+			BaseSHA:    "0000000000000000000000000000000000000000",
+			PRSHA:      resolveRef(t, repo, "main"),
 			ScratchDir: scratchParent,
 		})
 		return err
@@ -246,16 +268,16 @@ func TestCheckout_UnknownBaseRef(t *testing.T) {
 	if !errors.As(ce.Cause, &coErr) {
 		t.Fatalf("expected *CheckoutError, got %T", ce.Cause)
 	}
-	if coErr.Ref != "does-not-exist" {
-		t.Errorf("expected Ref=does-not-exist, got %q", coErr.Ref)
+	if coErr.SHA != "0000000000000000000000000000000000000000" {
+		t.Errorf("expected SHA=0000...0000, got %q", coErr.SHA)
 	}
 	// Scratch dir must have been cleaned up.
 	assertScratchCleaned(t, scratchParent)
 }
 
-// Merge_UnknownPRRef: valid repo, BaseRef OK, PRRef does not exist.
-// git merge fails with a non-conflict error → MergeError (not MergeConflictError).
-func TestMerge_UnknownPRRef(t *testing.T) {
+// Merge_BogusPRSHA: valid repo, BaseSHA OK, PRSHA is a syntactically-valid
+// but nonexistent SHA. git merge fails with a non-conflict error → MergeError.
+func TestMerge_BogusPRSHA(t *testing.T) {
 	repo := initRepo(t)
 	commitFile(t, repo, "a.txt", "a", "init")
 
@@ -264,8 +286,8 @@ func TestMerge_UnknownPRRef(t *testing.T) {
 	ce := assertConstructError(t, func() error {
 		_, err := Construct(context.Background(), Options{
 			SourceRepo: repo,
-			BaseRef:    "main",
-			PRRef:      "no-such-branch",
+			BaseSHA:    resolveRef(t, repo, "main"),
+			PRSHA:      "ffffffffffffffffffffffffffffffffffffffff",
 			ScratchDir: scratchParent,
 		})
 		return err
@@ -294,18 +316,20 @@ func TestMerge_Conflict(t *testing.T) {
 	// PR branch changes foo.txt.
 	branch(t, repo, "feat")
 	commitFile(t, repo, "foo.txt", "pr version", "pr changes foo.txt")
+	prSHA := resolveRef(t, repo, "feat")
 
 	// Back to main, also change foo.txt differently → conflict.
 	checkout(t, repo, "main")
 	commitFile(t, repo, "foo.txt", "base version", "base changes foo.txt")
+	baseSHA := resolveRef(t, repo, "main")
 
 	scratchParent := t.TempDir()
 
 	ce := assertConstructError(t, func() error {
 		_, err := Construct(context.Background(), Options{
 			SourceRepo: repo,
-			BaseRef:    "main",
-			PRRef:      "feat",
+			BaseSHA:    baseSHA,
+			PRSHA:      prSHA,
 			ScratchDir: scratchParent,
 		})
 		return err
@@ -341,10 +365,13 @@ func TestClose_Idempotent(t *testing.T) {
 	commitFile(t, repo, "b.txt", "b", "add b")
 	checkout(t, repo, "main")
 
+	baseSHA := resolveRef(t, repo, "main")
+	prSHA := resolveRef(t, repo, "feat")
+
 	wt, err := Construct(context.Background(), Options{
 		SourceRepo: repo,
-		BaseRef:    "main",
-		PRRef:      "feat",
+		BaseSHA:    baseSHA,
+		PRSHA:      prSHA,
 	})
 	if err != nil {
 		t.Fatalf("Construct: %v", err)
@@ -366,6 +393,7 @@ func TestConstruct_ContextCanceled(t *testing.T) {
 	repo := initRepo(t)
 	commitFile(t, repo, "a.txt", "a", "init")
 
+	sha := resolveRef(t, repo, "main")
 	scratchParent := t.TempDir()
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -373,8 +401,8 @@ func TestConstruct_ContextCanceled(t *testing.T) {
 
 	_, err := Construct(ctx, Options{
 		SourceRepo: repo,
-		BaseRef:    "main",
-		PRRef:      "main",
+		BaseSHA:    sha,
+		PRSHA:      sha,
 		ScratchDir: scratchParent,
 	})
 	if err == nil {
