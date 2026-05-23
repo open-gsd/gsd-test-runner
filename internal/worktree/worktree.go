@@ -175,13 +175,20 @@ func (e *MergeError) Error() string {
 	return fmt.Sprintf("git merge %s into %s failed (exit %d): %s", e.PRSHA, e.BaseSHA, e.ExitCode, strings.TrimSpace(e.Stderr))
 }
 
-// runGit runs git with the given args. Captures both stdout and stderr.
+// runGit is the entry point for git invocations. Package-level variable
+// so unit tests can swap it for canned responses. Default points at
+// realRunGit which spawns the real binary. Matches ADR-0011 dec 4's
+// function-variable-swap pattern used by dockerexec.
+var runGit = realRunGit
+
+// realRunGit is the production implementation of runGit (the actual
+// exec.Cmd against the git binary). Captures both stdout and stderr.
 // Returns exit code, captured streams, and any non-exit error (e.g., binary
 // not found). For non-zero git exit, exitCode is set but err is nil — the
 // caller interprets the exit code. Honors ctx cancellation: if ctx is
 // cancelled (pre or mid-exec), returns ctx.Err() directly per the
 // ADR-0014 dec 4 subprocess-cancellation convention.
-func runGit(ctx context.Context, dir string, args ...string) (exitCode int, stdout, stderr string, err error) {
+func realRunGit(ctx context.Context, dir string, args ...string) (exitCode int, stdout, stderr string, err error) {
 	cmd := exec.CommandContext(ctx, "git", args...)
 	if dir != "" {
 		cmd.Dir = dir

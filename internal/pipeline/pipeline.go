@@ -112,17 +112,48 @@ func (e *ImageNotPresentError) Error() string {
 	return fmt.Sprintf("image %s not present on bench %s: %s", e.Image, e.Bench, strings.TrimSpace(e.Stderr))
 }
 
-// BenchDockerError reports a docker invocation failure that is NOT
-// "image not present" — Bench unreachable, docker daemon down, etc.
-type BenchDockerError struct {
-	Bench    string
-	Args     []string
-	Stderr   string
-	ExitCode int
-}
+// BenchDockerError is an alias kept for package-local convenience; the
+// canonical definition lives in internal/bench.
+type BenchDockerError = bench.BenchDockerError
 
-func (e *BenchDockerError) Error() string {
-	return fmt.Sprintf("docker on bench %s failed (exit %d): %s", e.Bench, e.ExitCode, strings.TrimSpace(e.Stderr))
+// Per-leg exit codes returned in LegError.ExitCode. Documented table per
+// ADR-0004. Values start at 10 to leave room for the top-level aggregator's
+// exit codes (0/1/2 per ADR-0009).
+const (
+	ExitCodeCheckImageVersion = 10
+	ExitCodeCopyWorktree      = 11
+	ExitCodeStartContainer    = 12
+	ExitCodeNpmCI             = 13
+	ExitCodeBuild             = 14
+	ExitCodeRunTests          = 15
+	ExitCodeDrain             = 16
+	ExitCodeParse             = 17
+)
+
+// legExitCode returns the documented exit code for a given Leg. Maps the
+// Leg enum to the corresponding ExitCode* constant. Single source of truth
+// for the per-leg exit-code table — wrapper scripts read these values
+// from LegError.ExitCode and must remain stable across leg reorders.
+func legExitCode(leg Leg) int {
+	switch leg {
+	case LegCheckImageVersion:
+		return ExitCodeCheckImageVersion
+	case LegCopyWorktree:
+		return ExitCodeCopyWorktree
+	case LegStartContainer:
+		return ExitCodeStartContainer
+	case LegNpmCI:
+		return ExitCodeNpmCI
+	case LegBuild:
+		return ExitCodeBuild
+	case LegRunTests:
+		return ExitCodeRunTests
+	case LegDrain:
+		return ExitCodeDrain
+	case LegParse:
+		return ExitCodeParse
+	}
+	panic(fmt.Sprintf("legExitCode: unknown Leg %d", leg))
 }
 
 // dockerInspect is a package-level variable per ADR-0011 (decision 4).
@@ -268,78 +299,79 @@ func (p *Pipeline) CheckImageVersion(ctx context.Context) error {
 	return p.runLeg(ctx, LegCheckImageVersion, p.checkImageVersionWork(ctx))
 }
 
-func (p *Pipeline) checkImageVersionWork(ctx context.Context) func() error {
-	return func() error {
+func (p *Pipeline) checkImageVersionWork(ctx context.Context) func(context.Context) (string, error) {
+	return func(_ context.Context) (string, error) {
 		out, err := dockerInspect(ctx, p.bench, string(p.image))
 		if err != nil {
 			var de *dockerexec.ExecError
 			if errors.As(err, &de) {
 				if strings.Contains(de.Stderr, "No such image") {
-					return &ImageNotPresentError{
+					return "", &ImageNotPresentError{
 						Bench:  p.bench.Name,
 						Image:  string(p.image),
 						Stderr: de.Stderr,
 					}
 				}
-				return &BenchDockerError{
+				return "", &bench.BenchDockerError{
 					Bench:    p.bench.Name,
 					Args:     de.Args,
 					Stderr:   de.Stderr,
 					ExitCode: de.ExitCode,
 				}
 			}
-			return err
+			return "", err
 		}
 		actual := strings.TrimSpace(out)
 		if actual != p.expectedVersion {
-			return &ImageVersionMismatch{
+			return "", &ImageVersionMismatch{
 				Bench:    p.bench.Name,
 				Image:    string(p.image),
 				Expected: p.expectedVersion,
 				Actual:   actual,
 			}
 		}
-		return nil
+		return "", nil
 	}
 }
 
 // CopyWorktree copies the PR-merged worktree into a fresh container
 // on the Bench (ADR-0002: no bind-mounts).
 func (p *Pipeline) CopyWorktree(ctx context.Context) error {
-	return p.runLeg(ctx, LegCopyWorktree, func() error { return ErrNotImplemented })
+	return p.runLeg(ctx, LegCopyWorktree, func(_ context.Context) (string, error) { return "", ErrNotImplemented })
 }
 
 // StartContainer launches the fresh container with the copied
 // worktree mounted at the expected in-image path.
 func (p *Pipeline) StartContainer(ctx context.Context) error {
-	return p.runLeg(ctx, LegStartContainer, func() error { return ErrNotImplemented })
+	return p.runLeg(ctx, LegStartContainer, func(_ context.Context) (string, error) { return "", ErrNotImplemented })
 }
 
 // NpmCI runs `npm ci` inside the container.
 func (p *Pipeline) NpmCI(ctx context.Context) error {
-	return p.runLeg(ctx, LegNpmCI, func() error { return ErrNotImplemented })
+	return p.runLeg(ctx, LegNpmCI, func(_ context.Context) (string, error) { return "", ErrNotImplemented })
 }
 
 // Build runs the project's build step inside the container.
 func (p *Pipeline) Build(ctx context.Context) error {
-	return p.runLeg(ctx, LegBuild, func() error { return ErrNotImplemented })
+	return p.runLeg(ctx, LegBuild, func(_ context.Context) (string, error) { return "", ErrNotImplemented })
 }
 
 // RunTests executes the test suite inside the container; the Reporter
 // (ADR-0001) emits JSON Lines to a capture file.
 func (p *Pipeline) RunTests(ctx context.Context) error {
-	return p.runLeg(ctx, LegRunTests, func() error { return ErrNotImplemented })
+	return p.runLeg(ctx, LegRunTests, func(_ context.Context) (string, error) { return "", ErrNotImplemented })
 }
 
 // Drain pulls the JSON Lines capture file from the container to the
 // Dev Workstation via docker cp. It stores the local temp file path on
-// p.drainedPath for the Parse leg to consume. On docker cp failure the
-// temp file is removed before returning the DrainError.
+// p.drainedPath for the Parse leg to consume. On docker cp failure after
+// the temp file is created, the local path is returned as diagPath so the
+// caller can inspect partial data; the file is left on disk for diagnosis.
 func (p *Pipeline) Drain(ctx context.Context) error {
-	return p.runLeg(ctx, LegDrain, func() error {
+	return p.runLeg(ctx, LegDrain, func(_ context.Context) (string, error) {
 		f, err := os.CreateTemp("", "gsd-test-jsonl-*.log")
 		if err != nil {
-			return &DrainError{Stage: "create_temp", Cause: err}
+			return "", &DrainError{Stage: "create_temp", Cause: err}
 		}
 		localPath := f.Name()
 		f.Close() // we want the path only; docker cp will overwrite
@@ -347,12 +379,12 @@ func (p *Pipeline) Drain(ctx context.Context) error {
 		src := p.containerID + ":" + containerJSONLPath
 		_, err = dockerCp(ctx, p.bench, []string{src, localPath})
 		if err != nil {
-			os.Remove(localPath)
-			return &DrainError{Stage: "docker_cp", Cause: err}
+			// Return localPath as diagPath: partial data may exist on disk.
+			return localPath, &DrainError{Stage: "docker_cp", Cause: err}
 		}
 
 		p.drainedPath = localPath
-		return nil
+		return "", nil
 	})
 }
 
@@ -361,26 +393,26 @@ func (p *Pipeline) Drain(ctx context.Context) error {
 // file that yields zero parsed events is a Parse failure (ADR-0004:
 // not a silent zero-test success).
 func (p *Pipeline) Parse(ctx context.Context) error {
-	return p.runLeg(ctx, LegParse, func() error {
+	return p.runLeg(ctx, LegParse, func(_ context.Context) (string, error) {
 		if p.drainedPath == "" {
-			return &ParseError{Cause: errors.New("drain leg did not run or produced no file")}
+			return "", &ParseError{Cause: errors.New("drain leg did not run or produced no file")}
 		}
 		f, err := os.Open(p.drainedPath)
 		if err != nil {
-			return &ParseError{Cause: err}
+			return "", &ParseError{Cause: err}
 		}
 		defer f.Close()
 
 		passed, total, failures, err := parseJSONL(f)
 		if err != nil {
-			return &ParseError{Cause: err}
+			return "", &ParseError{Cause: err}
 		}
 
 		p.result.Total = total
 		p.result.Passed = passed
 		p.result.Failed = len(failures)
 		p.result.Failures = failures
-		return nil
+		return "", nil
 	})
 }
 
@@ -413,21 +445,24 @@ func (p *Pipeline) RunAll(ctx context.Context) (report.Report, error) {
 
 // runLeg orchestrates the LegStart/ctx-check/work/LegSuccess/LegFailure
 // protocol every leg must follow per ADR-0008. The work function does
-// the leg-specific subprocess work. If work returns nil, a LegSuccess
-// event is emitted and runLeg returns nil. If work returns an error,
-// the error is wrapped in *LegError (unless already wrapped), a
+// the leg-specific subprocess work and returns a diagPath (path to a
+// captured stderr/log file for this leg, if any) and an error. If work
+// returns nil error, a LegSuccess event is emitted and runLeg returns nil.
+// If work returns an error, the error is wrapped in *LegError (unless
+// already wrapped) with DiagPath populated from the returned diagPath, a
 // LegFailure event is emitted, and the *LegError is returned.
-func (p *Pipeline) runLeg(ctx context.Context, leg Leg, work func() error) error {
+func (p *Pipeline) runLeg(ctx context.Context, leg Leg, work func(context.Context) (string, error)) error {
 	p.emit(Event{Kind: EventLegStart, OS: p.bench.OS, Time: time.Now(), Leg: leg})
 	if err := ctx.Err(); err != nil {
-		legErr := &LegError{Leg: leg, Cause: err, ExitCode: int(leg) + 1}
+		legErr := &LegError{Leg: leg, Cause: err, ExitCode: legExitCode(leg)}
 		p.emit(Event{Kind: EventLegFailure, OS: p.bench.OS, Time: time.Now(), Leg: leg, Detail: legErr.Error()})
 		return legErr
 	}
-	if err := work(); err != nil {
+	diagPath, err := work(ctx)
+	if err != nil {
 		var legErr *LegError
 		if !errors.As(err, &legErr) {
-			legErr = &LegError{Leg: leg, Cause: err, ExitCode: int(leg) + 1}
+			legErr = &LegError{Leg: leg, Cause: err, ExitCode: legExitCode(leg), DiagPath: diagPath}
 			err = legErr
 		}
 		p.emit(Event{Kind: EventLegFailure, OS: p.bench.OS, Time: time.Now(), Leg: leg, Detail: legErr.Error()})

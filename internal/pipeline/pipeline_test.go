@@ -538,6 +538,115 @@ func TestCheckImageVersion_PreCanceledContext_DoesNotCallDocker(t *testing.T) {
 	}
 }
 
+// TestLegExitCode_UniqueAndStable verifies that all 8 legs produce distinct
+// exit codes and that the constants have not drifted from their documented
+// values per ADR-0004.
+func TestLegExitCode_UniqueAndStable(t *testing.T) {
+	// Assert exact constant values — these are stable per ADR-0004 and must
+	// not change without a corresponding ADR update. Wrapper scripts depend
+	// on these values.
+	if ExitCodeCheckImageVersion != 10 {
+		t.Fatalf("ExitCodeCheckImageVersion = %d, want 10", ExitCodeCheckImageVersion)
+	}
+	if ExitCodeCopyWorktree != 11 {
+		t.Fatalf("ExitCodeCopyWorktree = %d, want 11", ExitCodeCopyWorktree)
+	}
+	if ExitCodeStartContainer != 12 {
+		t.Fatalf("ExitCodeStartContainer = %d, want 12", ExitCodeStartContainer)
+	}
+	if ExitCodeNpmCI != 13 {
+		t.Fatalf("ExitCodeNpmCI = %d, want 13", ExitCodeNpmCI)
+	}
+	if ExitCodeBuild != 14 {
+		t.Fatalf("ExitCodeBuild = %d, want 14", ExitCodeBuild)
+	}
+	if ExitCodeRunTests != 15 {
+		t.Fatalf("ExitCodeRunTests = %d, want 15", ExitCodeRunTests)
+	}
+	if ExitCodeDrain != 16 {
+		t.Fatalf("ExitCodeDrain = %d, want 16", ExitCodeDrain)
+	}
+	if ExitCodeParse != 17 {
+		t.Fatalf("ExitCodeParse = %d, want 17", ExitCodeParse)
+	}
+
+	// Assert uniqueness: no two legs may share an exit code.
+	legs := []Leg{
+		LegCheckImageVersion,
+		LegCopyWorktree,
+		LegStartContainer,
+		LegNpmCI,
+		LegBuild,
+		LegRunTests,
+		LegDrain,
+		LegParse,
+	}
+	seen := make(map[int]Leg)
+	for _, leg := range legs {
+		code := legExitCode(leg)
+		if prev, dup := seen[code]; dup {
+			t.Errorf("exit code %d is shared by legs %v and %v", code, prev, leg)
+		}
+		seen[code] = leg
+	}
+
+	// Assert legExitCode matches the constants for each leg.
+	cases := []struct {
+		leg  Leg
+		want int
+	}{
+		{LegCheckImageVersion, ExitCodeCheckImageVersion},
+		{LegCopyWorktree, ExitCodeCopyWorktree},
+		{LegStartContainer, ExitCodeStartContainer},
+		{LegNpmCI, ExitCodeNpmCI},
+		{LegBuild, ExitCodeBuild},
+		{LegRunTests, ExitCodeRunTests},
+		{LegDrain, ExitCodeDrain},
+		{LegParse, ExitCodeParse},
+	}
+	for _, tc := range cases {
+		got := legExitCode(tc.leg)
+		if got != tc.want {
+			t.Errorf("legExitCode(%v) = %d, want %d", tc.leg, got, tc.want)
+		}
+	}
+}
+
+// TestDrain_PopulatesDiagPath_OnDockerCpFailure verifies that when docker cp
+// fails after the temp file is created, LegError.DiagPath is set to the
+// local temp file path (partial data may exist on disk for diagnosis).
+func TestDrain_PopulatesDiagPath_OnDockerCpFailure(t *testing.T) {
+	execErr := &dockerexec.ExecError{
+		Args:     []string{"cp", "ctr:/work/test-events.jsonl", "/tmp/x"},
+		Stderr:   "Error: No such container: ctr",
+		ExitCode: 1,
+	}
+	stubDockerCp(t, "", execErr)
+
+	p, _ := newTestPipeline(t, 16)
+	p.containerID = "ctr"
+
+	err := p.Drain(context.Background())
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+
+	var legErr *LegError
+	if !errors.As(err, &legErr) {
+		t.Fatalf("expected *LegError, got %T: %v", err, err)
+	}
+
+	// DiagPath must be set to the local temp file path.
+	if legErr.DiagPath == "" {
+		t.Error("expected LegError.DiagPath to be non-empty after docker cp failure")
+	}
+
+	// Clean up the temp file that Drain left on disk (kept for diagnosis).
+	if legErr.DiagPath != "" {
+		os.Remove(legErr.DiagPath)
+	}
+}
+
 // --- Drain leg dedicated tests ---
 
 // stubDockerCp swaps the package-level dockerCp for a function returning the

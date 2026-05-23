@@ -1,5 +1,10 @@
 package bench
 
+import (
+	"fmt"
+	"strings"
+)
+
 // Local is the Bench.Host value indicating the Local Engine should use
 // the Dev Workstation's own docker daemon (no DOCKER_HOST env var).
 const Local = "local"
@@ -34,4 +39,20 @@ func (b Bench) DockerHost() string {
 		return ""
 	}
 	return "ssh://" + b.Host
+}
+
+// BenchDockerError is returned by any package that invokes docker against
+// a Bench and gets a non-image-related infrastructure failure (Bench
+// unreachable, daemon down, SSH refused). Replaces the previously-duplicated
+// definitions in internal/pipeline and internal/images.
+type BenchDockerError struct {
+	Bench    string   // bench.Bench.Name
+	Args     []string
+	Stderr   string
+	ExitCode int
+}
+
+func (e *BenchDockerError) Error() string {
+	return fmt.Sprintf("bench %s: docker %s failed (exit=%d): %s",
+		e.Bench, strings.Join(e.Args, " "), e.ExitCode, strings.TrimSpace(e.Stderr))
 }
