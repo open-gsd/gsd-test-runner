@@ -16,6 +16,8 @@ Future direction: **macOS Containers** support is planned — Apple's native con
 
 A versioned Docker image, one per supported OS (Linux, Windows, future macOS Containers), holding only the *test-execution sandbox*: base OS, Node runtime, build toolchain, the Reporter at a known in-image path, sandbox config (HOME, perms, npm cache location), and an Image-version sentinel file. Contains zero project code and zero test files. Distributed primarily via GHCR; the Dockerfile in this repo is the fallback build path and the canonical source CI builds from.
 
+Dockerfiles live at `dockerfiles/linux.Dockerfile` and `dockerfiles/windows.Dockerfile` (per ADR-0012). The Reporter is baked in at `/opt/gsd-test/reporter.mjs` (Linux) and `C:\opt\gsd-test\reporter.mjs` (Windows); this path is contractual — the Local Engine's RunTests leg invokes `node --test --test-reporter=/opt/gsd-test/reporter.mjs`. The Image-version sentinel is the OCI label `sh.gsd-test.image-version` (per ADR-0011), injected at build time via `ARG IMAGE_VERSION`. The Reporter source of truth is `reporter/reporter.mjs` in this repo; Dockerfiles COPY it in at build time.
+
 ### Dev Workstation
 
 The developer's own machine where the Local Engine runs. Must be platform-agnostic: macOS, Linux, or Windows. Holds the project source, the Local Engine binary, and SSH credentials for reaching one or more Benches. Does NOT run containers itself — that work is offloaded to Benches so the laptop isn't burdened by full test suites.

@@ -33,6 +33,14 @@ type EnsurePresentOptions struct {
 // ADR-0005). If the pull fails with a not-found error and opts.FallbackDockerfile
 // is configured, falls back to building from that Dockerfile.
 //
+// Canonical Dockerfile paths (per ADR-0012):
+//   - Linux:   dockerfiles/linux.Dockerfile
+//   - Windows: dockerfiles/windows.Dockerfile
+//
+// Both Dockerfiles expect the build context to be the repo root (so
+// COPY reporter/reporter.mjs resolves correctly). Wiring these paths
+// into EnsurePresentOptions.FallbackDockerfile is Slice G8's job.
+//
 // Version label verification is NOT performed here — that is
 // Pipeline.CheckImageVersion's responsibility per ADR-0012.
 //
