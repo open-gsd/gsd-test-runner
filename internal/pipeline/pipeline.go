@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"strings"
 	"time"
 
@@ -12,6 +13,11 @@ import (
 	"github.com/open-gsd/gsd-test-runner/internal/images"
 	"github.com/open-gsd/gsd-test-runner/internal/report"
 )
+
+// containerJSONLPath is the path inside the Tester Image container where the
+// Reporter writes per-test JSONL events. The Drain leg copies this file to the
+// Dev Workstation via docker cp.
+const containerJSONLPath = "/work/test-events.jsonl"
 
 // ErrNotImplemented is the Cause of every LegError returned by the
 // skeleton. Real implementations will replace it with typed Cause
@@ -184,6 +190,39 @@ type Event struct {
 	Detail string
 }
 
+// dockerCp is a package-level variable for testability (matches the
+// dockerInspect pattern). Tests swap it for a stub via t.Cleanup.
+// Real implementation delegates to dockerexec.Run for docker cp operations.
+var dockerCp = func(ctx context.Context, b bench.Bench, args []string) (string, error) {
+	return dockerexec.Run(ctx, b, append([]string{"cp"}, args...))
+}
+
+// DrainError is the typed Cause for LegError when the Drain leg fails.
+// Stage discriminates the failure point within the leg.
+type DrainError struct {
+	// Stage is "create_temp" when os.CreateTemp fails, "docker_cp" when
+	// docker cp fails.
+	Stage string
+	Cause error
+}
+
+func (e *DrainError) Error() string {
+	return fmt.Sprintf("drain failed at stage %q: %v", e.Stage, e.Cause)
+}
+
+func (e *DrainError) Unwrap() error { return e.Cause }
+
+// ParseError is the typed Cause for LegError when the Parse leg fails.
+type ParseError struct {
+	Cause error
+}
+
+func (e *ParseError) Error() string {
+	return fmt.Sprintf("parse failed: %v", e.Cause)
+}
+
+func (e *ParseError) Unwrap() error { return e.Cause }
+
 // Pipeline executes the 8 per-OS legs against one Bench using one
 // Tester Image and one PR-merged worktree. One Pipeline per (Bench,
 // OS) per Local Engine run. See ADR-0008 for the shape rationale.
@@ -194,6 +233,13 @@ type Pipeline struct {
 	work            string // path to the PR-merged worktree (from worktree.Worktree.Path())
 	events          chan<- Event
 	result          report.Report
+	// containerID is the running container ID/name set by StartContainer.
+	// Drain uses it as the source for docker cp. Today StartContainer is a
+	// stub; tests seed this field directly.
+	containerID string
+	// drainedPath is the local temp file path written by Drain and consumed
+	// by Parse. Empty until Drain succeeds.
+	drainedPath string
 }
 
 // New constructs a Pipeline. The expectedVersion parameter is the
@@ -286,9 +332,28 @@ func (p *Pipeline) RunTests(ctx context.Context) error {
 }
 
 // Drain pulls the JSON Lines capture file from the container to the
-// Dev Workstation.
+// Dev Workstation via docker cp. It stores the local temp file path on
+// p.drainedPath for the Parse leg to consume. On docker cp failure the
+// temp file is removed before returning the DrainError.
 func (p *Pipeline) Drain(ctx context.Context) error {
-	return p.runLeg(ctx, LegDrain, func() error { return ErrNotImplemented })
+	return p.runLeg(ctx, LegDrain, func() error {
+		f, err := os.CreateTemp("", "gsd-test-jsonl-*.log")
+		if err != nil {
+			return &DrainError{Stage: "create_temp", Cause: err}
+		}
+		localPath := f.Name()
+		f.Close() // we want the path only; docker cp will overwrite
+
+		src := p.containerID + ":" + containerJSONLPath
+		_, err = dockerCp(ctx, p.bench, []string{src, localPath})
+		if err != nil {
+			os.Remove(localPath)
+			return &DrainError{Stage: "docker_cp", Cause: err}
+		}
+
+		p.drainedPath = localPath
+		return nil
+	})
 }
 
 // Parse converts the JSON Lines stream into structured test events
@@ -296,7 +361,27 @@ func (p *Pipeline) Drain(ctx context.Context) error {
 // file that yields zero parsed events is a Parse failure (ADR-0004:
 // not a silent zero-test success).
 func (p *Pipeline) Parse(ctx context.Context) error {
-	return p.runLeg(ctx, LegParse, func() error { return ErrNotImplemented })
+	return p.runLeg(ctx, LegParse, func() error {
+		if p.drainedPath == "" {
+			return &ParseError{Cause: errors.New("drain leg did not run or produced no file")}
+		}
+		f, err := os.Open(p.drainedPath)
+		if err != nil {
+			return &ParseError{Cause: err}
+		}
+		defer f.Close()
+
+		passed, total, failures, err := parseJSONL(f)
+		if err != nil {
+			return &ParseError{Cause: err}
+		}
+
+		p.result.Total = total
+		p.result.Passed = passed
+		p.result.Failed = len(failures)
+		p.result.Failures = failures
+		return nil
+	})
 }
 
 // Report returns the per-OS final result. Only meaningful after

@@ -3,6 +3,8 @@ package pipeline
 import (
 	"context"
 	"errors"
+	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -60,9 +62,10 @@ func TestNew_NilEventChannelOK(t *testing.T) {
 }
 
 // TestPipeline_StepMethods_ReturnLegErrorWithNotImplemented table-tests the
-// 7 still-stubbed step methods: each must return a *LegError whose Cause is
+// 5 still-stubbed step methods: each must return a *LegError whose Cause is
 // ErrNotImplemented and whose Leg field matches the expected leg constant.
 // CheckImageVersion is excluded — it has its own dedicated tests below.
+// Drain and Parse are excluded — they are implemented in this slice.
 func TestPipeline_StepMethods_ReturnLegErrorWithNotImplemented(t *testing.T) {
 	type stepCase struct {
 		name     string
@@ -75,8 +78,6 @@ func TestPipeline_StepMethods_ReturnLegErrorWithNotImplemented(t *testing.T) {
 		{"NpmCI", LegNpmCI, (*Pipeline).NpmCI},
 		{"Build", LegBuild, (*Pipeline).Build},
 		{"RunTests", LegRunTests, (*Pipeline).RunTests},
-		{"Drain", LegDrain, (*Pipeline).Drain},
-		{"Parse", LegParse, (*Pipeline).Parse},
 	}
 
 	for _, tc := range cases {
@@ -534,5 +535,367 @@ func TestCheckImageVersion_PreCanceledContext_DoesNotCallDocker(t *testing.T) {
 	}
 	if called {
 		t.Error("dockerInspect should not have been called for a pre-canceled context")
+	}
+}
+
+// --- Drain leg dedicated tests ---
+
+// stubDockerCp swaps the package-level dockerCp for a function returning the
+// given output/error. Restored via t.Cleanup.
+func stubDockerCp(t *testing.T, out string, err error) {
+	t.Helper()
+	original := dockerCp
+	dockerCp = func(ctx context.Context, b bench.Bench, args []string) (string, error) {
+		return out, err
+	}
+	t.Cleanup(func() { dockerCp = original })
+}
+
+// TestDrain_Success verifies that when dockerCp succeeds, p.drainedPath is
+// set to a non-empty path and LegStart + LegSuccess events are emitted.
+func TestDrain_Success(t *testing.T) {
+	// The stub must actually write a file so the path is valid for later
+	// use by Parse. For Drain's own test, we just need dockerCp to not
+	// error; the temp file was already created before dockerCp is called,
+	// and docker cp overwrites it. We simulate by doing nothing (the temp
+	// file created inside Drain will remain as-is).
+	stubDockerCp(t, "", nil)
+
+	p, ch := newTestPipeline(t, 16)
+	p.containerID = "test-container-xyz"
+
+	err := p.Drain(context.Background())
+	if err != nil {
+		t.Fatalf("expected nil error, got: %v", err)
+	}
+	if p.drainedPath == "" {
+		t.Error("expected p.drainedPath to be set after successful Drain")
+	}
+
+	// Clean up the temp file created by Drain.
+	if p.drainedPath != "" {
+		os.Remove(p.drainedPath)
+	}
+
+	close(ch)
+	var events []Event
+	for e := range ch {
+		events = append(events, e)
+	}
+
+	if len(events) != 2 {
+		t.Fatalf("expected 2 events (LegStart + LegSuccess), got %d", len(events))
+	}
+	if events[0].Kind != EventLegStart || events[0].Leg != LegDrain {
+		t.Errorf("events[0]: expected LegStart/LegDrain, got Kind=%v Leg=%v", events[0].Kind, events[0].Leg)
+	}
+	if events[1].Kind != EventLegSuccess || events[1].Leg != LegDrain {
+		t.Errorf("events[1]: expected LegSuccess/LegDrain, got Kind=%v Leg=%v", events[1].Kind, events[1].Leg)
+	}
+}
+
+// TestDrain_DockerCpFails verifies that a dockerCp failure returns a *LegError
+// wrapping *DrainError wrapping the original exec error, and p.drainedPath
+// remains empty (temp file is cleaned up).
+func TestDrain_DockerCpFails(t *testing.T) {
+	execErr := &dockerexec.ExecError{
+		Args:     []string{"cp", "test-container:/work/test-events.jsonl", "/tmp/x"},
+		Stderr:   "Error: No such container: test-container",
+		ExitCode: 1,
+	}
+	stubDockerCp(t, "", execErr)
+
+	p, _ := newTestPipeline(t, 16)
+	p.containerID = "test-container"
+
+	err := p.Drain(context.Background())
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+
+	var legErr *LegError
+	if !errors.As(err, &legErr) {
+		t.Fatalf("expected *LegError, got %T: %v", err, err)
+	}
+	if legErr.Leg != LegDrain {
+		t.Errorf("expected Leg=LegDrain, got %v", legErr.Leg)
+	}
+
+	var drainErr *DrainError
+	if !errors.As(legErr.Cause, &drainErr) {
+		t.Fatalf("expected Cause=*DrainError, got %T: %v", legErr.Cause, legErr.Cause)
+	}
+	if drainErr.Stage != "docker_cp" {
+		t.Errorf("expected Stage=%q, got %q", "docker_cp", drainErr.Stage)
+	}
+
+	var gotExecErr *dockerexec.ExecError
+	if !errors.As(drainErr.Cause, &gotExecErr) {
+		t.Fatalf("expected DrainError.Cause=*dockerexec.ExecError, got %T", drainErr.Cause)
+	}
+
+	// Temp file should be cleaned up on failure.
+	if p.drainedPath != "" {
+		t.Errorf("expected p.drainedPath to be empty after failed Drain, got %q", p.drainedPath)
+	}
+}
+
+// --- Parse leg dedicated tests ---
+
+// TestParse_ReadsFromDrainedPath verifies that Parse reads the file at
+// p.drainedPath and populates p.result.Total/Passed/Failures correctly.
+func TestParse_ReadsFromDrainedPath(t *testing.T) {
+	// Write sample JSONL to a temp file.
+	content := `{"type":"test_event","kind":"pass","name":"test A","file":"a.test.js"}
+{"type":"test_event","kind":"fail","name":"test B","file":"b.test.js","error":"oops","error_class":"throw"}
+`
+	f, err := os.CreateTemp("", "gsd-parse-test-*.jsonl")
+	if err != nil {
+		t.Fatalf("failed to create temp file: %v", err)
+	}
+	defer os.Remove(f.Name())
+	if _, err := f.WriteString(content); err != nil {
+		t.Fatalf("failed to write temp file: %v", err)
+	}
+	f.Close()
+
+	p, _ := newTestPipeline(t, 16)
+	p.drainedPath = f.Name()
+
+	if err := p.Parse(context.Background()); err != nil {
+		t.Fatalf("expected nil error, got: %v", err)
+	}
+
+	if p.result.Total != 2 {
+		t.Errorf("expected result.Total=2, got %d", p.result.Total)
+	}
+	if p.result.Passed != 1 {
+		t.Errorf("expected result.Passed=1, got %d", p.result.Passed)
+	}
+	if p.result.Failed != 1 {
+		t.Errorf("expected result.Failed=1, got %d", p.result.Failed)
+	}
+	if len(p.result.Failures) != 1 {
+		t.Fatalf("expected 1 failure, got %d", len(p.result.Failures))
+	}
+	if p.result.Failures[0].Name != "test B" {
+		t.Errorf("expected failure name %q, got %q", "test B", p.result.Failures[0].Name)
+	}
+}
+
+// TestParse_NoDrainedPath verifies that calling Parse without Drain having run
+// returns a *LegError wrapping *ParseError.
+func TestParse_NoDrainedPath(t *testing.T) {
+	p, _ := newTestPipeline(t, 16)
+	// p.drainedPath is empty — Drain was not called.
+
+	err := p.Parse(context.Background())
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+
+	var legErr *LegError
+	if !errors.As(err, &legErr) {
+		t.Fatalf("expected *LegError, got %T: %v", err, err)
+	}
+	if legErr.Leg != LegParse {
+		t.Errorf("expected Leg=LegParse, got %v", legErr.Leg)
+	}
+
+	var parseErr *ParseError
+	if !errors.As(legErr.Cause, &parseErr) {
+		t.Fatalf("expected Cause=*ParseError, got %T: %v", legErr.Cause, legErr.Cause)
+	}
+}
+
+// TestRunAll_DrainPlusParse_EventOrdering verifies the Drain + Parse leg event
+// ordering using stubs for all preceding legs. Because RunAll must run all 8
+// legs in order and the first 6 still return ErrNotImplemented, we verify that
+// when CopyWorktree fails (leg 2), only legs 1+2 events are emitted. To test
+// Drain+Parse events specifically we exercise them individually.
+func TestRunAll_DrainPlusParse_EventOrdering(t *testing.T) {
+	// Write sample JSONL for Parse to consume.
+	content := `{"type":"test_event","kind":"pass","name":"test A","file":"a.test.js"}
+`
+	f, err := os.CreateTemp("", "gsd-runall-test-*.jsonl")
+	if err != nil {
+		t.Fatalf("failed to create temp file: %v", err)
+	}
+	defer os.Remove(f.Name())
+	if _, err := f.WriteString(content); err != nil {
+		f.Close()
+		t.Fatalf("failed to write temp file: %v", err)
+	}
+	f.Close()
+
+	stubDockerCp(t, "", nil)
+	p, ch := newTestPipeline(t, 32)
+	p.containerID = "test-container-xyz"
+	// Seed drainedPath so we can call Parse independently.
+	p.drainedPath = f.Name()
+
+	// Call Drain and Parse directly to verify their event ordering without
+	// needing the preceding 6 stubs to succeed.
+	if err := p.Drain(context.Background()); err != nil {
+		t.Fatalf("Drain failed: %v", err)
+	}
+	// Override drainedPath back to our test file (Drain overwrites it with
+	// the stub's temp file path which is empty content).
+	if p.drainedPath != "" {
+		os.Remove(p.drainedPath)
+	}
+	p.drainedPath = f.Name()
+
+	if err := p.Parse(context.Background()); err != nil {
+		t.Fatalf("Parse failed: %v", err)
+	}
+
+	close(ch)
+	var events []Event
+	for e := range ch {
+		events = append(events, e)
+	}
+
+	// Expect: LegStart(Drain), LegSuccess(Drain), LegStart(Parse), LegSuccess(Parse).
+	if len(events) != 4 {
+		t.Fatalf("expected 4 events, got %d: %v", len(events), events)
+	}
+	if events[0].Kind != EventLegStart || events[0].Leg != LegDrain {
+		t.Errorf("events[0]: expected LegStart/Drain, got Kind=%v Leg=%v", events[0].Kind, events[0].Leg)
+	}
+	if events[1].Kind != EventLegSuccess || events[1].Leg != LegDrain {
+		t.Errorf("events[1]: expected LegSuccess/Drain, got Kind=%v Leg=%v", events[1].Kind, events[1].Leg)
+	}
+	if events[2].Kind != EventLegStart || events[2].Leg != LegParse {
+		t.Errorf("events[2]: expected LegStart/Parse, got Kind=%v Leg=%v", events[2].Kind, events[2].Leg)
+	}
+	if events[3].Kind != EventLegSuccess || events[3].Leg != LegParse {
+		t.Errorf("events[3]: expected LegSuccess/Parse, got Kind=%v Leg=%v", events[3].Kind, events[3].Leg)
+	}
+
+	// Verify Parse populated the result.
+	if p.result.Total != 1 {
+		t.Errorf("expected result.Total=1, got %d", p.result.Total)
+	}
+	if p.result.Passed != 1 {
+		t.Errorf("expected result.Passed=1, got %d", p.result.Passed)
+	}
+}
+
+// TestParse_ZeroEventsInDrainedFile verifies that a drained file with no
+// test_event records causes Parse to return a *LegError wrapping *ParseError
+// wrapping *ZeroEventsError.
+func TestParse_ZeroEventsInDrainedFile(t *testing.T) {
+	content := `{"type":"suite_start","suite":"my-suite"}
+`
+	f, err := os.CreateTemp("", "gsd-parse-zero-test-*.jsonl")
+	if err != nil {
+		t.Fatalf("failed to create temp file: %v", err)
+	}
+	defer os.Remove(f.Name())
+	if _, err := f.WriteString(content); err != nil {
+		f.Close()
+		t.Fatalf("failed to write temp file: %v", err)
+	}
+	f.Close()
+
+	p, _ := newTestPipeline(t, 16)
+	p.drainedPath = f.Name()
+
+	err = p.Parse(context.Background())
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+
+	var legErr *LegError
+	if !errors.As(err, &legErr) {
+		t.Fatalf("expected *LegError, got %T: %v", err, err)
+	}
+
+	var parseErr *ParseError
+	if !errors.As(legErr.Cause, &parseErr) {
+		t.Fatalf("expected Cause=*ParseError, got %T: %v", legErr.Cause, legErr.Cause)
+	}
+
+	var zeroErr *ZeroEventsError
+	if !errors.As(parseErr.Cause, &zeroErr) {
+		t.Fatalf("expected ParseError.Cause=*ZeroEventsError, got %T: %v", parseErr.Cause, parseErr.Cause)
+	}
+}
+
+// TestDrain_ContainerIDUsedInDockerCpArgs verifies the container ID is
+// incorporated into the docker cp source argument as "<containerID>:<path>".
+func TestDrain_ContainerIDUsedInDockerCpArgs(t *testing.T) {
+	var capturedArgs []string
+	original := dockerCp
+	dockerCp = func(ctx context.Context, b bench.Bench, args []string) (string, error) {
+		capturedArgs = append(capturedArgs, args...)
+		return "", nil
+	}
+	t.Cleanup(func() { dockerCp = original })
+
+	p, _ := newTestPipeline(t, 16)
+	p.containerID = "my-container-abc"
+
+	err := p.Drain(context.Background())
+	if err != nil {
+		t.Fatalf("expected nil error, got: %v", err)
+	}
+	if p.drainedPath != "" {
+		os.Remove(p.drainedPath)
+	}
+
+	if len(capturedArgs) < 1 {
+		t.Fatal("expected dockerCp to be called with args")
+	}
+	wantSrc := "my-container-abc:" + containerJSONLPath
+	if capturedArgs[0] != wantSrc {
+		t.Errorf("expected first arg %q, got %q", wantSrc, capturedArgs[0])
+	}
+}
+
+// TestParse_MalformedJSONLInDrainedFile verifies that malformed JSON in the
+// drained file causes a *LegError wrapping *ParseError wrapping *MalformedJSONLError.
+func TestParse_MalformedJSONLInDrainedFile(t *testing.T) {
+	content := strings.Join([]string{
+		`{"type":"test_event","kind":"pass","name":"ok","file":"a.js"}`,
+		`not valid json`,
+	}, "\n") + "\n"
+
+	f, err := os.CreateTemp("", "gsd-parse-malformed-*.jsonl")
+	if err != nil {
+		t.Fatalf("failed to create temp file: %v", err)
+	}
+	defer os.Remove(f.Name())
+	if _, err := f.WriteString(content); err != nil {
+		f.Close()
+		t.Fatalf("failed to write temp file: %v", err)
+	}
+	f.Close()
+
+	p, _ := newTestPipeline(t, 16)
+	p.drainedPath = f.Name()
+
+	err = p.Parse(context.Background())
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+
+	var legErr *LegError
+	if !errors.As(err, &legErr) {
+		t.Fatalf("expected *LegError, got %T: %v", err, err)
+	}
+
+	var parseErr *ParseError
+	if !errors.As(legErr.Cause, &parseErr) {
+		t.Fatalf("expected Cause=*ParseError, got %T: %v", legErr.Cause, legErr.Cause)
+	}
+
+	var malformedErr *MalformedJSONLError
+	if !errors.As(parseErr.Cause, &malformedErr) {
+		t.Fatalf("expected ParseError.Cause=*MalformedJSONLError, got %T: %v", parseErr.Cause, parseErr.Cause)
+	}
+	if malformedErr.Line != 2 {
+		t.Errorf("expected MalformedJSONLError.Line=2, got %d", malformedErr.Line)
 	}
 }
