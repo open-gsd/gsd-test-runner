@@ -126,8 +126,8 @@ func TestPipeline_RunAll_StopsAtFirstError(t *testing.T) {
 	if !errors.As(legErr.Cause, &benchErr) {
 		t.Errorf("expected Cause=*BenchDockerError, got %T: %v", legErr.Cause, legErr.Cause)
 	}
-	// Report must be zero.
-	_ = report // Report is a zero-field struct; any value equals Report{}
+	// Report is discarded — on error RunAll returns a zero report.Report.
+	_ = report
 }
 
 // TestPipeline_EmitsLegStartBeforeReturning verifies that CheckImageVersion

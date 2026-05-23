@@ -12,6 +12,7 @@ import (
 
 	"github.com/open-gsd/gsd-test-runner/internal/bench"
 	"github.com/open-gsd/gsd-test-runner/internal/images"
+	"github.com/open-gsd/gsd-test-runner/internal/report"
 )
 
 // ErrNotImplemented is the Cause of every LegError returned by the
@@ -219,15 +220,6 @@ type Event struct {
 	Detail string
 }
 
-// Report is the per-OS final result of a Pipeline run.
-//
-// TODO(ADR-0011?): deepening candidate #4 — the Report's shape (fields,
-// JSON serialization, renderer-vs-machine consumer split) is an open
-// design question. This placeholder allows the Pipeline interface to
-// compile and the orchestrator (ADR-0009) to be wired up. Real fields
-// land when candidate #4 resolves.
-type Report struct{}
-
 // Pipeline executes the 8 per-OS legs against one Bench using one
 // Tester Image and one PR-merged worktree. One Pipeline per (Bench,
 // OS) per Local Engine run. See ADR-0008 for the shape rationale.
@@ -237,7 +229,7 @@ type Pipeline struct {
 	expectedVersion string // per ADR-0011 decision 3: caller-supplied
 	work            string // path to the PR-merged worktree (from worktree.Worktree.Path())
 	events          chan<- Event
-	report          Report
+	result          report.Report
 }
 
 // New constructs a Pipeline. The expectedVersion parameter is the
@@ -254,6 +246,7 @@ func New(b bench.Bench, img images.ImageID, expectedVersion string, worktreePath
 		expectedVersion: expectedVersion,
 		work:            worktreePath,
 		events:          events,
+		result:          report.New(b.OS, b.Name, string(img), expectedVersion, time.Now().UTC()),
 	}
 }
 
@@ -349,12 +342,12 @@ func (p *Pipeline) Parse(ctx context.Context) error {
 
 // Report returns the per-OS final result. Only meaningful after
 // successful Parse (or after RunAll returns nil).
-func (p *Pipeline) Report() Report { return p.report }
+func (p *Pipeline) Report() report.Report { return p.result }
 
 // RunAll executes all 8 legs in order, short-circuiting on the first
 // LegError. Returns the Report and nil on success, or a zero Report
 // and the LegError of the first failed leg.
-func (p *Pipeline) RunAll(ctx context.Context) (Report, error) {
+func (p *Pipeline) RunAll(ctx context.Context) (report.Report, error) {
 	legs := []func(context.Context) error{
 		p.CheckImageVersion,
 		p.CopyWorktree,
@@ -367,10 +360,11 @@ func (p *Pipeline) RunAll(ctx context.Context) (Report, error) {
 	}
 	for _, run := range legs {
 		if err := run(ctx); err != nil {
-			return Report{}, err
+			return report.Report{}, err
 		}
 	}
-	return p.report, nil
+	p.result.Finalize(time.Now().UTC())
+	return p.result, nil
 }
 
 // runLeg orchestrates the LegStart/ctx-check/work/LegSuccess/LegFailure
