@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/open-gsd/gsd-test-runner/internal/bench"
+	"github.com/open-gsd/gsd-test-runner/internal/dockerexec"
 	"github.com/open-gsd/gsd-test-runner/internal/images"
 )
 
@@ -25,20 +26,20 @@ func newTestPipeline(t *testing.T, bufSize int) (*Pipeline, chan Event) {
 func stubDocker(t *testing.T, out string, err error) {
 	t.Helper()
 	original := dockerInspect
-	dockerInspect = func(ctx context.Context, dockerHost, image, format string) (string, error) {
+	dockerInspect = func(ctx context.Context, b bench.Bench, image string) (string, error) {
 		return out, err
 	}
 	t.Cleanup(func() { dockerInspect = original })
 }
 
-// stubDockerCapture is like stubDocker but captures the dockerHost
+// stubDockerCapture is like stubDocker but captures the bench
 // the stub was called with, for tests verifying transport logic.
-func stubDockerCapture(t *testing.T, out string, err error) *string {
+func stubDockerCapture(t *testing.T, out string, err error) *bench.Bench {
 	t.Helper()
 	original := dockerInspect
-	var captured string
-	dockerInspect = func(ctx context.Context, dockerHost, image, format string) (string, error) {
-		captured = dockerHost
+	var captured bench.Bench
+	dockerInspect = func(ctx context.Context, b bench.Bench, image string) (string, error) {
+		captured = b
 		return out, err
 	}
 	t.Cleanup(func() { dockerInspect = original })
@@ -104,8 +105,8 @@ func TestPipeline_StepMethods_ReturnLegErrorWithNotImplemented(t *testing.T) {
 // for LegCheckImageVersion (the first leg) whose Cause is *BenchDockerError,
 // and a zero Report.
 func TestPipeline_RunAll_StopsAtFirstError(t *testing.T) {
-	stubDocker(t, "", &dockerExecError{
-		Args:     []string{"docker", "image", "inspect"},
+	stubDocker(t, "", &dockerexec.ExecError{
+		Args:     []string{"image", "inspect"},
 		Stderr:   "Cannot connect to the Docker daemon",
 		ExitCode: 1,
 	})
@@ -133,8 +134,8 @@ func TestPipeline_RunAll_StopsAtFirstError(t *testing.T) {
 // TestPipeline_EmitsLegStartBeforeReturning verifies that CheckImageVersion
 // emits a LegStart event followed by a LegFailure event (on docker error).
 func TestPipeline_EmitsLegStartBeforeReturning(t *testing.T) {
-	stubDocker(t, "", &dockerExecError{
-		Args:     []string{"docker", "image", "inspect"},
+	stubDocker(t, "", &dockerexec.ExecError{
+		Args:     []string{"image", "inspect"},
 		Stderr:   "Cannot connect to the Docker daemon",
 		ExitCode: 1,
 	})
@@ -195,8 +196,8 @@ func TestPipeline_PreCanceledContext_ReturnsLegErrorWithContextCause(t *testing.
 // capacity-1 channel and no consumer completes without blocking. A short
 // context deadline causes the test to fail if Pipeline blocks.
 func TestEvent_FullChannel_DoesNotBlock(t *testing.T) {
-	stubDocker(t, "", &dockerExecError{
-		Args:     []string{"docker", "image", "inspect"},
+	stubDocker(t, "", &dockerexec.ExecError{
+		Args:     []string{"image", "inspect"},
 		Stderr:   "Cannot connect to the Docker daemon",
 		ExitCode: 1,
 	})
@@ -355,8 +356,8 @@ func TestCheckImageVersion_EmptyLabel_ReturnsImageVersionMismatchWithEmptyActual
 // TestCheckImageVersion_NoSuchImage_ReturnsImageNotPresent verifies that
 // docker stderr containing "No such image" maps to *ImageNotPresentError.
 func TestCheckImageVersion_NoSuchImage_ReturnsImageNotPresent(t *testing.T) {
-	stubDocker(t, "", &dockerExecError{
-		Args:     []string{"docker", "image", "inspect", "ghcr.io/foo:v1.2.3"},
+	stubDocker(t, "", &dockerexec.ExecError{
+		Args:     []string{"image", "inspect", "ghcr.io/foo:v1.2.3"},
 		Stderr:   "Error response from daemon: No such image: ghcr.io/foo:v1.2.3",
 		ExitCode: 1,
 	})
@@ -381,8 +382,8 @@ func TestCheckImageVersion_NoSuchImage_ReturnsImageNotPresent(t *testing.T) {
 // TestCheckImageVersion_GenericDockerFailure_ReturnsBenchDockerError verifies
 // that a generic docker error maps to *BenchDockerError.
 func TestCheckImageVersion_GenericDockerFailure_ReturnsBenchDockerError(t *testing.T) {
-	stubDocker(t, "", &dockerExecError{
-		Args:     []string{"docker", "image", "inspect"},
+	stubDocker(t, "", &dockerexec.ExecError{
+		Args:     []string{"image", "inspect"},
 		Stderr:   "Cannot connect to the Docker daemon at unix:///var/run/docker.sock. Is the docker daemon running?",
 		ExitCode: 1,
 	})
@@ -403,7 +404,7 @@ func TestCheckImageVersion_GenericDockerFailure_ReturnsBenchDockerError(t *testi
 }
 
 // TestCheckImageVersion_LocalBench_NoDockerHostPassed verifies that a bench
-// with Host="local" does not pass a DOCKER_HOST to dockerInspect.
+// with Host="local" passes a bench whose DockerHost() returns "" to dockerInspect.
 func TestCheckImageVersion_LocalBench_NoDockerHostPassed(t *testing.T) {
 	captured := stubDockerCapture(t, "v1.2.3\n", nil)
 	ch := make(chan Event, 16)
@@ -411,13 +412,13 @@ func TestCheckImageVersion_LocalBench_NoDockerHostPassed(t *testing.T) {
 	p := New(b, images.ImageID("gsd-tester-linux:v1.2.3"), "v1.2.3", "/tmp/worktree", ch)
 
 	_ = p.CheckImageVersion(context.Background())
-	if *captured != "" {
-		t.Errorf("expected empty dockerHost for local bench, got %q", *captured)
+	if captured.DockerHost() != "" {
+		t.Errorf("expected empty DockerHost for local bench, got %q", captured.DockerHost())
 	}
 }
 
 // TestCheckImageVersion_EmptyHost_NoDockerHostPassed verifies that a bench
-// with Host="" (empty) also does not pass a DOCKER_HOST to dockerInspect.
+// with Host="" (empty) also results in an empty DockerHost().
 func TestCheckImageVersion_EmptyHost_NoDockerHostPassed(t *testing.T) {
 	captured := stubDockerCapture(t, "v1.2.3\n", nil)
 	ch := make(chan Event, 16)
@@ -425,13 +426,13 @@ func TestCheckImageVersion_EmptyHost_NoDockerHostPassed(t *testing.T) {
 	p := New(b, images.ImageID("gsd-tester-linux:v1.2.3"), "v1.2.3", "/tmp/worktree", ch)
 
 	_ = p.CheckImageVersion(context.Background())
-	if *captured != "" {
-		t.Errorf("expected empty dockerHost for empty-host bench, got %q", *captured)
+	if captured.DockerHost() != "" {
+		t.Errorf("expected empty DockerHost for empty-host bench, got %q", captured.DockerHost())
 	}
 }
 
 // TestCheckImageVersion_RemoteBench_PassesSSHDockerHost verifies that a
-// remote bench passes DOCKER_HOST=ssh://<bench.Host> to dockerInspect.
+// remote bench has a DockerHost() of "ssh://<bench.Host>".
 func TestCheckImageVersion_RemoteBench_PassesSSHDockerHost(t *testing.T) {
 	captured := stubDockerCapture(t, "v1.2.3\n", nil)
 	ch := make(chan Event, 16)
@@ -440,8 +441,8 @@ func TestCheckImageVersion_RemoteBench_PassesSSHDockerHost(t *testing.T) {
 
 	_ = p.CheckImageVersion(context.Background())
 	want := "ssh://bench-linux-1"
-	if *captured != want {
-		t.Errorf("expected dockerHost=%q, got %q", want, *captured)
+	if captured.DockerHost() != want {
+		t.Errorf("expected DockerHost()=%q, got %q", want, captured.DockerHost())
 	}
 }
 
@@ -510,7 +511,7 @@ func TestCheckImageVersion_EmitsLegFailureOnMismatch(t *testing.T) {
 func TestCheckImageVersion_PreCanceledContext_DoesNotCallDocker(t *testing.T) {
 	called := false
 	original := dockerInspect
-	dockerInspect = func(ctx context.Context, dockerHost, image, format string) (string, error) {
+	dockerInspect = func(ctx context.Context, b bench.Bench, image string) (string, error) {
 		called = true
 		return "v1.2.3", nil
 	}

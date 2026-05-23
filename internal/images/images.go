@@ -1,15 +1,13 @@
 package images
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
-	"os"
-	"os/exec"
 	"strings"
 
 	"github.com/open-gsd/gsd-test-runner/internal/bench"
+	"github.com/open-gsd/gsd-test-runner/internal/dockerexec"
 )
 
 // ImageID is a fully-qualified Tester Image reference, typically
@@ -46,15 +44,10 @@ type EnsurePresentOptions struct {
 //   - *BuildError if the fallback build failed
 //   - *BenchDockerError if the initial presence check failed for a non-image-related reason
 func EnsurePresent(ctx context.Context, b bench.Bench, image ImageID, opts EnsurePresentOptions) error {
-	dockerHost := ""
-	if b.Host != "" && b.Host != "local" {
-		dockerHost = "ssh://" + b.Host
-	}
-
 	// 1. Check presence first.
-	present, presenceErr := imagePresent(ctx, dockerHost, string(image))
+	present, presenceErr := imagePresent(ctx, b, string(image))
 	if presenceErr != nil {
-		var de *dockerExecError
+		var de *dockerexec.ExecError
 		if errors.As(presenceErr, &de) {
 			return &BenchDockerError{
 				Bench:    b.Name,
@@ -70,13 +63,13 @@ func EnsurePresent(ctx context.Context, b bench.Bench, image ImageID, opts Ensur
 	}
 
 	// 2. Try pulling.
-	pullErr := dockerPull(ctx, dockerHost, string(image))
+	_, pullErr := dockerPull(ctx, b, string(image))
 	if pullErr == nil {
 		return nil
 	}
 
 	// 3. Classify and possibly fall back.
-	var de *dockerExecError
+	var de *dockerexec.ExecError
 	if !errors.As(pullErr, &de) {
 		return pullErr // unexpected, non-exec error
 	}
@@ -88,7 +81,7 @@ func EnsurePresent(ctx context.Context, b bench.Bench, image ImageID, opts Ensur
 		if opts.FallbackDockerfile == "" {
 			return &PullNotFoundError{Bench: b.Name, Image: string(image), Stderr: stderr}
 		}
-		return tryFallbackBuild(ctx, dockerHost, b, image, opts)
+		return tryFallbackBuild(ctx, b, image, opts)
 	default:
 		return &PullDockerError{
 			Bench:    b.Name,
@@ -100,26 +93,26 @@ func EnsurePresent(ctx context.Context, b bench.Bench, image ImageID, opts Ensur
 }
 
 // imagePresent returns true if the named image is present on the
-// docker daemon at dockerHost. Returns (false, nil) for "no such
+// docker daemon at the bench. Returns (false, nil) for "no such
 // image", (false, error) for any other failure.
-func imagePresent(ctx context.Context, dockerHost, image string) (bool, error) {
-	_, err := dockerInspect(ctx, dockerHost, image, "{{.Id}}")
+func imagePresent(ctx context.Context, b bench.Bench, image string) (bool, error) {
+	_, err := dockerInspect(ctx, b, image)
 	if err == nil {
 		return true, nil
 	}
-	var de *dockerExecError
+	var de *dockerexec.ExecError
 	if errors.As(err, &de) && strings.Contains(de.Stderr, "No such image") {
 		return false, nil
 	}
 	return false, err
 }
 
-func tryFallbackBuild(ctx context.Context, dockerHost string, b bench.Bench, image ImageID, opts EnsurePresentOptions) error {
-	buildErr := dockerBuild(ctx, dockerHost, string(image), opts.FallbackDockerfile, opts.FallbackContextDir)
+func tryFallbackBuild(ctx context.Context, b bench.Bench, image ImageID, opts EnsurePresentOptions) error {
+	_, buildErr := dockerBuild(ctx, b, opts.FallbackDockerfile, opts.FallbackContextDir, string(image))
 	if buildErr == nil {
 		return nil
 	}
-	var de *dockerExecError
+	var de *dockerexec.ExecError
 	if errors.As(buildErr, &de) {
 		return &BuildError{
 			Bench:      b.Name,
@@ -152,69 +145,19 @@ func isNotFoundError(stderr string) bool {
 		strings.Contains(lower, "manifest for")
 }
 
-// dockerExecError captures the output of a failed docker command for
-// classification by callers. Deliberately duplicated from
-// internal/pipeline — extraction to a shared internal/dockerexec
-// package will follow once a third leg implementation cements the
-// patterns (per NOTES.md "Known duplication").
-type dockerExecError struct {
-	Args     []string
-	Stdout   string
-	Stderr   string
-	ExitCode int
-}
-
-func (e *dockerExecError) Error() string {
-	return fmt.Sprintf("docker %s failed (exit %d): %s", strings.Join(e.Args, " "), e.ExitCode, strings.TrimSpace(e.Stderr))
-}
-
 // Function variables per ADR-0011 (decision 4): tests swap these for
 // stubs returning canned output, restored via t.Cleanup.
 var (
-	dockerInspect = realDockerInspect
-	dockerPull    = realDockerPull
-	dockerBuild   = realDockerBuild
+	dockerInspect = func(ctx context.Context, b bench.Bench, image string) (string, error) {
+		return dockerexec.Run(ctx, b, []string{"image", "inspect", image})
+	}
+	dockerPull = func(ctx context.Context, b bench.Bench, image string) (string, error) {
+		return dockerexec.Run(ctx, b, []string{"pull", image})
+	}
+	dockerBuild = func(ctx context.Context, b bench.Bench, dockerfile, contextDir, tag string) (string, error) {
+		return dockerexec.Run(ctx, b, []string{"build", "-t", tag, "-f", dockerfile, contextDir})
+	}
 )
-
-func realDockerInspect(ctx context.Context, dockerHost, image, format string) (string, error) {
-	args := []string{"image", "inspect", image, "--format", format}
-	return runDocker(ctx, dockerHost, args, "")
-}
-
-func realDockerPull(ctx context.Context, dockerHost, image string) error {
-	args := []string{"pull", image}
-	_, err := runDocker(ctx, dockerHost, args, "")
-	return err
-}
-
-func realDockerBuild(ctx context.Context, dockerHost, image, dockerfile, contextDir string) error {
-	args := []string{"build", "-t", image, "-f", dockerfile, contextDir}
-	_, err := runDocker(ctx, dockerHost, args, "")
-	return err
-}
-
-func runDocker(ctx context.Context, dockerHost string, args []string, _stdin string) (string, error) {
-	cmd := exec.CommandContext(ctx, "docker", args...)
-	if dockerHost != "" {
-		cmd.Env = append(os.Environ(), "DOCKER_HOST="+dockerHost)
-	}
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
-		var exitErr *exec.ExitError
-		if errors.As(err, &exitErr) {
-			return stdout.String(), &dockerExecError{
-				Args:     append([]string{"docker"}, args...),
-				Stdout:   stdout.String(),
-				Stderr:   stderr.String(),
-				ExitCode: exitErr.ExitCode(),
-			}
-		}
-		return "", fmt.Errorf("docker exec failed: %w", err)
-	}
-	return stdout.String(), nil
-}
 
 // Typed errors. Each carries Bench name + Image ID for diagnostics.
 

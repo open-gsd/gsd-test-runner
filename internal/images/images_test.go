@@ -7,14 +7,15 @@ import (
 	"testing"
 
 	"github.com/open-gsd/gsd-test-runner/internal/bench"
+	"github.com/open-gsd/gsd-test-runner/internal/dockerexec"
 )
 
 // stubAll swaps inspect/pull/build to the provided stubs (or no-ops
 // if nil), restored via t.Cleanup.
 func stubAll(t *testing.T,
-	inspect func(ctx context.Context, dockerHost, image, format string) (string, error),
-	pull func(ctx context.Context, dockerHost, image string) error,
-	build func(ctx context.Context, dockerHost, image, dockerfile, contextDir string) error,
+	inspect func(ctx context.Context, b bench.Bench, image string) (string, error),
+	pull func(ctx context.Context, b bench.Bench, image string) (string, error),
+	build func(ctx context.Context, b bench.Bench, dockerfile, contextDir, tag string) (string, error),
 ) {
 	t.Helper()
 	origI, origP, origB := dockerInspect, dockerPull, dockerBuild
@@ -34,11 +35,11 @@ func stubAll(t *testing.T,
 	})
 }
 
-// noSuchImageErr returns a dockerExecError that imagePresent recognises
+// noSuchImageErr returns a *dockerexec.ExecError that imagePresent recognises
 // as "image not present" (not a bench error).
-func noSuchImageErr() *dockerExecError {
-	return &dockerExecError{
-		Args:     []string{"docker", "image", "inspect", "img", "--format", "{{.Id}}"},
+func noSuchImageErr() *dockerexec.ExecError {
+	return &dockerexec.ExecError{
+		Args:     []string{"image", "inspect", "img"},
 		Stderr:   "Error: No such image: img",
 		ExitCode: 1,
 	}
@@ -49,12 +50,12 @@ func noSuchImageErr() *dockerExecError {
 func TestEnsurePresent_AlreadyPresent_PullNotCalled(t *testing.T) {
 	pullCalled := false
 	stubAll(t,
-		func(_ context.Context, _, _, _ string) (string, error) {
+		func(_ context.Context, _ bench.Bench, _ string) (string, error) {
 			return "sha256:abc123", nil
 		},
-		func(_ context.Context, _, _ string) error {
+		func(_ context.Context, _ bench.Bench, _ string) (string, error) {
 			pullCalled = true
-			return nil
+			return "", nil
 		},
 		nil,
 	)
@@ -74,15 +75,15 @@ func TestEnsurePresent_AlreadyPresent_PullNotCalled(t *testing.T) {
 func TestEnsurePresent_NotPresent_PullSucceeds(t *testing.T) {
 	buildCalled := false
 	stubAll(t,
-		func(_ context.Context, _, _, _ string) (string, error) {
+		func(_ context.Context, _ bench.Bench, _ string) (string, error) {
 			return "", noSuchImageErr()
 		},
-		func(_ context.Context, _, _ string) error {
-			return nil
+		func(_ context.Context, _ bench.Bench, _ string) (string, error) {
+			return "", nil
 		},
-		func(_ context.Context, _, _, _, _ string) error {
+		func(_ context.Context, _ bench.Bench, _, _, _ string) (string, error) {
 			buildCalled = true
-			return nil
+			return "", nil
 		},
 	)
 
@@ -101,11 +102,11 @@ func TestEnsurePresent_NotPresent_PullSucceeds(t *testing.T) {
 func TestEnsurePresent_PullAuthError(t *testing.T) {
 	stderr := "unauthorized: authentication required"
 	stubAll(t,
-		func(_ context.Context, _, _, _ string) (string, error) {
+		func(_ context.Context, _ bench.Bench, _ string) (string, error) {
 			return "", noSuchImageErr()
 		},
-		func(_ context.Context, _, _ string) error {
-			return &dockerExecError{Stderr: stderr, ExitCode: 1}
+		func(_ context.Context, _ bench.Bench, _ string) (string, error) {
+			return "", &dockerexec.ExecError{Stderr: stderr, ExitCode: 1}
 		},
 		nil,
 	)
@@ -137,11 +138,11 @@ func TestEnsurePresent_PullAuthError(t *testing.T) {
 // requested access to the resource is denied". Expects *PullAuthError.
 func TestEnsurePresent_PullAuthError_DeniedVariant(t *testing.T) {
 	stubAll(t,
-		func(_ context.Context, _, _, _ string) (string, error) {
+		func(_ context.Context, _ bench.Bench, _ string) (string, error) {
 			return "", noSuchImageErr()
 		},
-		func(_ context.Context, _, _ string) error {
-			return &dockerExecError{Stderr: "denied: requested access to the resource is denied", ExitCode: 1}
+		func(_ context.Context, _ bench.Bench, _ string) (string, error) {
+			return "", &dockerexec.ExecError{Stderr: "denied: requested access to the resource is denied", ExitCode: 1}
 		},
 		nil,
 	)
@@ -158,11 +159,11 @@ func TestEnsurePresent_PullAuthError_DeniedVariant(t *testing.T) {
 // auth credentials". Expects *PullAuthError.
 func TestEnsurePresent_PullAuthError_NoBasicAuthVariant(t *testing.T) {
 	stubAll(t,
-		func(_ context.Context, _, _, _ string) (string, error) {
+		func(_ context.Context, _ bench.Bench, _ string) (string, error) {
 			return "", noSuchImageErr()
 		},
-		func(_ context.Context, _, _ string) error {
-			return &dockerExecError{Stderr: "no basic auth credentials", ExitCode: 1}
+		func(_ context.Context, _ bench.Bench, _ string) (string, error) {
+			return "", &dockerexec.ExecError{Stderr: "no basic auth credentials", ExitCode: 1}
 		},
 		nil,
 	)
@@ -181,15 +182,15 @@ func TestEnsurePresent_PullAuthError_NoBasicAuthVariant(t *testing.T) {
 func TestEnsurePresent_PullNotFound_NoFallback_ReturnsPullNotFoundError(t *testing.T) {
 	buildCalled := false
 	stubAll(t,
-		func(_ context.Context, _, _, _ string) (string, error) {
+		func(_ context.Context, _ bench.Bench, _ string) (string, error) {
 			return "", noSuchImageErr()
 		},
-		func(_ context.Context, _, _ string) error {
-			return &dockerExecError{Stderr: "manifest unknown", ExitCode: 1}
+		func(_ context.Context, _ bench.Bench, _ string) (string, error) {
+			return "", &dockerexec.ExecError{Stderr: "manifest unknown", ExitCode: 1}
 		},
-		func(_ context.Context, _, _, _, _ string) error {
+		func(_ context.Context, _ bench.Bench, _, _, _ string) (string, error) {
 			buildCalled = true
-			return nil
+			return "", nil
 		},
 	)
 
@@ -208,11 +209,11 @@ func TestEnsurePresent_PullNotFound_NoFallback_ReturnsPullNotFoundError(t *testi
 // ghcr.io/foo:v1 not found". Expects *PullNotFoundError when no fallback.
 func TestEnsurePresent_PullNotFound_NotFoundVariant(t *testing.T) {
 	stubAll(t,
-		func(_ context.Context, _, _, _ string) (string, error) {
+		func(_ context.Context, _ bench.Bench, _ string) (string, error) {
 			return "", noSuchImageErr()
 		},
-		func(_ context.Context, _, _ string) error {
-			return &dockerExecError{Stderr: "Error response from daemon: manifest for ghcr.io/foo:v1 not found", ExitCode: 1}
+		func(_ context.Context, _ bench.Bench, _ string) (string, error) {
+			return "", &dockerexec.ExecError{Stderr: "Error response from daemon: manifest for ghcr.io/foo:v1 not found", ExitCode: 1}
 		},
 		nil,
 	)
@@ -231,16 +232,16 @@ func TestEnsurePresent_PullNotFound_NotFoundVariant(t *testing.T) {
 func TestEnsurePresent_PullNotFound_FallbackBuildSucceeds(t *testing.T) {
 	var capturedDockerfile, capturedContextDir string
 	stubAll(t,
-		func(_ context.Context, _, _, _ string) (string, error) {
+		func(_ context.Context, _ bench.Bench, _ string) (string, error) {
 			return "", noSuchImageErr()
 		},
-		func(_ context.Context, _, _ string) error {
-			return &dockerExecError{Stderr: "manifest unknown", ExitCode: 1}
+		func(_ context.Context, _ bench.Bench, _ string) (string, error) {
+			return "", &dockerexec.ExecError{Stderr: "manifest unknown", ExitCode: 1}
 		},
-		func(_ context.Context, _, _, dockerfile, contextDir string) error {
+		func(_ context.Context, _ bench.Bench, dockerfile, contextDir, _ string) (string, error) {
 			capturedDockerfile = dockerfile
 			capturedContextDir = contextDir
-			return nil
+			return "", nil
 		},
 	)
 
@@ -262,19 +263,19 @@ func TestEnsurePresent_PullNotFound_FallbackBuildSucceeds(t *testing.T) {
 }
 
 // TestEnsurePresent_PullNotFound_FallbackBuildFails — pull not-found,
-// fallback configured, build returns dockerExecError. Expects *BuildError
+// fallback configured, build returns dockerexec.ExecError. Expects *BuildError
 // with Dockerfile, ContextDir, Stderr fields populated.
 func TestEnsurePresent_PullNotFound_FallbackBuildFails(t *testing.T) {
 	buildStderr := "failed to solve: error from rpc"
 	stubAll(t,
-		func(_ context.Context, _, _, _ string) (string, error) {
+		func(_ context.Context, _ bench.Bench, _ string) (string, error) {
 			return "", noSuchImageErr()
 		},
-		func(_ context.Context, _, _ string) error {
-			return &dockerExecError{Stderr: "manifest unknown", ExitCode: 1}
+		func(_ context.Context, _ bench.Bench, _ string) (string, error) {
+			return "", &dockerexec.ExecError{Stderr: "manifest unknown", ExitCode: 1}
 		},
-		func(_ context.Context, _, _, _, _ string) error {
-			return &dockerExecError{Stderr: buildStderr, ExitCode: 1}
+		func(_ context.Context, _ bench.Bench, _, _, _ string) (string, error) {
+			return "", &dockerexec.ExecError{Stderr: buildStderr, ExitCode: 1}
 		},
 	)
 
@@ -304,11 +305,11 @@ func TestEnsurePresent_PullNotFound_FallbackBuildFails(t *testing.T) {
 // *PullDockerError.
 func TestEnsurePresent_PullGenericFailure_ReturnsPullDockerError(t *testing.T) {
 	stubAll(t,
-		func(_ context.Context, _, _, _ string) (string, error) {
+		func(_ context.Context, _ bench.Bench, _ string) (string, error) {
 			return "", noSuchImageErr()
 		},
-		func(_ context.Context, _, _ string) error {
-			return &dockerExecError{Stderr: "Get https://ghcr.io/v2/: dial tcp: lookup ghcr.io: no such host", ExitCode: 1}
+		func(_ context.Context, _ bench.Bench, _ string) (string, error) {
+			return "", &dockerexec.ExecError{Stderr: "Get https://ghcr.io/v2/: dial tcp: lookup ghcr.io: no such host", ExitCode: 1}
 		},
 		nil,
 	)
@@ -322,13 +323,13 @@ func TestEnsurePresent_PullGenericFailure_ReturnsPullDockerError(t *testing.T) {
 }
 
 // TestEnsurePresent_InitialInspectFails_NonImageError_ReturnsBenchDockerError
-// — inspect returns dockerExecError with "Cannot connect to the Docker daemon"
+// — inspect returns dockerexec.ExecError with "Cannot connect to the Docker daemon"
 // (not "No such image"). Expects *BenchDockerError.
 func TestEnsurePresent_InitialInspectFails_NonImageError_ReturnsBenchDockerError(t *testing.T) {
 	stubAll(t,
-		func(_ context.Context, _, _, _ string) (string, error) {
-			return "", &dockerExecError{
-				Args:     []string{"docker", "image", "inspect"},
+		func(_ context.Context, _ bench.Bench, _ string) (string, error) {
+			return "", &dockerexec.ExecError{
+				Args:     []string{"image", "inspect"},
 				Stderr:   "Cannot connect to the Docker daemon at unix:///var/run/docker.sock",
 				ExitCode: 1,
 			}
@@ -349,12 +350,12 @@ func TestEnsurePresent_InitialInspectFails_NonImageError_ReturnsBenchDockerError
 }
 
 // TestEnsurePresent_LocalBench_NoDockerHostPassed — bench.Host = "local";
-// dockerHost passed to inspect stub must be "".
+// bench passed to inspect stub must have DockerHost() == "".
 func TestEnsurePresent_LocalBench_NoDockerHostPassed(t *testing.T) {
-	var capturedHost string
+	var capturedBench bench.Bench
 	stubAll(t,
-		func(_ context.Context, dockerHost, _, _ string) (string, error) {
-			capturedHost = dockerHost
+		func(_ context.Context, b bench.Bench, _ string) (string, error) {
+			capturedBench = b
 			return "sha256:abc", nil
 		},
 		nil,
@@ -366,18 +367,18 @@ func TestEnsurePresent_LocalBench_NoDockerHostPassed(t *testing.T) {
 	if err != nil {
 		t.Fatalf("expected nil, got %v", err)
 	}
-	if capturedHost != "" {
-		t.Errorf("dockerHost = %q, want %q (empty)", capturedHost, "")
+	if capturedBench.DockerHost() != "" {
+		t.Errorf("DockerHost() = %q, want %q (empty)", capturedBench.DockerHost(), "")
 	}
 }
 
 // TestEnsurePresent_EmptyHost_NoDockerHostPassed — bench.Host = "";
-// dockerHost must be "" (same as local).
+// bench passed to inspect stub must have DockerHost() == "" (same as local).
 func TestEnsurePresent_EmptyHost_NoDockerHostPassed(t *testing.T) {
-	var capturedHost string
+	var capturedBench bench.Bench
 	stubAll(t,
-		func(_ context.Context, dockerHost, _, _ string) (string, error) {
-			capturedHost = dockerHost
+		func(_ context.Context, b bench.Bench, _ string) (string, error) {
+			capturedBench = b
 			return "sha256:abc", nil
 		},
 		nil,
@@ -389,19 +390,19 @@ func TestEnsurePresent_EmptyHost_NoDockerHostPassed(t *testing.T) {
 	if err != nil {
 		t.Fatalf("expected nil, got %v", err)
 	}
-	if capturedHost != "" {
-		t.Errorf("dockerHost = %q, want %q (empty)", capturedHost, "")
+	if capturedBench.DockerHost() != "" {
+		t.Errorf("DockerHost() = %q, want %q (empty)", capturedBench.DockerHost(), "")
 	}
 }
 
 // TestEnsurePresent_RemoteBench_PassesSSHDockerHost — bench.Host =
-// "bench-linux-1"; dockerHost passed to inspect stub must be
-// "ssh://bench-linux-1".
+// "bench-linux-1"; bench passed to inspect stub must have DockerHost()
+// == "ssh://bench-linux-1".
 func TestEnsurePresent_RemoteBench_PassesSSHDockerHost(t *testing.T) {
-	var capturedHost string
+	var capturedBench bench.Bench
 	stubAll(t,
-		func(_ context.Context, dockerHost, _, _ string) (string, error) {
-			capturedHost = dockerHost
+		func(_ context.Context, b bench.Bench, _ string) (string, error) {
+			capturedBench = b
 			return "sha256:abc", nil
 		},
 		nil,
@@ -413,8 +414,8 @@ func TestEnsurePresent_RemoteBench_PassesSSHDockerHost(t *testing.T) {
 	if err != nil {
 		t.Fatalf("expected nil, got %v", err)
 	}
-	if capturedHost != "ssh://bench-linux-1" {
-		t.Errorf("dockerHost = %q, want %q", capturedHost, "ssh://bench-linux-1")
+	if capturedBench.DockerHost() != "ssh://bench-linux-1" {
+		t.Errorf("DockerHost() = %q, want %q", capturedBench.DockerHost(), "ssh://bench-linux-1")
 	}
 }
 
@@ -423,11 +424,11 @@ func TestEnsurePresent_RemoteBench_PassesSSHDockerHost(t *testing.T) {
 func TestEnsurePresent_PreCanceledContext_PropagatesContextError(t *testing.T) {
 	inspectCalled := false
 	stubAll(t,
-		func(ctx context.Context, _, _, _ string) (string, error) {
+		func(ctx context.Context, _ bench.Bench, _ string) (string, error) {
 			inspectCalled = true
 			// Honour the cancelled context.
 			if err := ctx.Err(); err != nil {
-				return "", &dockerExecError{Stderr: err.Error(), ExitCode: 1}
+				return "", &dockerexec.ExecError{Stderr: err.Error(), ExitCode: 1}
 			}
 			return "sha256:abc", nil
 		},
