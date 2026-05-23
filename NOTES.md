@@ -45,10 +45,10 @@ and update any internal import paths (none yet — packages are skeleton-only).
 | Package | ADR | Status |
 |---|---|---|
 | `cmd/gsd-test`         | 0009 | minimal main, exits 3 |
-| `internal/bench`       | 0007, 0008 | doc.go only |
+| `internal/bench`       | 0007, 0008 | doc.go + Bench struct (minimal) |
 | `internal/config`      | 0007       | doc.go only |
-| `internal/images`      | 0001, 0005 | doc.go only |
-| `internal/pipeline`    | 0008       | doc.go only |
+| `internal/images`      | 0001, 0005 | doc.go + ImageID newtype (minimal) |
+| `internal/pipeline`    | 0008       | skeleton: LegError, Event, 8 stubbed step methods, RunAll |
 | `internal/plan`        | 0009       | doc.go only |
 | `internal/renderer`    | 0009       | doc.go only |
 | `internal/worktree`    | 0002       | Construct(): scratch clone + merge |
