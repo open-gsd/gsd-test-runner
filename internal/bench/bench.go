@@ -1,5 +1,9 @@
 package bench
 
+// Local is the Bench.Host value indicating the Local Engine should use
+// the Dev Workstation's own docker daemon (no DOCKER_HOST env var).
+const Local = "local"
+
 // Bench is a remote SSH-reachable machine that runs containerized
 // test suites on behalf of a Dev Workstation. One Bench per target
 // OS family.
@@ -20,4 +24,14 @@ type Bench struct {
 	// OS is the Bench's OS family: "linux", "windows", or
 	// "macos-container" (future per ADR-0001).
 	OS string
+}
+
+// DockerHost returns the DOCKER_HOST environment variable value for
+// reaching this Bench's docker daemon. Returns "" when the bench is
+// local (no env var needed).
+func (b Bench) DockerHost() string {
+	if b.Host == "" || b.Host == Local {
+		return ""
+	}
+	return "ssh://" + b.Host
 }

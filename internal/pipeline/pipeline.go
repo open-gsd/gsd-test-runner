@@ -1,16 +1,14 @@
 package pipeline
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
-	"os"
-	"os/exec"
 	"strings"
 	"time"
 
 	"github.com/open-gsd/gsd-test-runner/internal/bench"
+	"github.com/open-gsd/gsd-test-runner/internal/dockerexec"
 	"github.com/open-gsd/gsd-test-runner/internal/images"
 )
 
@@ -77,19 +75,6 @@ func (e *LegError) Error() string {
 
 func (e *LegError) Unwrap() error { return e.Cause }
 
-// dockerExecError captures the output of a failed docker command for
-// stage-specific classification by callers.
-type dockerExecError struct {
-	Args     []string
-	Stdout   string
-	Stderr   string
-	ExitCode int
-}
-
-func (e *dockerExecError) Error() string {
-	return fmt.Sprintf("docker %s failed (exit %d): %s", strings.Join(e.Args, " "), e.ExitCode, strings.TrimSpace(e.Stderr))
-}
-
 // ImageVersionMismatch reports that the Tester Image's
 // sh.gsd-test.image-version label does not match the expected version
 // (or the label is missing entirely — Actual is "").
@@ -134,32 +119,11 @@ func (e *BenchDockerError) Error() string {
 }
 
 // dockerInspect is a package-level variable per ADR-0011 (decision 4).
-// Tests swap it for a stub via t.Cleanup. Real implementation shells
-// out to docker via os/exec.
-var dockerInspect = realDockerInspect
-
-func realDockerInspect(ctx context.Context, dockerHost, image, format string) (string, error) {
-	args := []string{"image", "inspect", image, "--format", format}
-	cmd := exec.CommandContext(ctx, "docker", args...)
-	if dockerHost != "" {
-		cmd.Env = append(os.Environ(), "DOCKER_HOST="+dockerHost)
-	}
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
-		var exitErr *exec.ExitError
-		if errors.As(err, &exitErr) {
-			return stdout.String(), &dockerExecError{
-				Args:     append([]string{"docker"}, args...),
-				Stdout:   stdout.String(),
-				Stderr:   stderr.String(),
-				ExitCode: exitErr.ExitCode(),
-			}
-		}
-		return "", fmt.Errorf("docker exec failed: %w", err)
-	}
-	return stdout.String(), nil
+// Tests swap it for a stub via t.Cleanup. Real implementation delegates
+// to dockerexec.Run.
+var dockerInspect = func(ctx context.Context, b bench.Bench, image string) (string, error) {
+	const labelFormat = `{{ index .Config.Labels "sh.gsd-test.image-version" }}`
+	return dockerexec.Run(ctx, b, []string{"image", "inspect", image, "--format", labelFormat})
 }
 
 // EventKind discriminates the variants of Event. Per ADR-0008, the
@@ -267,14 +231,9 @@ func (p *Pipeline) CheckImageVersion(ctx context.Context) error {
 
 func (p *Pipeline) checkImageVersionWork(ctx context.Context) func() error {
 	return func() error {
-		dockerHost := ""
-		if p.bench.Host != "" && p.bench.Host != "local" {
-			dockerHost = "ssh://" + p.bench.Host
-		}
-		const labelFormat = `{{ index .Config.Labels "sh.gsd-test.image-version" }}`
-		out, err := dockerInspect(ctx, dockerHost, string(p.image), labelFormat)
+		out, err := dockerInspect(ctx, p.bench, string(p.image))
 		if err != nil {
-			var de *dockerExecError
+			var de *dockerexec.ExecError
 			if errors.As(err, &de) {
 				if strings.Contains(de.Stderr, "No such image") {
 					return &ImageNotPresentError{
