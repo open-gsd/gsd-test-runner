@@ -16,6 +16,14 @@ Future direction: **macOS Containers** support is planned — Apple's native con
 
 A versioned Docker image, one per supported OS (Linux, Windows, future macOS Containers), holding only the *test-execution sandbox*: base OS, Node runtime, build toolchain, the Reporter at a known in-image path, sandbox config (HOME, perms, npm cache location), and an Image-version sentinel file. Contains zero project code and zero test files. Distributed primarily via GHCR; the Dockerfile in this repo is the fallback build path and the canonical source CI builds from.
 
+### Dev Workstation
+
+The developer's own machine where the Local Engine runs. Must be platform-agnostic: macOS, Linux, or Windows. Holds the project source, the Local Engine binary, and SSH credentials for reaching one or more Benches. Does NOT run containers itself — that work is offloaded to Benches so the laptop isn't burdened by full test suites.
+
+### Bench
+
+A remote machine the Dev Workstation hands containerized test runs off to. SSH-reachable, has Docker (or a compatible container runtime) installed, and holds one or more pulled Tester Images. One Bench per target OS family (Linux Bench, Windows Bench, future macOS Container Bench). Typically the developer's own hardware — a desktop, a home-lab box, a spare workstation — not shared infrastructure or CI fleet. The name comes from the engineering "test bench": an isolated environment for running experiments on the unit under test.
+
 ### Image-version sentinel
 
 A file baked into each Tester Image at a known path containing the image's version tag. The Local Engine reads it before running; if it doesn't match the expected version for this repo checkout, the Engine fails loud. Closes the "stale image silently produces wrong results" failure class.
@@ -26,7 +34,7 @@ The per-run payload. Constructed by the Local Engine in a scratch clone: base br
 
 ### Local Engine
 
-The developer-side launcher. Per OS: (1) constructs the PR-merged worktree, (2) verifies the right Tester Image is present locally (pulls from GHCR if not, or builds from the in-repo Dockerfile as fallback), (3) checks the Image-version sentinel, (4) copies the worktree into a fresh container, (5) runs npm ci + build + the full test suite, (6) drains JSON Lines output, (7) emits a per-OS report (`pass x/y` or structured fail details). Each OS runs independently; there is no cross-OS comparison.
+The developer-side launcher, distributed as a single static Go binary per Dev Workstation OS (see ADR-0006). Per OS: (1) constructs the PR-merged worktree on the Dev Workstation, (2) selects a Bench for the target OS and verifies the right Tester Image is present on that Bench (pulls from GHCR if not, or builds from the in-repo Dockerfile as fallback), (3) checks the Image-version sentinel, (4) copies the worktree into a fresh container on the Bench, (5) runs npm ci + build + the full test suite, (6) drains JSON Lines output, (7) emits a Per-OS report. Each target OS runs independently on its assigned Bench; there is no cross-OS comparison.
 
 ### Per-OS report
 
@@ -38,7 +46,7 @@ The Local Engine's contract: every leg of the pipeline (image-version check, mer
 
 ### GHCR distribution
 
-Tester Images are published to GitHub Container Registry from this repo's CI on tagged releases. Local Engines pull tagged images by version. Eliminates the per-host build drift that plagued the transitional architecture.
+Tester Images are published to GitHub Container Registry from this repo's CI on tagged releases. Local Engines pull tagged images by version. Eliminates the per-host build drift that plagued the transitional architecture. Benches pull tagged images on first use; the Dev Workstation never holds Tester Images itself.
 
 ---
 
@@ -82,7 +90,7 @@ The rsync'd copy of the developer's working tree on a remote Docker host. Persis
 
 ### Host
 
-_Transitional — will be retired when the target architecture lands._
+_Transitional — superseded by the target term **Bench**. Retained here only to map old terminology to new._
 
 An SSH alias listed in ~/.config/gsd-test/hosts (Linux) or ~/.config/gsd-test/windows-hosts (Windows). These are typically the developer's own machines — a workstation, a home lab box, a second box on the same network — not shared infra or a CI fleet. Key-auth SSH is the assumed trust boundary because it's the developer's own network. Must be key-authenticated and have Docker installed.
 
@@ -133,3 +141,4 @@ These modules describe the current INSTALL_GSD_TEST.sh-embedded implementation. 
 - **CI execution.** This project is deliberately a local-dev tool. CI parity is the goal — catching platform bugs before you push, while the edit loop is still hot — but CI execution is explicitly someone else's job. There is no .github/workflows here and there never will be.
 - **Tested-package conventions.** This repo has no tests of its own — the harness is too thin to warrant them, and dogfooding via the get-shit-done suite covers the real risks.
 - **Cross-OS divergence reporting.** The transitional Diff did this; the target Per-OS report does not. If platforms disagree, the user reads two reports.
+- **Running containers on the Dev Workstation.** The Dev Workstation orchestrates; Benches execute. A developer with no Bench cannot use the harness — they must SSH-reach at least one machine per target OS they want covered.
