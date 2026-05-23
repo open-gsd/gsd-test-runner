@@ -61,45 +61,9 @@ func TestNew_NilEventChannelOK(t *testing.T) {
 	}
 }
 
-// TestPipeline_StepMethods_ReturnLegErrorWithNotImplemented table-tests the
-// 3 still-stubbed step methods: each must return a *LegError whose Cause is
-// ErrNotImplemented and whose Leg field matches the expected leg constant.
-// CheckImageVersion is excluded — it has its own dedicated tests below.
-// Drain and Parse are excluded — they are implemented in an earlier slice.
-// StartContainer and CopyWorktree are excluded — they are implemented in G1.
-func TestPipeline_StepMethods_ReturnLegErrorWithNotImplemented(t *testing.T) {
-	type stepCase struct {
-		name     string
-		leg      Leg
-		callStep func(*Pipeline, context.Context) error
-	}
-	cases := []stepCase{
-		{"NpmCI", LegNpmCI, (*Pipeline).NpmCI},
-		{"Build", LegBuild, (*Pipeline).Build},
-		{"RunTests", LegRunTests, (*Pipeline).RunTests},
-	}
-
-	for _, tc := range cases {
-		tc := tc
-		t.Run(tc.name, func(t *testing.T) {
-			p, _ := newTestPipeline(t, 16)
-			err := tc.callStep(p, context.Background())
-			if err == nil {
-				t.Fatal("expected error, got nil")
-			}
-			var legErr *LegError
-			if !errors.As(err, &legErr) {
-				t.Fatalf("expected *LegError, got %T: %v", err, err)
-			}
-			if legErr.Leg != tc.leg {
-				t.Errorf("expected Leg=%v, got %v", tc.leg, legErr.Leg)
-			}
-			if !errors.Is(legErr.Cause, ErrNotImplemented) {
-				t.Errorf("expected Cause=ErrNotImplemented, got %v", legErr.Cause)
-			}
-		})
-	}
-}
+// TestPipeline_StepMethods_ReturnLegErrorWithNotImplemented was removed: all
+// 8 legs are now implemented (NpmCI/Build/RunTests in this PR; StartContainer/
+// CopyWorktree in ADR-0008). No stubs remain to test.
 
 // TestPipeline_RunAll_StopsAtFirstError verifies RunAll returns a *LegError
 // for LegCheckImageVersion (the first leg) whose Cause is *BenchDockerError,
@@ -255,7 +219,8 @@ func TestLeg_String_ContainsLegName(t *testing.T) {
 }
 
 // TestEventKind_String_ContainsKindName verifies that each EventKind's
-// String() returns the expected stable identifier.
+// String() returns the expected stable identifier. EventReport was removed
+// per ADR-0017 dec 3.
 func TestEventKind_String_ContainsKindName(t *testing.T) {
 	cases := []struct {
 		kind EventKind
@@ -267,7 +232,6 @@ func TestEventKind_String_ContainsKindName(t *testing.T) {
 		{EventChildOutput, "child_output"},
 		{EventTestPass, "test_pass"},
 		{EventTestFail, "test_fail"},
-		{EventReport, "report"},
 	}
 	for _, tc := range cases {
 		tc := tc
@@ -1253,5 +1217,397 @@ func TestParse_MalformedJSONLInDrainedFile(t *testing.T) {
 	}
 	if malformedErr.Line != 2 {
 		t.Errorf("expected MalformedJSONLError.Line=2, got %d", malformedErr.Line)
+	}
+}
+
+// --- dockerStream stub helpers ---
+
+// stubDockerStream replaces the dockerStream package var with fn and restores
+// it via t.Cleanup.
+func stubDockerStream(t *testing.T, fn func(ctx context.Context, b bench.Bench, args []string, stdoutLine, stderrLine dockerexec.LineHandler) error) {
+	t.Helper()
+	original := dockerStream
+	dockerStream = fn
+	t.Cleanup(func() { dockerStream = original })
+}
+
+// filterEvents returns events of the given kind from a slice.
+func filterEvents(events []Event, kind EventKind) []Event {
+	var out []Event
+	for _, e := range events {
+		if e.Kind == kind {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
+// --- NpmCI tests ---
+
+// TestNpmCI_NoContainerID verifies that NpmCI with no containerID returns a
+// *LegError wrapping *NpmCIError with a non-nil Cause about the missing ID.
+func TestNpmCI_NoContainerID(t *testing.T) {
+	p, _ := newTestPipeline(t, 16)
+	// containerID is empty — StartContainer was not called.
+
+	err := p.NpmCI(context.Background())
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	var legErr *LegError
+	if !errors.As(err, &legErr) {
+		t.Fatalf("expected *LegError, got %T: %v", err, err)
+	}
+	if legErr.Leg != LegNpmCI {
+		t.Errorf("expected Leg=LegNpmCI, got %v", legErr.Leg)
+	}
+	var npmErr *NpmCIError
+	if !errors.As(legErr.Cause, &npmErr) {
+		t.Fatalf("expected Cause=*NpmCIError, got %T: %v", legErr.Cause, legErr.Cause)
+	}
+	if npmErr.Cause == nil {
+		t.Error("expected NpmCIError.Cause to be non-nil for missing containerID")
+	}
+	if !strings.Contains(npmErr.Cause.Error(), "containerID") {
+		t.Errorf("expected Cause to mention containerID, got: %v", npmErr.Cause)
+	}
+}
+
+// TestNpmCI_Success verifies that when dockerStream succeeds and emits stdout
+// lines, NpmCI returns nil and the pipeline emits the correct EventChildOutput
+// events with Stream="stdout" and Leg=LegNpmCI.
+func TestNpmCI_Success(t *testing.T) {
+	stubDockerStream(t, func(ctx context.Context, b bench.Bench, args []string, stdoutLine, stderrLine dockerexec.LineHandler) error {
+		stdoutLine("added 42 packages")
+		stdoutLine("npm ci: ok")
+		stdoutLine("done")
+		return nil
+	})
+
+	p, ch := newTestPipeline(t, 32)
+	p.containerID = "test-container"
+
+	err := p.NpmCI(context.Background())
+	if err != nil {
+		t.Fatalf("expected nil error, got: %v", err)
+	}
+
+	close(ch)
+	var events []Event
+	for e := range ch {
+		events = append(events, e)
+	}
+
+	// Expect: LegStart, 3×EventChildOutput, LegSuccess.
+	childOutputEvents := filterEvents(events, EventChildOutput)
+	if len(childOutputEvents) != 3 {
+		t.Fatalf("expected 3 EventChildOutput events, got %d", len(childOutputEvents))
+	}
+	for i, ev := range childOutputEvents {
+		if ev.Stream != "stdout" {
+			t.Errorf("events[%d].Stream: expected %q, got %q", i, "stdout", ev.Stream)
+		}
+		if ev.Leg != LegNpmCI {
+			t.Errorf("events[%d].Leg: expected LegNpmCI, got %v", i, ev.Leg)
+		}
+	}
+	if childOutputEvents[0].Line != "added 42 packages" {
+		t.Errorf("expected first line %q, got %q", "added 42 packages", childOutputEvents[0].Line)
+	}
+}
+
+// TestNpmCI_NonZeroExit verifies that when dockerStream returns *ExecError,
+// NpmCI returns a *LegError wrapping *NpmCIError with the stderr captured.
+func TestNpmCI_NonZeroExit(t *testing.T) {
+	stubDockerStream(t, func(ctx context.Context, b bench.Bench, args []string, stdoutLine, stderrLine dockerexec.LineHandler) error {
+		stderrLine("npm ERR! missing peer dep")
+		stderrLine("npm ERR! resolve failed")
+		return &dockerexec.ExecError{Args: args, ExitCode: 1}
+	})
+
+	p, _ := newTestPipeline(t, 32)
+	p.containerID = "test-container"
+
+	err := p.NpmCI(context.Background())
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	var legErr *LegError
+	if !errors.As(err, &legErr) {
+		t.Fatalf("expected *LegError, got %T: %v", err, err)
+	}
+	var npmErr *NpmCIError
+	if !errors.As(legErr.Cause, &npmErr) {
+		t.Fatalf("expected Cause=*NpmCIError, got %T: %v", legErr.Cause, legErr.Cause)
+	}
+	if npmErr.ExitCode != 1 {
+		t.Errorf("expected ExitCode=1, got %d", npmErr.ExitCode)
+	}
+	if !strings.Contains(npmErr.Stderr, "npm ERR! missing peer dep") {
+		t.Errorf("expected Stderr to contain first error line, got: %q", npmErr.Stderr)
+	}
+	if !strings.Contains(npmErr.Stderr, "npm ERR! resolve failed") {
+		t.Errorf("expected Stderr to contain second error line, got: %q", npmErr.Stderr)
+	}
+}
+
+// --- Build tests ---
+
+// TestBuild_NoContainerID verifies Build with no containerID returns *BuildError.
+func TestBuild_NoContainerID(t *testing.T) {
+	p, _ := newTestPipeline(t, 16)
+
+	err := p.Build(context.Background())
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	var legErr *LegError
+	if !errors.As(err, &legErr) {
+		t.Fatalf("expected *LegError, got %T: %v", err, err)
+	}
+	if legErr.Leg != LegBuild {
+		t.Errorf("expected Leg=LegBuild, got %v", legErr.Leg)
+	}
+	var buildErr *BuildError
+	if !errors.As(legErr.Cause, &buildErr) {
+		t.Fatalf("expected Cause=*BuildError, got %T: %v", legErr.Cause, legErr.Cause)
+	}
+	if buildErr.Cause == nil {
+		t.Error("expected BuildError.Cause to be non-nil for missing containerID")
+	}
+}
+
+// TestBuild_Success verifies Build returns nil and emits correct events on success.
+func TestBuild_Success(t *testing.T) {
+	stubDockerStream(t, func(ctx context.Context, b bench.Bench, args []string, stdoutLine, stderrLine dockerexec.LineHandler) error {
+		stdoutLine("build complete")
+		stdoutLine("dist/index.js written")
+		return nil
+	})
+
+	p, ch := newTestPipeline(t, 32)
+	p.containerID = "test-container"
+
+	err := p.Build(context.Background())
+	if err != nil {
+		t.Fatalf("expected nil error, got: %v", err)
+	}
+
+	close(ch)
+	var events []Event
+	for e := range ch {
+		events = append(events, e)
+	}
+
+	childOutputEvents := filterEvents(events, EventChildOutput)
+	if len(childOutputEvents) != 2 {
+		t.Fatalf("expected 2 EventChildOutput events, got %d", len(childOutputEvents))
+	}
+	for i, ev := range childOutputEvents {
+		if ev.Stream != "stdout" {
+			t.Errorf("events[%d].Stream: expected %q, got %q", i, "stdout", ev.Stream)
+		}
+		if ev.Leg != LegBuild {
+			t.Errorf("events[%d].Leg: expected LegBuild, got %v", i, ev.Leg)
+		}
+	}
+}
+
+// TestBuild_Failure verifies Build returns *BuildError wrapping stderr on non-zero exit.
+func TestBuild_Failure(t *testing.T) {
+	stubDockerStream(t, func(ctx context.Context, b bench.Bench, args []string, stdoutLine, stderrLine dockerexec.LineHandler) error {
+		stderrLine("tsc: error TS2345: bad type")
+		return &dockerexec.ExecError{Args: args, ExitCode: 2}
+	})
+
+	p, _ := newTestPipeline(t, 16)
+	p.containerID = "test-container"
+
+	err := p.Build(context.Background())
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	var legErr *LegError
+	if !errors.As(err, &legErr) {
+		t.Fatalf("expected *LegError, got %T: %v", err, err)
+	}
+	var buildErr *BuildError
+	if !errors.As(legErr.Cause, &buildErr) {
+		t.Fatalf("expected Cause=*BuildError, got %T: %v", legErr.Cause, legErr.Cause)
+	}
+	if buildErr.ExitCode != 2 {
+		t.Errorf("expected ExitCode=2, got %d", buildErr.ExitCode)
+	}
+	if !strings.Contains(buildErr.Stderr, "tsc: error TS2345") {
+		t.Errorf("expected Stderr to contain error, got: %q", buildErr.Stderr)
+	}
+}
+
+// --- RunTests tests ---
+
+// TestRunTests_NoContainerID verifies RunTests with no containerID returns *TestRunError.
+func TestRunTests_NoContainerID(t *testing.T) {
+	p, _ := newTestPipeline(t, 16)
+
+	err := p.RunTests(context.Background())
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	var legErr *LegError
+	if !errors.As(err, &legErr) {
+		t.Fatalf("expected *LegError, got %T: %v", err, err)
+	}
+	if legErr.Leg != LegRunTests {
+		t.Errorf("expected Leg=LegRunTests, got %v", legErr.Leg)
+	}
+	var runErr *TestRunError
+	if !errors.As(legErr.Cause, &runErr) {
+		t.Fatalf("expected Cause=*TestRunError, got %T: %v", legErr.Cause, legErr.Cause)
+	}
+	if runErr.Cause == nil {
+		t.Error("expected TestRunError.Cause to be non-nil for missing containerID")
+	}
+}
+
+// TestRunTests_Success_TestsPass verifies that when the test subprocess exits 0,
+// RunTests returns nil (no leg error).
+func TestRunTests_Success_TestsPass(t *testing.T) {
+	// Both calls (test exec + tail exec) return nil immediately.
+	stubDockerStream(t, func(ctx context.Context, b bench.Bench, args []string, stdoutLine, stderrLine dockerexec.LineHandler) error {
+		return nil
+	})
+
+	p, _ := newTestPipeline(t, 32)
+	p.containerID = "test-container"
+
+	err := p.RunTests(context.Background())
+	if err != nil {
+		t.Fatalf("expected nil error, got: %v", err)
+	}
+}
+
+// TestRunTests_Success_TestsFail verifies that when the test subprocess exits 1
+// (tests ran but failed), RunTests still returns nil — test failures are surfaced
+// by the Parse leg, not the RunTests leg.
+func TestRunTests_Success_TestsFail(t *testing.T) {
+	stubDockerStream(t, func(ctx context.Context, b bench.Bench, args []string, stdoutLine, stderrLine dockerexec.LineHandler) error {
+		// Tail call (matches "tail" in args) returns nil immediately.
+		for _, a := range args {
+			if a == "tail" {
+				return nil
+			}
+		}
+		// Test exec returns exit 1.
+		return &dockerexec.ExecError{Args: args, ExitCode: 1}
+	})
+
+	p, _ := newTestPipeline(t, 32)
+	p.containerID = "test-container"
+
+	err := p.RunTests(context.Background())
+	if err != nil {
+		t.Fatalf("expected nil error for exit 1 (tests failed but ran), got: %v", err)
+	}
+}
+
+// TestRunTests_RunnerCrash verifies that when the test subprocess exits with
+// code > 1 (OOM, signal, etc.), RunTests returns a *TestRunError.
+func TestRunTests_RunnerCrash(t *testing.T) {
+	stubDockerStream(t, func(ctx context.Context, b bench.Bench, args []string, stdoutLine, stderrLine dockerexec.LineHandler) error {
+		for _, a := range args {
+			if a == "tail" {
+				return nil
+			}
+		}
+		return &dockerexec.ExecError{Args: args, ExitCode: 137}
+	})
+
+	p, _ := newTestPipeline(t, 32)
+	p.containerID = "test-container"
+
+	err := p.RunTests(context.Background())
+	if err == nil {
+		t.Fatal("expected error for exit 137, got nil")
+	}
+	var legErr *LegError
+	if !errors.As(err, &legErr) {
+		t.Fatalf("expected *LegError, got %T: %v", err, err)
+	}
+	var runErr *TestRunError
+	if !errors.As(legErr.Cause, &runErr) {
+		t.Fatalf("expected Cause=*TestRunError, got %T: %v", legErr.Cause, legErr.Cause)
+	}
+	if runErr.ExitCode != 137 {
+		t.Errorf("expected ExitCode=137, got %d", runErr.ExitCode)
+	}
+}
+
+// TestRunTests_EmitsLiveTestEvents verifies that the JSONL-tail goroutine emits
+// EventTestPass/EventTestFail based on lines fed through the tail call. The stub
+// distinguishes the tail call from the test exec call by checking for "tail" in args.
+func TestRunTests_EmitsLiveTestEvents(t *testing.T) {
+	passLine1 := `{"type":"test_event","kind":"pass","name":"test alpha","file":"a.test.js"}`
+	passLine2 := `{"type":"test_event","kind":"pass","name":"test beta","file":"b.test.js"}`
+	failLine := `{"type":"test_event","kind":"fail","name":"test gamma","file":"c.test.js"}`
+
+	stubDockerStream(t, func(ctx context.Context, b bench.Bench, args []string, stdoutLine, stderrLine dockerexec.LineHandler) error {
+		isTail := false
+		for _, a := range args {
+			if a == "tail" {
+				isTail = true
+				break
+			}
+		}
+		if isTail {
+			// Simulate tail emitting three JSONL lines.
+			if stdoutLine != nil {
+				stdoutLine(passLine1)
+				stdoutLine(passLine2)
+				stdoutLine(failLine)
+			}
+			return nil
+		}
+		// Test exec: return nil immediately.
+		return nil
+	})
+
+	p, ch := newTestPipeline(t, 64)
+	p.containerID = "test-container"
+
+	err := p.RunTests(context.Background())
+	if err != nil {
+		t.Fatalf("expected nil error, got: %v", err)
+	}
+
+	close(ch)
+	var events []Event
+	for e := range ch {
+		events = append(events, e)
+	}
+
+	testPassEvents := filterEvents(events, EventTestPass)
+	testFailEvents := filterEvents(events, EventTestFail)
+
+	if len(testPassEvents) != 2 {
+		t.Errorf("expected 2 EventTestPass events, got %d", len(testPassEvents))
+	}
+	if len(testFailEvents) != 1 {
+		t.Errorf("expected 1 EventTestFail event, got %d", len(testFailEvents))
+	}
+
+	// Verify names are set correctly.
+	names := make(map[string]bool)
+	for _, ev := range testPassEvents {
+		names[ev.Line] = true
+	}
+	if !names["test alpha"] {
+		t.Error("expected EventTestPass with Line=test alpha")
+	}
+	if !names["test beta"] {
+		t.Error("expected EventTestPass with Line=test beta")
+	}
+
+	if len(testFailEvents) == 1 && testFailEvents[0].Line != "test gamma" {
+		t.Errorf("expected EventTestFail with Line=test gamma, got %q", testFailEvents[0].Line)
 	}
 }

@@ -118,6 +118,40 @@ func parseJSONL(r io.Reader) (passed, total int, failures []report.FailedTest, e
 	return passed, total, failures, nil
 }
 
+// LiveTestEvent is the subset of fields needed for live event emission by the
+// JSONL-tail goroutine in RunTests. parseJSONL still builds the full
+// report.FailedTest from JSONL; this is the lighter shape the tail goroutine
+// consumes.
+type LiveTestEvent struct {
+	Kind string // "pass" | "fail"
+	Name string
+	File string
+}
+
+// parseLiveTestEvent attempts to parse a single JSONL line as a test_event.
+// Returns (event, true) if the line is a recognized test_event with required
+// fields; (zero, false) otherwise (silently dropped — non-test_event lines,
+// malformed lines, etc.). The tail goroutine uses this; parseJSONL uses a
+// stricter version for the final report.
+func parseLiveTestEvent(line []byte) (LiveTestEvent, bool) {
+	var envelope struct {
+		Type string `json:"type"`
+		Kind string `json:"kind"`
+		Name string `json:"name"`
+		File string `json:"file"`
+	}
+	if err := json.Unmarshal(line, &envelope); err != nil {
+		return LiveTestEvent{}, false
+	}
+	if envelope.Type != "test_event" {
+		return LiveTestEvent{}, false
+	}
+	if envelope.Kind == "" || envelope.Name == "" {
+		return LiveTestEvent{}, false
+	}
+	return LiveTestEvent{Kind: envelope.Kind, Name: envelope.Name, File: envelope.File}, true
+}
+
 // snippetOf returns up to maxLen bytes of b as a string for error messages.
 func snippetOf(b []byte, maxLen int) string {
 	if len(b) > maxLen {
