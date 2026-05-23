@@ -1,9 +1,13 @@
 package pipeline
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"os"
+	"os/exec"
+	"strings"
 	"time"
 
 	"github.com/open-gsd/gsd-test-runner/internal/bench"
@@ -72,6 +76,91 @@ func (e *LegError) Error() string {
 }
 
 func (e *LegError) Unwrap() error { return e.Cause }
+
+// dockerExecError captures the output of a failed docker command for
+// stage-specific classification by callers.
+type dockerExecError struct {
+	Args     []string
+	Stdout   string
+	Stderr   string
+	ExitCode int
+}
+
+func (e *dockerExecError) Error() string {
+	return fmt.Sprintf("docker %s failed (exit %d): %s", strings.Join(e.Args, " "), e.ExitCode, strings.TrimSpace(e.Stderr))
+}
+
+// ImageVersionMismatch reports that the Tester Image's
+// sh.gsd-test.image-version label does not match the expected version
+// (or the label is missing entirely — Actual is "").
+type ImageVersionMismatch struct {
+	Bench    string // Bench.Name
+	Image    string // ImageID
+	Expected string
+	Actual   string // "" when the label is absent
+}
+
+func (e *ImageVersionMismatch) Error() string {
+	if e.Actual == "" {
+		return fmt.Sprintf("image %s on bench %s: expected version %q but image has no sh.gsd-test.image-version label", e.Image, e.Bench, e.Expected)
+	}
+	return fmt.Sprintf("image %s on bench %s: expected version %q, got %q", e.Image, e.Bench, e.Expected, e.Actual)
+}
+
+// ImageNotPresentError reports that the Tester Image is not present
+// on the Bench. Distinguished from BenchDockerError by docker's
+// "No such image" stderr substring.
+type ImageNotPresentError struct {
+	Bench  string
+	Image  string
+	Stderr string
+}
+
+func (e *ImageNotPresentError) Error() string {
+	return fmt.Sprintf("image %s not present on bench %s: %s", e.Image, e.Bench, strings.TrimSpace(e.Stderr))
+}
+
+// BenchDockerError reports a docker invocation failure that is NOT
+// "image not present" — Bench unreachable, docker daemon down, etc.
+type BenchDockerError struct {
+	Bench    string
+	Args     []string
+	Stderr   string
+	ExitCode int
+}
+
+func (e *BenchDockerError) Error() string {
+	return fmt.Sprintf("docker on bench %s failed (exit %d): %s", e.Bench, e.ExitCode, strings.TrimSpace(e.Stderr))
+}
+
+// dockerInspect is a package-level variable per ADR-0011 (decision 4).
+// Tests swap it for a stub via t.Cleanup. Real implementation shells
+// out to docker via os/exec.
+var dockerInspect = realDockerInspect
+
+func realDockerInspect(ctx context.Context, dockerHost, image, format string) (string, error) {
+	args := []string{"image", "inspect", image, "--format", format}
+	cmd := exec.CommandContext(ctx, "docker", args...)
+	if dockerHost != "" {
+		cmd.Env = append(os.Environ(), "DOCKER_HOST="+dockerHost)
+	}
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) {
+			return stdout.String(), &dockerExecError{
+				Args:     append([]string{"docker"}, args...),
+				Stdout:   stdout.String(),
+				Stderr:   stderr.String(),
+				ExitCode: exitErr.ExitCode(),
+			}
+		}
+		return "", fmt.Errorf("docker exec failed: %w", err)
+	}
+	return stdout.String(), nil
+}
 
 // EventKind discriminates the variants of Event. Per ADR-0008, the
 // Event struct uses optional fields rather than a sealed-interface
@@ -143,64 +232,111 @@ type Report struct{}
 // Tester Image and one PR-merged worktree. One Pipeline per (Bench,
 // OS) per Local Engine run. See ADR-0008 for the shape rationale.
 type Pipeline struct {
-	bench  bench.Bench
-	image  images.ImageID
-	work   string // path to the PR-merged worktree (from worktree.Worktree.Path())
-	events chan<- Event
-	report Report
+	bench           bench.Bench
+	image           images.ImageID
+	expectedVersion string // per ADR-0011 decision 3: caller-supplied
+	work            string // path to the PR-merged worktree (from worktree.Worktree.Path())
+	events          chan<- Event
+	report          Report
 }
 
-// New constructs a Pipeline. The events channel must be readable by
-// some consumer; Pipeline sends are non-blocking (select-with-default),
-// so a full or unread channel silently drops events. Real callers
-// should buffer generously and drain in a goroutine.
-func New(b bench.Bench, img images.ImageID, worktreePath string, events chan<- Event) *Pipeline {
+// New constructs a Pipeline. The expectedVersion parameter is the
+// Image-version sentinel value this Pipeline will verify in
+// CheckImageVersion (see ADR-0011, decision 3). The events channel
+// must be readable by some consumer; Pipeline sends are non-blocking
+// (select-with-default), so a full or unread channel silently drops
+// events. Real callers should buffer generously and drain in a
+// goroutine.
+func New(b bench.Bench, img images.ImageID, expectedVersion string, worktreePath string, events chan<- Event) *Pipeline {
 	return &Pipeline{
-		bench:  b,
-		image:  img,
-		work:   worktreePath,
-		events: events,
+		bench:           b,
+		image:           img,
+		expectedVersion: expectedVersion,
+		work:            worktreePath,
+		events:          events,
 	}
 }
 
 // CheckImageVersion verifies the Image-version sentinel on the Bench
-// matches what this Local Engine expects (ADR-0001).
+// matches what this Local Engine expects (ADRs 0001, 0011). The
+// sentinel is an OCI label `sh.gsd-test.image-version` on the Tester
+// Image; this leg reads it via `docker image inspect`.
 func (p *Pipeline) CheckImageVersion(ctx context.Context) error {
-	return p.runLegStub(ctx, LegCheckImageVersion)
+	return p.runLeg(ctx, LegCheckImageVersion, p.checkImageVersionWork(ctx))
+}
+
+func (p *Pipeline) checkImageVersionWork(ctx context.Context) func() error {
+	return func() error {
+		dockerHost := ""
+		if p.bench.Host != "" && p.bench.Host != "local" {
+			dockerHost = "ssh://" + p.bench.Host
+		}
+		const labelFormat = `{{ index .Config.Labels "sh.gsd-test.image-version" }}`
+		out, err := dockerInspect(ctx, dockerHost, string(p.image), labelFormat)
+		if err != nil {
+			var de *dockerExecError
+			if errors.As(err, &de) {
+				if strings.Contains(de.Stderr, "No such image") {
+					return &ImageNotPresentError{
+						Bench:  p.bench.Name,
+						Image:  string(p.image),
+						Stderr: de.Stderr,
+					}
+				}
+				return &BenchDockerError{
+					Bench:    p.bench.Name,
+					Args:     de.Args,
+					Stderr:   de.Stderr,
+					ExitCode: de.ExitCode,
+				}
+			}
+			return err
+		}
+		actual := strings.TrimSpace(out)
+		if actual != p.expectedVersion {
+			return &ImageVersionMismatch{
+				Bench:    p.bench.Name,
+				Image:    string(p.image),
+				Expected: p.expectedVersion,
+				Actual:   actual,
+			}
+		}
+		return nil
+	}
 }
 
 // CopyWorktree copies the PR-merged worktree into a fresh container
 // on the Bench (ADR-0002: no bind-mounts).
 func (p *Pipeline) CopyWorktree(ctx context.Context) error {
-	return p.runLegStub(ctx, LegCopyWorktree)
+	return p.runLeg(ctx, LegCopyWorktree, func() error { return ErrNotImplemented })
 }
 
 // StartContainer launches the fresh container with the copied
 // worktree mounted at the expected in-image path.
 func (p *Pipeline) StartContainer(ctx context.Context) error {
-	return p.runLegStub(ctx, LegStartContainer)
+	return p.runLeg(ctx, LegStartContainer, func() error { return ErrNotImplemented })
 }
 
 // NpmCI runs `npm ci` inside the container.
 func (p *Pipeline) NpmCI(ctx context.Context) error {
-	return p.runLegStub(ctx, LegNpmCI)
+	return p.runLeg(ctx, LegNpmCI, func() error { return ErrNotImplemented })
 }
 
 // Build runs the project's build step inside the container.
 func (p *Pipeline) Build(ctx context.Context) error {
-	return p.runLegStub(ctx, LegBuild)
+	return p.runLeg(ctx, LegBuild, func() error { return ErrNotImplemented })
 }
 
 // RunTests executes the test suite inside the container; the Reporter
 // (ADR-0001) emits JSON Lines to a capture file.
 func (p *Pipeline) RunTests(ctx context.Context) error {
-	return p.runLegStub(ctx, LegRunTests)
+	return p.runLeg(ctx, LegRunTests, func() error { return ErrNotImplemented })
 }
 
 // Drain pulls the JSON Lines capture file from the container to the
 // Dev Workstation.
 func (p *Pipeline) Drain(ctx context.Context) error {
-	return p.runLegStub(ctx, LegDrain)
+	return p.runLeg(ctx, LegDrain, func() error { return ErrNotImplemented })
 }
 
 // Parse converts the JSON Lines stream into structured test events
@@ -208,7 +344,7 @@ func (p *Pipeline) Drain(ctx context.Context) error {
 // file that yields zero parsed events is a Parse failure (ADR-0004:
 // not a silent zero-test success).
 func (p *Pipeline) Parse(ctx context.Context) error {
-	return p.runLegStub(ctx, LegParse)
+	return p.runLeg(ctx, LegParse, func() error { return ErrNotImplemented })
 }
 
 // Report returns the per-OS final result. Only meaningful after
@@ -237,20 +373,30 @@ func (p *Pipeline) RunAll(ctx context.Context) (Report, error) {
 	return p.report, nil
 }
 
-// runLegStub emits a LegStart event then returns a LegError wrapping
-// ErrNotImplemented. Real implementations will replace this with the
-// actual leg work, emitting LegSuccess on completion or LegFailure
-// before returning.
-func (p *Pipeline) runLegStub(ctx context.Context, leg Leg) error {
+// runLeg orchestrates the LegStart/ctx-check/work/LegSuccess/LegFailure
+// protocol every leg must follow per ADR-0008. The work function does
+// the leg-specific subprocess work. If work returns nil, a LegSuccess
+// event is emitted and runLeg returns nil. If work returns an error,
+// the error is wrapped in *LegError (unless already wrapped), a
+// LegFailure event is emitted, and the *LegError is returned.
+func (p *Pipeline) runLeg(ctx context.Context, leg Leg, work func() error) error {
 	p.emit(Event{Kind: EventLegStart, OS: p.bench.OS, Time: time.Now(), Leg: leg})
-
-	// Honor context cancellation even in the stub — establishes the
-	// pattern future real implementations must follow.
 	if err := ctx.Err(); err != nil {
-		return &LegError{Leg: leg, Cause: err, ExitCode: int(leg) + 1}
+		legErr := &LegError{Leg: leg, Cause: err, ExitCode: int(leg) + 1}
+		p.emit(Event{Kind: EventLegFailure, OS: p.bench.OS, Time: time.Now(), Leg: leg, Detail: legErr.Error()})
+		return legErr
 	}
-
-	return &LegError{Leg: leg, Cause: ErrNotImplemented, ExitCode: int(leg) + 1}
+	if err := work(); err != nil {
+		var legErr *LegError
+		if !errors.As(err, &legErr) {
+			legErr = &LegError{Leg: leg, Cause: err, ExitCode: int(leg) + 1}
+			err = legErr
+		}
+		p.emit(Event{Kind: EventLegFailure, OS: p.bench.OS, Time: time.Now(), Leg: leg, Detail: legErr.Error()})
+		return err
+	}
+	p.emit(Event{Kind: EventLegSuccess, OS: p.bench.OS, Time: time.Now(), Leg: leg})
+	return nil
 }
 
 // emit sends an Event non-blockingly. If the channel is full or has
