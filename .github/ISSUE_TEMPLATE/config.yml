@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Discussions
+    url: https://github.com/open-gsd/gsd-test-runner/discussions
+    about: Share ideas or ask general questions about the test runner
+  - name: GSD main repo
+    url: https://github.com/open-gsd/get-shit-done-redux
+    about: For issues with GSD itself (not the remote test runner), open there instead.
+  - name: Discord Community
+    url: https://discord.gg/mYgfVNfA2r
+    about: Ask questions and get help from the community
