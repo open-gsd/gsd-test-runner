@@ -1,11 +1,13 @@
 package pipeline
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/open-gsd/gsd-test-runner/internal/bench"
@@ -177,7 +179,6 @@ const (
 	EventChildOutput // a line of subprocess stdout/stderr
 	EventTestPass
 	EventTestFail
-	EventReport
 )
 
 func (k EventKind) String() string {
@@ -194,8 +195,6 @@ func (k EventKind) String() string {
 		return "test_pass"
 	case EventTestFail:
 		return "test_fail"
-	case EventReport:
-		return "report"
 	}
 	return fmt.Sprintf("event(%d)", int(k))
 }
@@ -215,6 +214,10 @@ type Event struct {
 	// Line is set for ChildOutput (the subprocess line),
 	// TestPass/TestFail (the test name).
 	Line string
+
+	// Stream is set for EventChildOutput: "stdout" or "stderr".
+	// Empty for all other event kinds. Per ADR-0017 dec 4.
+	Stream string
 
 	// Detail is set for LegFailure (error message), TestFail
 	// (failure output / stack).
@@ -241,6 +244,12 @@ var dockerRun = func(ctx context.Context, b bench.Bench, args []string) (string,
 // docker rm operations.
 var dockerRm = func(ctx context.Context, b bench.Bench, args []string) (string, error) {
 	return dockerexec.Run(ctx, b, args)
+}
+
+// dockerStream is the test seam for streaming subprocess legs. Per-package
+// wrapper var per ADR-0014 dec 3.
+var dockerStream = func(ctx context.Context, b bench.Bench, args []string, stdoutLine, stderrLine dockerexec.LineHandler) error {
+	return dockerexec.Stream(ctx, b, args, stdoutLine, stderrLine)
 }
 
 // ContainerStartError is the typed Cause for LegError when StartContainer
@@ -445,20 +454,197 @@ func (p *Pipeline) StartContainer(ctx context.Context) error {
 	})
 }
 
+// NpmCIError is the typed Cause for LegError when the NpmCI leg fails.
+type NpmCIError struct {
+	Stderr   string
+	ExitCode int
+	Cause    error // non-nil for non-exec errors (ctx canceled, etc.)
+}
+
+func (e *NpmCIError) Error() string {
+	if e.Cause != nil {
+		return fmt.Sprintf("npm ci failed: %v", e.Cause)
+	}
+	return fmt.Sprintf("npm ci failed (exit=%d): %s", e.ExitCode, strings.TrimSpace(e.Stderr))
+}
+
+func (e *NpmCIError) Unwrap() error { return e.Cause }
+
 // NpmCI runs `npm ci` inside the container.
 func (p *Pipeline) NpmCI(ctx context.Context) error {
-	return p.runLeg(ctx, LegNpmCI, func(_ context.Context) (string, error) { return "", ErrNotImplemented })
+	return p.runLeg(ctx, LegNpmCI, func(ctx context.Context) (string, error) {
+		if p.containerID == "" {
+			return "", &NpmCIError{Cause: errors.New("StartContainer did not run; containerID is empty")}
+		}
+		var stderrBuf bytes.Buffer
+		args := []string{"exec", "--workdir", "/work", p.containerID, "npm", "ci"}
+		err := dockerStream(ctx, p.bench, args,
+			func(line string) {
+				p.emit(Event{Kind: EventChildOutput, Leg: LegNpmCI, Line: line, Stream: "stdout"})
+			},
+			func(line string) {
+				p.emit(Event{Kind: EventChildOutput, Leg: LegNpmCI, Line: line, Stream: "stderr"})
+				stderrBuf.WriteString(line + "\n")
+			},
+		)
+		if err != nil {
+			var execErr *dockerexec.ExecError
+			if errors.As(err, &execErr) {
+				return "", &NpmCIError{Stderr: stderrBuf.String(), ExitCode: execErr.ExitCode}
+			}
+			return "", &NpmCIError{Cause: err}
+		}
+		return "", nil
+	})
 }
+
+// BuildError is the typed Cause for LegError when the Build leg fails.
+type BuildError struct {
+	Stderr   string
+	ExitCode int
+	Cause    error // non-nil for non-exec errors (ctx canceled, etc.)
+}
+
+func (e *BuildError) Error() string {
+	if e.Cause != nil {
+		return fmt.Sprintf("npm run build failed: %v", e.Cause)
+	}
+	return fmt.Sprintf("npm run build failed (exit=%d): %s", e.ExitCode, strings.TrimSpace(e.Stderr))
+}
+
+func (e *BuildError) Unwrap() error { return e.Cause }
 
 // Build runs the project's build step inside the container.
 func (p *Pipeline) Build(ctx context.Context) error {
-	return p.runLeg(ctx, LegBuild, func(_ context.Context) (string, error) { return "", ErrNotImplemented })
+	return p.runLeg(ctx, LegBuild, func(ctx context.Context) (string, error) {
+		if p.containerID == "" {
+			return "", &BuildError{Cause: errors.New("StartContainer did not run; containerID is empty")}
+		}
+		var stderrBuf bytes.Buffer
+		args := []string{"exec", "--workdir", "/work", p.containerID, "npm", "run", "build"}
+		err := dockerStream(ctx, p.bench, args,
+			func(line string) {
+				p.emit(Event{Kind: EventChildOutput, Leg: LegBuild, Line: line, Stream: "stdout"})
+			},
+			func(line string) {
+				p.emit(Event{Kind: EventChildOutput, Leg: LegBuild, Line: line, Stream: "stderr"})
+				stderrBuf.WriteString(line + "\n")
+			},
+		)
+		if err != nil {
+			var execErr *dockerexec.ExecError
+			if errors.As(err, &execErr) {
+				return "", &BuildError{Stderr: stderrBuf.String(), ExitCode: execErr.ExitCode}
+			}
+			return "", &BuildError{Cause: err}
+		}
+		return "", nil
+	})
 }
 
+// TestRunError is the typed Cause for LegError when the RunTests leg fails
+// due to a runner crash (not merely test failures — exit 1 is intentionally
+// not a leg error per ADR-0017).
+type TestRunError struct {
+	Stderr   string
+	ExitCode int
+	Cause    error // non-nil for non-exec errors (ctx canceled, etc.)
+}
+
+func (e *TestRunError) Error() string {
+	if e.Cause != nil {
+		return fmt.Sprintf("test runner failed: %v", e.Cause)
+	}
+	return fmt.Sprintf("test runner crashed (exit=%d): %s", e.ExitCode, strings.TrimSpace(e.Stderr))
+}
+
+func (e *TestRunError) Unwrap() error { return e.Cause }
+
 // RunTests executes the test suite inside the container; the Reporter
-// (ADR-0001) emits JSON Lines to a capture file.
+// (ADR-0001) emits JSON Lines to a capture file. A JSONL-tail goroutine
+// runs concurrently to emit live EventTestPass/EventTestFail events per
+// ADR-0017 dec 2. Test-process exit code 1 (tests failed) is NOT a leg
+// error — the Parse leg surfaces failures via Report.Failures.
 func (p *Pipeline) RunTests(ctx context.Context) error {
-	return p.runLeg(ctx, LegRunTests, func(_ context.Context) (string, error) { return "", ErrNotImplemented })
+	return p.runLeg(ctx, LegRunTests, func(ctx context.Context) (string, error) {
+		if p.containerID == "" {
+			return "", &TestRunError{Cause: errors.New("StartContainer did not run; containerID is empty")}
+		}
+
+		// Start JSONL-tail goroutine. Lives for the duration of RunTests.
+		tailCtx, cancelTail := context.WithCancel(ctx)
+		defer cancelTail()
+		var tailWG sync.WaitGroup
+		tailWG.Add(1)
+		go p.tailJSONLForLiveEvents(tailCtx, &tailWG)
+
+		// Run the test subprocess. Reporter writes JSONL to containerJSONLPath
+		// while the JSONL-tail goroutine emits live test events from it.
+		var stderrBuf bytes.Buffer
+		args := []string{
+			"exec", "--workdir", "/work", p.containerID,
+			"node", "--test",
+			"--test-reporter=/opt/gsd-test/reporter.mjs",
+			"--test-reporter-destination=" + containerJSONLPath,
+		}
+		err := dockerStream(ctx, p.bench, args,
+			func(line string) {
+				p.emit(Event{Kind: EventChildOutput, Leg: LegRunTests, Line: line, Stream: "stdout"})
+			},
+			func(line string) {
+				p.emit(Event{Kind: EventChildOutput, Leg: LegRunTests, Line: line, Stream: "stderr"})
+				stderrBuf.WriteString(line + "\n")
+			},
+		)
+
+		// Cancel and wait for the tail goroutine.
+		cancelTail()
+		tailWG.Wait()
+
+		// exit 1 == "tests failed but runner ran OK" — not a leg error.
+		// Only exit > 1 or non-exec errors indicate a runner crash.
+		if err != nil {
+			var execErr *dockerexec.ExecError
+			if errors.As(err, &execErr) {
+				if execErr.ExitCode > 1 {
+					return "", &TestRunError{Stderr: stderrBuf.String(), ExitCode: execErr.ExitCode}
+				}
+				// exit 1: tests failed — Parse leg surfaces it via Report.Failures.
+				return "", nil
+			}
+			return "", &TestRunError{Cause: err}
+		}
+		return "", nil
+	})
+}
+
+// tailJSONLForLiveEvents tails containerJSONLPath inside the running container
+// and emits EventTestPass/EventTestFail per parsed test event. Stops when ctx
+// is canceled (which RunTests does after the test subprocess exits). Errors are
+// best-effort — failures here don't fail the leg (Parse reads the final file).
+func (p *Pipeline) tailJSONLForLiveEvents(ctx context.Context, wg *sync.WaitGroup) {
+	defer wg.Done()
+	args := []string{
+		"exec", p.containerID,
+		"tail", "-f", "-n", "+1", containerJSONLPath,
+	}
+	_ = dockerStream(ctx, p.bench, args,
+		func(line string) {
+			if line == "" {
+				return
+			}
+			ev, ok := parseLiveTestEvent([]byte(line))
+			if !ok {
+				return
+			}
+			kind := EventTestPass
+			if ev.Kind == "fail" {
+				kind = EventTestFail
+			}
+			p.emit(Event{Kind: kind, Leg: LegRunTests, Line: ev.Name, OS: p.bench.OS})
+		},
+		nil, // ignore stderr from `tail -f`
+	)
 }
 
 // Drain pulls the JSON Lines capture file from the container to the
