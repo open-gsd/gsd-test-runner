@@ -49,7 +49,7 @@ func EnsurePresent(ctx context.Context, b bench.Bench, image ImageID, opts Ensur
 	if presenceErr != nil {
 		var de *dockerexec.ExecError
 		if errors.As(presenceErr, &de) {
-			return &BenchDockerError{
+			return &bench.BenchDockerError{
 				Bench:    b.Name,
 				Args:     de.Args,
 				Stderr:   de.Stderr,
@@ -205,13 +205,6 @@ func (e *BuildError) Error() string {
 	return fmt.Sprintf("fallback build of %s on bench %s (using %s) failed (exit %d): %s", e.Image, e.Bench, e.Dockerfile, e.ExitCode, strings.TrimSpace(e.Stderr))
 }
 
-type BenchDockerError struct {
-	Bench    string
-	Args     []string
-	Stderr   string
-	ExitCode int
-}
-
-func (e *BenchDockerError) Error() string {
-	return fmt.Sprintf("docker on bench %s failed (exit %d): %s", e.Bench, e.ExitCode, strings.TrimSpace(e.Stderr))
-}
+// BenchDockerError is an alias kept for package-local convenience; the
+// canonical definition lives in internal/bench.
+type BenchDockerError = bench.BenchDockerError

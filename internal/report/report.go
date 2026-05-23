@@ -57,7 +57,10 @@ type FailedTest struct {
 	// " > " (space-chevron-space).
 	Name string `json:"name"`
 
-	// DurationMs is the wall-clock duration of the test in milliseconds.
+	// DurationMs is the container-internal per-test duration as reported
+	// by the Node test runner. Reported in milliseconds with fractional
+	// precision. NOT comparable to Report.DurationMs (which is pipeline
+	// wall-clock); the two measure different things.
 	DurationMs float64 `json:"duration_ms"`
 
 	// RetryCount is the number of retries before this result was recorded.
@@ -98,11 +101,18 @@ type Report struct {
 	// LegCheckImageVersion.
 	ImageVersion string `json:"image_version"`
 
-	// StartedAt is the wall-clock time at Pipeline construction (UTC).
+	// StartedAt is the moment Pipeline.New was called. This is NOT first-
+	// leg-start time; if a Pipeline is constructed before being dispatched
+	// (no current production path does this, but architecturally possible),
+	// StartedAt includes any wait time. Frozen as part of the schema per
+	// ADR-0013; future schema changes are additive only.
 	StartedAt time.Time `json:"started_at"`
 
-	// DurationMs is the wall-clock duration from StartedAt to Finalize (ms).
-	// Set by Finalize.
+	// DurationMs is the total Pipeline wall-clock duration from Pipeline.New
+	// to Pipeline.RunAll completing — includes all 8 legs, Drain disk I/O,
+	// and Parse file-scan time. Distinct from sum(FailedTest.DurationMs)
+	// which is container-internal per-test runner time and is NOT expected
+	// to equal Report.DurationMs. Set by Finalize.
 	DurationMs float64 `json:"duration_ms"`
 
 	// Total is the total number of tests found in the JSONL stream.
