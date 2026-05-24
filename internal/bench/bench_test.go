@@ -56,6 +56,28 @@ func TestBenchDockerError_Error(t *testing.T) {
 	}
 }
 
+func TestRuntimeBin_DefaultsToDocker(t *testing.T) {
+	b := Bench{Name: "bench-linux-1", OS: "linux"}
+	// Runtime is zero value (empty string); should default to "docker".
+	if got := b.RuntimeBin(); got != "docker" {
+		t.Errorf("RuntimeBin() = %q, want %q", got, "docker")
+	}
+}
+
+func TestRuntimeBin_Docker(t *testing.T) {
+	b := Bench{Name: "bench-linux-2", OS: "linux", Runtime: RuntimeDocker}
+	if got := b.RuntimeBin(); got != "docker" {
+		t.Errorf("RuntimeBin() = %q, want %q", got, "docker")
+	}
+}
+
+func TestRuntimeBin_Container(t *testing.T) {
+	b := Bench{Name: "bench-macos-1", OS: "macos", Runtime: RuntimeContainer}
+	if got := b.RuntimeBin(); got != "container" {
+		t.Errorf("RuntimeBin() = %q, want %q", got, "container")
+	}
+}
+
 func TestDockerHost(t *testing.T) {
 	cases := []struct {
 		name string

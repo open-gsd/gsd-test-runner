@@ -29,7 +29,7 @@ func (e *ExecError) Error() string {
 // On ctx cancellation (pre or mid-exec) returns ("", ctx.Err()) directly —
 // unifies the dual cancellation path per ADR-0014 dec 4.
 func Run(ctx context.Context, b bench.Bench, args []string) (string, error) {
-	cmd := exec.CommandContext(ctx, "docker", args...)
+	cmd := exec.CommandContext(ctx, b.RuntimeBin(), args...)
 	if host := b.DockerHost(); host != "" {
 		cmd.Env = append(os.Environ(), "DOCKER_HOST="+host)
 	}

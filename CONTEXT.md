@@ -6,7 +6,7 @@ The current implementation is a quick-built local-dev harness (described in the 
 
 gsd-test-runner is a local-dev harness, not a CI system. It runs on the developer's own machine and on Linux/Windows boxes they have SSH access to — typically their own hardware: a desktop under the desk, a home lab box, a second machine. The point is parity with what CI would catch, but at edit-loop latency, before pushing. It runs the same Node test suite across three platforms (macOS native, Linux Docker, Windows Docker) in parallel and diffs the results. The bugs it catches are platform-specific: case-sensitive filesystems, missing system tools, different home directories, and path-separator divergence. All runtime code is shipped as heredocs inside a single idempotent installer (INSTALL_GSD_TEST.sh, ~1300 lines) that writes executables to ~/.local/bin/ and the shared Node reporter to ~/.local/share/gsd-test/.
 
-Future direction: **macOS Containers** support is planned — Apple's native container runtime (distinct from Docker Desktop) as a fourth Runner target. The current macOS Runner is bare-metal `node --test`; a future macOS Runner will run inside an Apple container for true sandbox parity with the Linux and Windows Docker runners.
+Future direction: **macOS Containers** support is in active groundwork — Apple's native container runtime (distinct from Docker Desktop) as a fourth Runner target. The current macOS Runner is bare-metal `node --test`; a future macOS Runner will run inside an Apple container for true sandbox parity with the Linux and Windows Docker runners. The runtime abstraction, Containerfile, and workflow job are in place (see ADR-0020); activation awaits a macOS 26 GitHub Actions runner with Apple Containers preinstalled.
 
 ---
 
@@ -49,6 +49,10 @@ The Local Engine's contract: every leg of the pipeline (image-version check, mer
 ### GHCR distribution
 
 Tester Images are published to GitHub Container Registry from this repo's CI on tagged releases. Local Engines pull tagged images by version. Eliminates the per-host build drift that plagued the transitional architecture. Benches pull tagged images on first use; the Dev Workstation never holds Tester Images itself.
+
+### macOS Containers (Apple Containers)
+
+Apple's native container runtime for macOS 26+. The CLI is `container` (not `docker`). Unlike Docker Desktop on Mac — which runs Linux containers inside a Linux VM — Apple Containers runs macOS-native containers, giving genuine macOS sandbox parity with the Linux and Windows Docker runners. The macOS Bench target uses `bench.RuntimeContainer` as its runtime selector (ADR-0020); `internal/dockerexec` invokes the `container` binary when `Bench.Runtime == RuntimeContainer`. The macOS Tester Image is defined at `dockerfiles/macos.containerfile`; the publish-macos CI job is present but gated (`if: false`) until a macOS 26 GitHub Actions runner with Apple Containers is available. See ADR-0020 for the full design.
 
 ---
 
@@ -113,12 +117,6 @@ The canonical inter-module data format. One JSON object per line, one line per t
 _Transitional — will be retired when the target architecture lands._
 
 The Diff's central responsibility: rewriting platform-specific paths (/work/foo.test.js, C:\work\foo.test.js, /Users/x/proj/foo.test.js) to a single canonical form so divergence detection compares apples to apples.
-
-### macOS Containers (planned)
-
-_Transitional — will be retired when the target architecture lands._
-
-Apple's native container runtime — distinct from Docker Desktop. Planned as a fourth Runner target to replace the current bare-metal macOS Runner (gsd-test-local) with a true sandboxed environment, giving macOS the same container-level isolation as the Linux and Windows Docker runners. See also: gsd-test-local in the Module map.
 
 ---
 

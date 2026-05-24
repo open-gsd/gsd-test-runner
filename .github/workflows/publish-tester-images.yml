@@ -133,3 +133,59 @@ jobs:
             exit 1
           }
           Write-Host "Sentinel label OK: $label"
+
+  publish-macos:
+    # Blocked on GitHub Actions providing macos-26 (or later) runners with
+    # Apple Containers preinstalled. Until then this job will fail to
+    # select a runner. When the runner is available, change runs-on and
+    # set if to true (or remove the condition entirely). The container CLI
+    # invocations below already match Apple Containers' CLI exactly.
+    # See ADR-0020 dec 4 for the full activation checklist.
+    runs-on: macos-26  # NOT YET AVAILABLE — see ADR-0020 dec 4
+    if: false  # disabled until runner is available; flip to true when ready
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve version
+        id: version
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            VERSION="${{ inputs.version }}"
+          else
+            VERSION="${GITHUB_REF_NAME#v}"
+          fi
+          echo "tag=v${VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to GHCR
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_ACTOR: ${{ github.actor }}
+        run: |
+          echo "$GITHUB_TOKEN" | container login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+
+      - name: Build macOS Tester Image
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+          REGISTRY: ${{ env.REGISTRY }}
+          IMAGE_NAMESPACE: ${{ env.IMAGE_NAMESPACE }}
+        run: |
+          IMAGE="${REGISTRY}/${IMAGE_NAMESPACE}/gsd-tester-macos:${TAG}"
+          container build \
+            -f dockerfiles/macos.containerfile \
+            --build-arg "IMAGE_VERSION=${TAG}" \
+            -t "$IMAGE" .
+          container push "$IMAGE"
+
+      - name: Verify sentinel label
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+          REGISTRY: ${{ env.REGISTRY }}
+          IMAGE_NAMESPACE: ${{ env.IMAGE_NAMESPACE }}
+        run: |
+          IMAGE="${REGISTRY}/${IMAGE_NAMESPACE}/gsd-tester-macos:${TAG}"
+          LABEL=$(container image inspect "$IMAGE" --format '{{ index .Config.Labels "sh.gsd-test.image-version" }}')
+          if [[ "$LABEL" != "$TAG" ]]; then
+            echo "::error::Sentinel label mismatch: expected '$TAG', got '$LABEL'"
+            exit 1
+          fi
