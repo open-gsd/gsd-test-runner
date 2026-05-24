@@ -112,6 +112,32 @@ jobs:
           "tag=v$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
           Write-Host "Publishing as version: $version (tag: v$version)"
 
+      - name: Start Docker service and wait for daemon
+        shell: pwsh
+        run: |
+          # windows-2022 runners have Docker Engine installed but the service
+          # may not be auto-started. Docker Engine on Windows Server defaults
+          # to Windows containers (no mode-switch needed; Docker Desktop's
+          # DockerCli.exe -SwitchDaemon doesn't exist here).
+          Write-Host "Starting Docker service..."
+          Start-Service -Name docker -ErrorAction Stop
+
+          # Wait for the daemon to accept connections
+          $timeout = 60
+          $elapsed = 0
+          while ($elapsed -lt $timeout) {
+            docker info 2>$null | Out-Null
+            if ($LASTEXITCODE -eq 0) {
+              Write-Host "Docker daemon ready after $elapsed seconds"
+              docker version
+              exit 0
+            }
+            Start-Sleep -Seconds 2
+            $elapsed += 2
+          }
+          Write-Error "Docker daemon did not become ready within $timeout seconds"
+          exit 1
+
       - name: Log in to GHCR
         shell: pwsh
         run: |
