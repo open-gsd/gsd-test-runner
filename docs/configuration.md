@@ -23,6 +23,7 @@ mkdir -p ~/.config/gsd-test
 | `[defaults]` | Table | Default values for CLI flags |
 | `[[benches]]` | Table-array | One entry per Bench |
 | `[versions]` | Table | OS-to-image-version mapping |
+| `[testing]` | Table | Optional test command override for RunTests leg |
 
 ## `[defaults]`
 
@@ -123,6 +124,28 @@ windows = "v1.0.0"
 
 You must add a `[versions]` entry for every OS in `defaults.targets`. If an OS has no version entry, `plan.Build` skips it with reason `no_image_version`.
 
+## `[testing]`
+
+Optional test command template for the `run_tests` leg.
+
+| Field | Type | Required | Default |
+|-------|------|----------|---------|
+| `command` | `string` | No | `node --test --test-reporter={{REPORTER_PATH}} --test-reporter-destination={{REPORTER_DEST}}` |
+
+If omitted, behavior is unchanged from current releases.
+
+Placeholder tokens supported in `testing.command`:
+
+- `{{REPORTER_PATH}}` → `/opt/gsd-test/reporter.mjs`
+- `{{REPORTER_DEST}}` → `/work/test-events.jsonl`
+
+Example:
+
+```toml
+[testing]
+command = "npm test -- --test-reporter={{REPORTER_PATH}} --test-reporter-destination={{REPORTER_DEST}}"
+```
+
 ## CLI flags
 
 CLI flags override the corresponding config values. Flags always take precedence.
@@ -181,4 +204,7 @@ os   = "windows"
 [versions]
 linux   = "v1.0.0"
 windows = "v1.0.0"
+
+[testing]
+command = "npm test -- --test-reporter={{REPORTER_PATH}} --test-reporter-destination={{REPORTER_DEST}}"
 ```

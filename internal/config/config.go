@@ -22,6 +22,7 @@ type Config struct {
 	Targets     []string           // default target OSes from config
 	Versions    map[string]string  // OS -> expected image version
 	Defaults    Defaults
+	Testing     Testing
 }
 
 // UnreachableBench records a Bench that failed reachability probing.
@@ -36,6 +37,11 @@ type Defaults struct {
 	Targets []string
 	Pin     string
 	Exclude []string
+}
+
+// Testing contains optional test command configuration.
+type Testing struct {
+	Command string
 }
 
 // LoadOptions controls config.Load behavior.
@@ -55,6 +61,7 @@ type rawConfig struct {
 	Defaults rawDefaults       `toml:"defaults"`
 	Benches  []rawBench        `toml:"benches"`
 	Versions map[string]string `toml:"versions"`
+	Testing  rawTesting        `toml:"testing"`
 }
 
 type rawDefaults struct {
@@ -68,6 +75,10 @@ type rawBench struct {
 	Host    string `toml:"host"`
 	OS      string `toml:"os"`
 	Runtime string `toml:"runtime,omitempty"` // "docker" (default; all benches today) | "container" (reserved for future Apple Containers)
+}
+
+type rawTesting struct {
+	Command string `toml:"command"`
 }
 
 // probeRun is the function used by probeBenches to test connectivity.
@@ -161,7 +172,7 @@ func validateAndTransform(raw rawConfig) (*Config, error) {
 
 		registry = append(registry, bench.Bench{
 			Name:    rb.Name,
-			Host:    rb.Host,    // empty is fine — means local
+			Host:    rb.Host, // empty is fine — means local
 			OS:      rb.OS,
 			Runtime: rb.Runtime, // empty defaults to "docker" via bench.RuntimeBin()
 		})
@@ -175,6 +186,9 @@ func validateAndTransform(raw rawConfig) (*Config, error) {
 			Targets: raw.Defaults.Targets,
 			Pin:     raw.Defaults.Pin,
 			Exclude: raw.Defaults.Exclude,
+		},
+		Testing: Testing{
+			Command: raw.Testing.Command,
 		},
 	}, nil
 }

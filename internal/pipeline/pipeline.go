@@ -21,6 +21,10 @@ import (
 // Reporter writes per-test JSONL events. The Drain leg copies this file to the
 // Dev Workstation via docker cp.
 const containerJSONLPath = "/work/test-events.jsonl"
+const defaultTestCommand = "node --test --test-reporter={{REPORTER_PATH}} --test-reporter-destination={{REPORTER_DEST}}"
+const reporterPathPlaceholder = "{{REPORTER_PATH}}"
+const reporterDestPlaceholder = "{{REPORTER_DEST}}"
+const defaultReporterPath = "/opt/gsd-test/reporter.mjs"
 
 // ErrNotImplemented is the Cause of every LegError returned by the
 // skeleton. Real implementations will replace it with typed Cause
@@ -343,6 +347,9 @@ type Pipeline struct {
 	// drainedPath is the local temp file path written by Drain and consumed
 	// by Parse. Empty until Drain succeeds.
 	drainedPath string
+	// testCommand is the optional command template for the RunTests leg.
+	// Empty means "use defaultTestCommand".
+	testCommand string
 }
 
 // New constructs a Pipeline. The expectedVersion parameter is the
@@ -352,15 +359,35 @@ type Pipeline struct {
 // (select-with-default), so a full or unread channel silently drops
 // events. Real callers should buffer generously and drain in a
 // goroutine.
-func New(b bench.Bench, img images.ImageID, expectedVersion string, worktreePath string, events chan<- Event) *Pipeline {
+func New(b bench.Bench, img images.ImageID, expectedVersion string, worktreePath string, testCommand string, events chan<- Event) *Pipeline {
 	return &Pipeline{
 		bench:           b,
 		image:           img,
 		expectedVersion: expectedVersion,
 		work:            worktreePath,
+		testCommand:     testCommand,
 		events:          events,
 		result:          report.New(b.OS, b.Name, string(img), expectedVersion, time.Now().UTC()),
 	}
+}
+
+func (p *Pipeline) runTestsCommandArgs() []string {
+	template := strings.TrimSpace(p.testCommand)
+	if template == "" {
+		template = defaultTestCommand
+	}
+	command := strings.NewReplacer(
+		reporterPathPlaceholder, defaultReporterPath,
+		reporterDestPlaceholder, containerJSONLPath,
+	).Replace(template)
+	fields := strings.Fields(command)
+	if len(fields) == 0 {
+		fields = strings.Fields(strings.NewReplacer(
+			reporterPathPlaceholder, defaultReporterPath,
+			reporterDestPlaceholder, containerJSONLPath,
+		).Replace(defaultTestCommand))
+	}
+	return fields
 }
 
 // CheckImageVersion verifies the Image-version sentinel on the Bench
@@ -620,12 +647,7 @@ func (p *Pipeline) RunTests(ctx context.Context) error {
 		// Run the test subprocess. Reporter writes JSONL to containerJSONLPath
 		// while the JSONL-tail goroutine emits live test events from it.
 		var stderrBuf bytes.Buffer
-		args := []string{
-			"exec", "--workdir", "/work", p.containerID,
-			"node", "--test",
-			"--test-reporter=/opt/gsd-test/reporter.mjs",
-			"--test-reporter-destination=" + containerJSONLPath,
-		}
+		args := append([]string{"exec", "--workdir", "/work", p.containerID}, p.runTestsCommandArgs()...)
 		err := dockerStream(ctx, p.bench, args,
 			func(line string) {
 				p.emit(Event{Kind: EventChildOutput, Leg: LegRunTests, Line: line, Stream: "stdout"})

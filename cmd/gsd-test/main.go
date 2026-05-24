@@ -216,7 +216,7 @@ func run(args []string, stdout, stderr *os.File) int {
 		r.Subscribe(run.OS, events)
 		go func() {
 			defer pwg.Done()
-			pl := pipeline.New(run.Bench, run.ImageID, run.Version, wt.Path(), events)
+			pl := pipeline.New(run.Bench, run.ImageID, run.Version, wt.Path(), cfg.Testing.Command, events)
 			rep, err := pl.RunAll(ctx)
 			close(events) // signal renderer the channel is done
 			results <- pipelineResult{os: run.OS, rep: rep, err: err}
