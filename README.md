@@ -44,6 +44,7 @@ gsd-test
 
 ## Documentation
 
+- **[Release Notes](docs/release-notes.md)** — What changed in recent releases and how to adopt it
 - **[Installation](docs/installation.md)** — Install the binary on macOS, Linux, or Windows
 - **[Getting Started](docs/getting-started.md)** — Your first end-to-end test run
 - **[Setting up Benches](docs/benches.md)** — Configure your Linux, Windows, and macOS hardware
