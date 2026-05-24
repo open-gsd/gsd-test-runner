@@ -1,0 +1,135 @@
+name: Publish Tester Images
+
+# Triggers on tagged releases. Tag format: v<major>.<minor>.<patch>
+# (semver). The tag value (minus "v" prefix) becomes the image version.
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version tag to publish as (without v prefix, e.g. 1.4.0). Used for manual triggers.'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAMESPACE: ${{ github.repository_owner }}
+
+jobs:
+  publish-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve version
+        id: version
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            VERSION="${{ inputs.version }}"
+          else
+            # Strip leading "v" from tag
+            VERSION="${GITHUB_REF_NAME#v}"
+          fi
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "tag=v${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "Publishing as version: ${VERSION} (tag: v${VERSION})"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push Linux Tester Image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: dockerfiles/linux.Dockerfile
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/gsd-tester-linux:${{ steps.version.outputs.tag }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/gsd-tester-linux:latest
+          build-args: |
+            IMAGE_VERSION=${{ steps.version.outputs.tag }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ steps.version.outputs.tag }}
+
+      - name: Verify sentinel label
+        run: |
+          # Pull the image we just pushed and inspect the label to confirm
+          # it matches the tag. Fails the workflow if mismatch.
+          IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/gsd-tester-linux:${{ steps.version.outputs.tag }}"
+          docker pull "$IMAGE"
+          LABEL=$(docker image inspect "$IMAGE" --format '{{ index .Config.Labels "sh.gsd-test.image-version" }}')
+          if [[ "$LABEL" != "${{ steps.version.outputs.tag }}" ]]; then
+            echo "::error::Sentinel label mismatch: expected '${{ steps.version.outputs.tag }}', got '${LABEL}'"
+            exit 1
+          fi
+          echo "Sentinel label OK: ${LABEL}"
+
+  publish-windows:
+    runs-on: windows-2022
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve version
+        id: version
+        shell: pwsh
+        run: |
+          if ("${{ github.event_name }}" -eq "workflow_dispatch") {
+            $version = "${{ inputs.version }}"
+          } else {
+            # Strip leading "v" from tag
+            $version = "${{ github.ref_name }}".TrimStart("v")
+          }
+          "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "tag=v$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          Write-Host "Publishing as version: $version (tag: v$version)"
+
+      - name: Log in to GHCR
+        shell: pwsh
+        run: |
+          $token = "${{ secrets.GITHUB_TOKEN }}"
+          $token | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Build Windows Tester Image
+        shell: pwsh
+        run: |
+          $tag = "${{ steps.version.outputs.tag }}"
+          $image = "${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/gsd-tester-windows:$tag"
+          $latest = "${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/gsd-tester-windows:latest"
+          docker build `
+            -f dockerfiles/windows.Dockerfile `
+            --build-arg "IMAGE_VERSION=$tag" `
+            --label "org.opencontainers.image.source=https://github.com/${{ github.repository }}" `
+            --label "org.opencontainers.image.revision=${{ github.sha }}" `
+            --label "org.opencontainers.image.version=$tag" `
+            -t $image -t $latest .
+          docker push $image
+          docker push $latest
+
+      - name: Verify sentinel label
+        shell: pwsh
+        run: |
+          $tag = "${{ steps.version.outputs.tag }}"
+          $image = "${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/gsd-tester-windows:$tag"
+          $label = docker image inspect $image --format '{{ index .Config.Labels "sh.gsd-test.image-version" }}'
+          if ($label -ne $tag) {
+            Write-Host "::error::Sentinel label mismatch: expected '$tag', got '$label'"
+            exit 1
+          }
+          Write-Host "Sentinel label OK: $label"
