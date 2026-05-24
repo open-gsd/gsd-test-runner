@@ -72,7 +72,7 @@ Each `[[benches]]` block declares one Bench. All fields in a single block descri
 | `name` | `string` | **Yes** | — | Unique Bench identifier. Used by `--bench` and `--exclude`. |
 | `host` | `string` | No | `""` | SSH host alias from `~/.ssh/config`. Set to `"local"` or leave empty to use the Dev Workstation's own Docker daemon. |
 | `os` | `string` | **Yes** | — | Target OS this Bench provides. One of `"linux"`, `"windows"`, `"macos"`. |
-| `runtime` | `string` | No | `"docker"` | Container runtime. `"docker"` for Linux/Windows Benches. `"container"` for macOS Benches with Apple Containers (per ADR-0020, macOS 26+). |
+| `runtime` | `string` | No | `"docker"` | Container runtime. `"docker"` is the default for all Benches today (Linux, Windows, and macOS). `"container"` is reserved for future Apple Containers support (requires macOS 26; not usable today — see ADR-0020). |
 
 ### `name`
 

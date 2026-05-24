@@ -67,7 +67,7 @@ type rawBench struct {
 	Name    string `toml:"name"`
 	Host    string `toml:"host"`
 	OS      string `toml:"os"`
-	Runtime string `toml:"runtime,omitempty"` // empty defaults to "docker" via bench.RuntimeBin()
+	Runtime string `toml:"runtime,omitempty"` // "docker" (default; all benches today) | "container" (reserved for future Apple Containers)
 }
 
 // probeRun is the function used by probeBenches to test connectivity.

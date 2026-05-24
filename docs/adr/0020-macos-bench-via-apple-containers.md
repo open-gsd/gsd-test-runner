@@ -1,8 +1,21 @@
 # ADR-0020 — macOS Bench via Apple Containers
 
 **Date**: 2026-05-23
-**Status**: Accepted
+**Status**: Accepted (2026-05-23)
+**Amended**: 2026-05-24 — pivoted from Apple Containers to Docker on macOS — see Decision 5.
 **Context**: Issue #8 — Create macOS containers to run on macOS hardware and test macOS-based products.
+
+---
+
+> **AMENDED 2026-05-24**
+>
+> The original ADR (2026-05-23) over-specified Apple Containers as the only valid runtime for macOS Benches.
+> Apple Containers requires macOS 26 — not yet generally available on developer Macs or GitHub Actions runners.
+> This amendment pivots to Docker on macOS (Docker Desktop or colima) using the Linux Tester Image as content,
+> satisfying the actual user requirement (container isolation from the Mac's local filesystem) with technology
+> available today. The Apple Containers path is preserved as a future evolution — see Decision 5.
+>
+> Decisions 1, 3, and 4 are revised below. Decision 2 is unchanged. Decision 5 is new.
 
 ---
 
@@ -14,27 +27,29 @@ Apple Containers shipped in macOS 26 as a native sandbox runtime. The CLI is `co
 
 The existing Bench abstraction (ADR-0011, ADR-0014) assumes Docker as the container runtime, invoking `docker` directly in `internal/dockerexec`. macOS support requires the Local Engine to invoke `container` instead. The sentinel mechanism (OCI label `sh.gsd-test.image-version`, ADR-0011) is runtime-agnostic — both Docker and Apple Containers consume OCI images — so the sentinel continues to work without change.
 
-Separately, GitHub Actions hosted runners with macOS 26 + Apple Containers preinstalled are not yet generally available (latest is `macos-15` as of this ADR). This ADR establishes the design and file structure so that issue #8 can close; the actual macOS Tester Image build is gated on runner availability.
+Separately, GitHub Actions hosted runners with macOS 26 + Apple Containers preinstalled are not yet generally available (latest is `macos-15` as of this ADR). The original ADR established the design and file structure so that issue #8 can close; the actual macOS Tester Image build was gated on runner availability.
+
+**Amendment context**: after writing the original ADR, it became clear that requiring macOS 26 + Apple Containers blocked practical use of macOS Benches entirely — no developer Macs and no GH Actions runners meet the requirement today. The actual user requirement from issue #8 is *container isolation from the developer's local Mac filesystem* during npm ci / build / test runs. Docker on macOS (Docker Desktop or colima) satisfies that requirement using technology available today.
 
 ---
 
 ## Decisions
 
-### Decision 1 — macOS runtime: Apple Containers (not Docker, not Podman)
+### Decision 1 — macOS runtime: Docker (amended 2026-05-24; Apple Containers reserved for future)
 
-Apple Containers is the selected runtime for macOS Benches. It ships natively in macOS 26+; the CLI binary is `container`; it builds and runs OCI images natively; and — critically — it can run macOS-native containers, giving genuine macOS sandbox parity.
+**Current decision**: macOS Benches use Docker (Docker Desktop or colima) running Linux containers. The `runtime` field on `bench.Bench` defaults to `"docker"`, which applies to macOS Benches as well as Linux and Windows Benches.
 
-**Rejected alternatives:**
+Apple Containers becomes a future evolution path when macOS 26 + GH Actions `macos-26` runners are generally available. The `Runtime` field and `RuntimeContainer` constant are preserved in the codebase for that future — no code needs to change when the time comes.
 
-- **Docker Desktop (macOS)**: runs Linux containers inside a Linux VM. Cannot sandbox macOS-native code paths. Tests running inside Docker Desktop on Mac would observe Linux, not macOS, kernel behavior. Wrong tool.
-- **Podman (macOS)**: same limitation — Linux containers in a VM (via `gvisor`, `lima`, or `podman machine`). Also wrong tool.
-- **Lima / colima**: these are VM managers layered on top of qemu or Apple Virtualization. Still Linux VMs; same limitation as Docker Desktop.
+**Original decision (superseded by amendment)**: Apple Containers was selected as the macOS runtime. Rejected alternatives included Docker Desktop (Linux containers in a VM, cannot sandbox macOS code paths), Podman (same limitation), and Lima/colima (VM managers, same limitation).
 
-Apple Containers is the only available runtime on macOS 26+ that can run macOS containers natively.
+**Why Docker on macOS is sufficient now**: the user requirement is container isolation from the Mac filesystem — keeping `npm ci`, build artifacts, and test state out of the developer's local environment. Docker Desktop and colima both provide this isolation for Linux containers running on a Mac. macOS-specific code paths (FSEvents, case-insensitive HFS+, macOS-only Node APIs) are not exercised by this configuration, but that is a known and documented limitation rather than a blocker for most use cases.
 
 ### Decision 2 — Runtime abstraction: extend `dockerexec` with a runtime selector
 
-The existing `internal/dockerexec` package (`Run`, `Stream`) hardcodes `"docker"` as the subprocess binary. To support Apple Containers, this binary must be selectable per Bench.
+*Unchanged from original ADR.*
+
+The existing `internal/dockerexec` package (`Run`, `Stream`) hardcodes `"docker"` as the subprocess binary. To support Apple Containers (future), this binary must be selectable per Bench.
 
 **Decision**: extend, not replace. Add a `Runtime string` field to `bench.Bench` with two sentinel values — `RuntimeDocker = "docker"` (default, preserves all existing behavior) and `RuntimeContainer = "container"` (Apple Containers, macOS Benches). Add a `RuntimeBin() string` method to `Bench` that returns the right binary name. Update `dockerexec.Run` and `dockerexec.Stream` to invoke `b.RuntimeBin()` instead of the hardcoded `"docker"` string.
 
@@ -44,27 +59,29 @@ The existing `internal/dockerexec` package (`Run`, `Stream`) hardcodes `"docker"
 
 **Consequence for `DOCKER_HOST`**: `DockerHost()` returns `"ssh://<host>"` regardless of runtime. Apple Containers supports the same SSH transport, so the value is reused unchanged.
 
-### Decision 3 — Tester Image format: OCI Containerfile at `dockerfiles/macos.containerfile`
+### Decision 3 — Tester Image format: alias-publish (amended 2026-05-24; no separate macOS Dockerfile)
 
-Apple Containers accepts standard Dockerfile syntax (it's an OCI image builder). The macOS Tester Image uses the same Dockerfile syntax as the Linux and Windows Tester Images.
+**Current decision**: no separate macOS Tester Image is built or published. The publish workflow re-tags the existing `gsd-tester-linux:vX.Y.Z` image as `gsd-tester-macos:vX.Y.Z` (alias publish on the Linux runner — a pure manifest operation, no rebuild). The Linux image provides container isolation when run on a Mac via Docker Desktop or colima.
 
-The file is placed at `dockerfiles/macos.containerfile`. The `.containerfile` extension is chosen (over `.Dockerfile`) to signal at the file-layout level that this file targets a non-Docker runtime. The content is semantically identical to `dockerfiles/linux.Dockerfile` in structure — same ARG/LABEL pattern, same sentinel OCI label, same Reporter COPY — but the base image and system package installation differ because macOS base images use different package managers and paths.
+`dockerfiles/macos.containerfile` is deleted. The `tag-macos-alias` job in the publish workflow depends on `publish-linux` and runs on `ubuntu-latest`.
 
-**Placeholder status**: as of this ADR, Apple does not publish official macOS base images for Apple Containers to a public registry. The `FROM` line is replaced with `FROM scratch` as a syntactically valid placeholder. The file documents the intended structure. The actual base image will be filled in when Apple makes one available.
+The sentinel label (`sh.gsd-test.image-version`) is preserved on the alias automatically — re-tagging carries all labels from the source image. The publish workflow verifies this with a `docker image inspect` step.
 
-**Image naming and distribution**: tagged and pushed to GHCR at `ghcr.io/<owner>/gsd-tester-macos:<tag>`, consistent with the Linux (`gsd-tester-linux`) and Windows (`gsd-tester-windows`) pattern. The `cmd/gsd-test/main.go` ImageID derivation (`ghcr.io/open-gsd/gsd-tester-<os>`) already works for `os=macos` without change.
+**Original decision (superseded by amendment)**: a `dockerfiles/macos.containerfile` was added (using Apple Containers Dockerfile syntax). The file used `FROM scratch` as a placeholder pending Apple publishing official macOS base images.
 
-### Decision 4 — GH Actions runner: placeholder job with `if: false` gate
+### Decision 4 — GH Actions runner: no macOS runner needed for publish (amended 2026-05-24)
 
-A `publish-macos` job is added to `.github/workflows/publish-tester-images.yml`. The job is unconditionally disabled via `if: false` in its condition. The `runs-on` field is set to `macos-26` (not yet available from GitHub Actions as of this ADR's date).
+**Current decision**: no macOS GH Actions runner is needed for the publish. The `tag-macos-alias` job runs on `ubuntu-latest` and performs a pure manifest operation (pull Linux image, re-tag, push). The `macos-26` runner requirement is eliminated.
 
-When GitHub Actions provides a macOS 26 runner with Apple Containers preinstalled:
+**Original decision (superseded by amendment)**: a `publish-macos` job was added with `if: false` gate, waiting on `macos-26` runner availability from GitHub Actions.
 
-1. Set `runs-on` to the correct runner label.
-2. Set `if: true` (or remove the condition entirely).
-3. Replace the placeholder `FROM scratch` in `dockerfiles/macos.containerfile` with the actual Apple-published macOS base image.
+### Decision 5 (new, 2026-05-24) — Why this amendment
 
-No other code changes are needed — the `container` binary invocations in the job match Apple Containers' CLI exactly.
+The original ADR over-specified Apple Containers as the only valid runtime for macOS Benches. The actual user requirement from issue #8 is container isolation from the developer's local Mac filesystem during npm ci / build / test runs — Docker on macOS satisfies that requirement using technology available today (Docker Desktop, colima).
+
+The amendment makes macOS Benches usable immediately without waiting for macOS 26 or GH Actions runner updates. The `Runtime` field on `bench.Bench` and the `RuntimeContainer` constant are preserved in the codebase — when Apple Containers becomes broadly available, the path to enable it is: (1) set `runtime = "container"` in the bench config, (2) flip the publish job to build a native macOS image. No architectural changes are needed.
+
+The amendment is made in-place on this ADR (not as a new ADR) because the framing and context remain correct — only the implementation decisions changed.
 
 ---
 
@@ -73,14 +90,21 @@ No other code changes are needed — the `container` binary invocations in the j
 - `bench.Bench` gains a `Runtime` field and two constants. Existing bench values constructed without the field default to `""`, which `RuntimeBin()` maps to `"docker"` — fully backward-compatible.
 - `internal/dockerexec.Run` and `internal/dockerexec.Stream` each change one line (hardcoded `"docker"` → `b.RuntimeBin()`). All existing tests continue to pass; the runtime abstraction is exercised by new unit tests in `internal/bench/bench_test.go`.
 - `internal/config` gains `runtime` as an optional TOML field on `[[benches]]` entries. Omitting it (all existing configs) continues to work.
-- `dockerfiles/macos.containerfile` is added but will not build until the placeholder `FROM scratch` is replaced and a macOS-capable runner is available.
-- The `publish-macos` workflow job is inert (`if: false`) until the runner and base image are available.
-- Issue #8 closes on this PR: the design is locked, the file structure is established, the runtime abstraction is wired, and the only remaining work is operational (wait for GH Actions runner availability + Apple base image).
+- `dockerfiles/macos.containerfile` is deleted (amendment). A `dockerfiles/macos.README.md` documents the alias-publish approach and the path back to a native macOS Tester Image.
+- The `publish-macos` workflow job is replaced by `tag-macos-alias` — a pure manifest re-tag on `ubuntu-latest` that runs after `publish-linux` succeeds (amendment).
+- Mac developers can use the harness today with Docker Desktop or colima — no macOS 26 requirement.
+- No separate image build/publish for macOS — the alias keeps Tester Images in lock-step with the Linux image.
+- macOS-specific code paths (FSEvents, case-insensitive HFS+, macOS-only Node APIs) are NOT tested by this configuration. Real macOS-native testing waits for Apple Containers + `macos-26` GH Actions runners.
+- The Linux Tester Image is published as a multi-arch manifest (`linux/amd64` + `linux/arm64`) via `docker/build-push-action` with QEMU emulation on the `ubuntu-latest` runner (added 2026-05-24). Apple Silicon Macs (M1+) receive native arm64 images without needing `--platform=linux/amd64` or Rosetta emulation in the Docker VM. The macOS alias (`gsd-tester-macos`) inherits multi-arch automatically because re-tagging a manifest list produces a multi-arch alias.
 
 ---
 
 ## Alternatives considered
 
-See Decision 1 (Docker Desktop, Podman, Lima/colima rejected) and Decision 2 (separate `containerexec` package rejected).
+See Decision 1 (Docker Desktop rejected in original — now accepted as the interim path), Decision 2 (separate `containerexec` package rejected), and the original Decision 4 (omitting the macOS job entirely — rejected in favor of the disabled stub, now replaced by the alias-publish approach).
 
-One additional alternative considered for the workflow gate: omitting the `publish-macos` job entirely and adding it later. Rejected because having the job present — even disabled — makes the runner-availability gate visible in the repo and documents exactly what needs to change (runner label + `if: false` → `if: true`). Future contributors can find the activation path without reading ADRs.
+**Alias-publish (chosen amendment)**: re-tag the Linux image as `gsd-tester-macos:vX.Y.Z`. No separate image build. The Linux image provides container isolation on macOS. Chosen because it makes macOS Benches available today, requires zero new Dockerfile content, and keeps macOS and Linux Tester Images in lock-step automatically.
+
+**Continue waiting for Apple Containers**: keep `if: false` and `macos-26` runner. Rejected because no timeline exists for `macos-26` runner availability on GH Actions, leaving macOS Bench support permanently blocked.
+
+**Separate Linux-based macOS image**: build a dedicated Dockerfile with macOS-relevant tooling on top of Linux. Rejected because it adds maintenance burden without benefit — the Linux Tester Image already has everything needed (Node 22, npm, git, tar, reporter), and the content difference between "Linux Tester Image" and "Linux-based macOS Tester Image" would be zero in practice.

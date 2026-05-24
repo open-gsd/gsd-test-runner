@@ -41,6 +41,9 @@ jobs:
           echo "tag=v${VERSION}" >> "$GITHUB_OUTPUT"
           echo "Publishing as version: ${VERSION} (tag: v${VERSION})"
 
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
@@ -57,6 +60,7 @@ jobs:
           context: .
           file: dockerfiles/linux.Dockerfile
           push: true
+          platforms: linux/amd64,linux/arm64
           tags: |
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/gsd-tester-linux:${{ steps.version.outputs.tag }}
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/gsd-tester-linux:latest
@@ -67,18 +71,26 @@ jobs:
             org.opencontainers.image.revision=${{ github.sha }}
             org.opencontainers.image.version=${{ steps.version.outputs.tag }}
 
-      - name: Verify sentinel label
+      - name: Verify sentinel label (multi-arch aware)
         run: |
-          # Pull the image we just pushed and inspect the label to confirm
-          # it matches the tag. Fails the workflow if mismatch.
+          # buildx imagetools inspect understands multi-arch manifest lists.
+          # 'docker image inspect' on a manifest index returns the index entry,
+          # not a single image config -- use imagetools instead.
           IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/gsd-tester-linux:${{ steps.version.outputs.tag }}"
-          docker pull "$IMAGE"
-          LABEL=$(docker image inspect "$IMAGE" --format '{{ index .Config.Labels "sh.gsd-test.image-version" }}')
+          OUTPUT=$(docker buildx imagetools inspect "$IMAGE" --format '{{ json .Image }}')
+          # Verify amd64
+          LABEL=$(echo "$OUTPUT" | jq -r '."linux/amd64".config.Labels."sh.gsd-test.image-version"')
           if [[ "$LABEL" != "${{ steps.version.outputs.tag }}" ]]; then
-            echo "::error::Sentinel label mismatch: expected '${{ steps.version.outputs.tag }}', got '${LABEL}'"
+            echo "::error::Sentinel label mismatch (amd64): expected '${{ steps.version.outputs.tag }}', got '$LABEL'"
             exit 1
           fi
-          echo "Sentinel label OK: ${LABEL}"
+          # Verify arm64
+          LABEL_ARM=$(echo "$OUTPUT" | jq -r '."linux/arm64".config.Labels."sh.gsd-test.image-version"')
+          if [[ "$LABEL_ARM" != "${{ steps.version.outputs.tag }}" ]]; then
+            echo "::error::Sentinel label mismatch (arm64): expected '${{ steps.version.outputs.tag }}', got '$LABEL_ARM'"
+            exit 1
+          fi
+          echo "Sentinel label OK on both amd64 + arm64: $LABEL"
 
   publish-windows:
     runs-on: windows-2022
@@ -105,6 +117,40 @@ jobs:
         run: |
           $token = "${{ secrets.GITHUB_TOKEN }}"
           $token | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Switch Docker to Windows containers mode
+        shell: pwsh
+        run: |
+          # GitHub Actions windows-2022 runners default Docker to Linux containers (WSL2).
+          # Windows-container builds require switching the daemon to Windows mode.
+          Write-Host "Stopping Docker service..."
+          Stop-Service -Name docker -Force -ErrorAction SilentlyContinue
+
+          Write-Host "Switching to Windows containers..."
+          & 'C:\Program Files\Docker\Docker\DockerCli.exe' -SwitchDaemon
+
+          Write-Host "Starting Docker service..."
+          Start-Service -Name docker
+
+          # Wait for daemon
+          $timeout = 60
+          $elapsed = 0
+          while ($elapsed -lt $timeout) {
+            try {
+              docker info | Out-Null
+              if ($LASTEXITCODE -eq 0) {
+                Write-Host "Docker daemon ready after $elapsed seconds"
+                docker version
+                break
+              }
+            } catch {}
+            Start-Sleep -Seconds 2
+            $elapsed += 2
+          }
+          if ($elapsed -ge $timeout) {
+            Write-Error "Docker daemon did not become ready within $timeout seconds"
+            exit 1
+          }
 
       - name: Build Windows Tester Image
         shell: pwsh
@@ -134,19 +180,14 @@ jobs:
           }
           Write-Host "Sentinel label OK: $label"
 
-  publish-macos:
-    # Blocked on GitHub Actions providing macos-26 (or later) runners with
-    # Apple Containers preinstalled. Until then this job will fail to
-    # select a runner. When the runner is available, change runs-on and
-    # set if to true (or remove the condition entirely). The container CLI
-    # invocations below already match Apple Containers' CLI exactly.
-    # See ADR-0020 dec 4 for the full activation checklist.
-    runs-on: macos-26  # NOT YET AVAILABLE — see ADR-0020 dec 4
-    if: false  # disabled until runner is available; flip to true when ready
+  tag-macos-alias:
+    # Per ADR-0020 (amended 2026-05-24): the macOS Tester Image is a re-tagged
+    # alias of the Linux image. Mac developers run it via Docker Desktop or
+    # colima -- Docker on macOS provides container isolation using the Linux
+    # image as content. Pure manifest operation; no rebuild.
+    needs: publish-linux
+    runs-on: ubuntu-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
       - name: Resolve version
         id: version
         run: |
@@ -157,35 +198,41 @@ jobs:
           fi
           echo "tag=v${VERSION}" >> "$GITHUB_OUTPUT"
 
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
       - name: Log in to GHCR
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GITHUB_ACTOR: ${{ github.actor }}
-        run: |
-          echo "$GITHUB_TOKEN" | container login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build macOS Tester Image
-        env:
-          TAG: ${{ steps.version.outputs.tag }}
-          REGISTRY: ${{ env.REGISTRY }}
-          IMAGE_NAMESPACE: ${{ env.IMAGE_NAMESPACE }}
+      - name: Re-tag Linux image as macOS alias
         run: |
-          IMAGE="${REGISTRY}/${IMAGE_NAMESPACE}/gsd-tester-macos:${TAG}"
-          container build \
-            -f dockerfiles/macos.containerfile \
-            --build-arg "IMAGE_VERSION=${TAG}" \
-            -t "$IMAGE" .
-          container push "$IMAGE"
+          # Use imagetools create to duplicate the full multi-arch manifest list.
+          # 'docker pull/tag/push' only copies the platform-native image and
+          # silently drops the other architectures from the manifest. imagetools
+          # operates on the registry index directly, preserving all platforms.
+          TAG="${{ steps.version.outputs.tag }}"
+          LINUX_IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/gsd-tester-linux:$TAG"
+          MACOS_IMAGE_VERSIONED="${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/gsd-tester-macos:$TAG"
+          MACOS_IMAGE_LATEST="${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/gsd-tester-macos:latest"
 
-      - name: Verify sentinel label
-        env:
-          TAG: ${{ steps.version.outputs.tag }}
-          REGISTRY: ${{ env.REGISTRY }}
-          IMAGE_NAMESPACE: ${{ env.IMAGE_NAMESPACE }}
+          docker buildx imagetools create --tag "$MACOS_IMAGE_VERSIONED" "$LINUX_IMAGE"
+          docker buildx imagetools create --tag "$MACOS_IMAGE_LATEST" "$LINUX_IMAGE"
+
+      - name: Verify sentinel label on alias (multi-arch aware)
         run: |
-          IMAGE="${REGISTRY}/${IMAGE_NAMESPACE}/gsd-tester-macos:${TAG}"
-          LABEL=$(container image inspect "$IMAGE" --format '{{ index .Config.Labels "sh.gsd-test.image-version" }}')
+          # The macOS alias is a re-tag of the multi-arch Linux manifest list.
+          # buildx imagetools inspect works on multi-arch manifests; docker image
+          # inspect would return the index entry rather than a platform image config.
+          TAG="${{ steps.version.outputs.tag }}"
+          IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/gsd-tester-macos:$TAG"
+          OUTPUT=$(docker buildx imagetools inspect "$IMAGE" --format '{{ json .Image }}')
+          LABEL=$(echo "$OUTPUT" | jq -r '."linux/amd64".config.Labels."sh.gsd-test.image-version"')
           if [[ "$LABEL" != "$TAG" ]]; then
-            echo "::error::Sentinel label mismatch: expected '$TAG', got '$LABEL'"
+            echo "::error::Sentinel label mismatch on macOS alias (amd64): expected '$TAG', got '$LABEL'"
             exit 1
           fi
+          echo "Sentinel label OK on macOS alias: $LABEL"
