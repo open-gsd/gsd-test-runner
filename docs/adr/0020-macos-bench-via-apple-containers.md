@@ -95,6 +95,7 @@ The amendment is made in-place on this ADR (not as a new ADR) because the framin
 - Mac developers can use the harness today with Docker Desktop or colima — no macOS 26 requirement.
 - No separate image build/publish for macOS — the alias keeps Tester Images in lock-step with the Linux image.
 - macOS-specific code paths (FSEvents, case-insensitive HFS+, macOS-only Node APIs) are NOT tested by this configuration. Real macOS-native testing waits for Apple Containers + `macos-26` GH Actions runners.
+- The Linux Tester Image is published as a multi-arch manifest (`linux/amd64` + `linux/arm64`) via `docker/build-push-action` with QEMU emulation on the `ubuntu-latest` runner (added 2026-05-24). Apple Silicon Macs (M1+) receive native arm64 images without needing `--platform=linux/amd64` or Rosetta emulation in the Docker VM. The macOS alias (`gsd-tester-macos`) inherits multi-arch automatically because re-tagging a manifest list produces a multi-arch alias.
 
 ---
 
