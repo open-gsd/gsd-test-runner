@@ -60,9 +60,13 @@ func (b Bench) DockerHost() string {
 	return "ssh://" + b.Host
 }
 
-// RuntimeBin returns the CLI binary name for the Bench's container runtime.
-// An empty Runtime field defaults to "docker" for backward compatibility.
-// RuntimeContainer returns "container" (Apple Containers, macOS 26+).
+// RuntimeBin returns the CLI binary name for this Bench. Defaults to
+// "docker" if Runtime is empty.
+//
+// "container" (Apple Containers) is reserved for a future macOS path that
+// requires macOS 26 + a macos-26 GH Actions runner — see ADR-0020 amendment
+// (2026-05-24). Until then, macOS Benches use runtime="docker" with Docker
+// Desktop or colima providing the container runtime on the Mac.
 func (b Bench) RuntimeBin() string {
 	if b.Runtime == RuntimeContainer {
 		return "container"

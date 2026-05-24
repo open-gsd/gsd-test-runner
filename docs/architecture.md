@@ -23,7 +23,7 @@ Phases 3 and 4 do I/O. Phases 1, 2, and 5 are CPU/memory only and are independen
 | `cmd/gsd-test` | `cmd/gsd-test/` | CLI entry point. Flag parsing, phase sequencing, exit code mapping. |
 | `config` | `internal/config/` | TOML config loading and validation. Bench registry, version map, defaults. |
 | `plan` | `internal/plan/` | Pure resolver. Builds the list of `Run` values from config + selector. |
-| `bench` | `internal/bench/` | `Bench` type (with `Runtime` field for Docker vs Apple Containers). `Selector` (round-robin + pin/exclude). `BenchDockerError`. |
+| `bench` | `internal/bench/` | `Bench` type (with `Runtime` field; `"docker"` default for all Benches today; `"container"` reserved for future Apple Containers). `Selector` (round-robin + pin/exclude). `BenchDockerError`. |
 | `refs` | `internal/refs/` | Git ref resolution. Converts `--base` and `--head` string refs to SHAs. |
 | `worktree` | `internal/worktree/` | PR-merged worktree construction. Shallow clone + real `git merge` in a scratch directory. |
 | `images` | `internal/images/` | `EnsurePresent`: pull from GHCR, fall back to `docker build` on the Bench. Typed pull errors. |
@@ -103,4 +103,4 @@ All design decisions live in [docs/adr/](adr/). Read them in numeric order for t
 | 0017 | Event emission contract |
 | 0018 | Local Engine orchestration phases |
 | 0019 | Local Engine binary distribution via GitHub Release assets |
-| 0020 | macOS Bench via Apple Containers |
+| 0020 | macOS Bench via Apple Containers (amended 2026-05-24: pivoted to Docker on macOS) |

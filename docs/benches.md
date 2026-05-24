@@ -139,26 +139,51 @@ docker login ghcr.io
 ssh win-rig-1 docker pull ghcr.io/open-gsd/gsd-tester-windows:v1.0.0
 ```
 
-## Setting up a macOS Bench (preview)
+## Setting up a macOS Bench
 
-macOS Bench support targets macOS 26 and later using Apple Containers — Apple's native container runtime (distinct from Docker Desktop). Unlike Docker on Mac, which runs Linux containers inside a Linux VM, Apple Containers runs macOS-native containers natively. This is the only way to test actual macOS code paths in a sandboxed environment on macOS hardware.
+A macOS Bench is a Mac with Docker installed — either Docker Desktop or colima. The Tester Image is a Linux container (provides isolation from your Mac's local filesystem during npm ci / build / test runs); the Mac provides the host environment.
 
-This feature is in preview: the Tester Image base image is not yet published (Apple has not released official macOS base images), and GitHub Actions does not yet offer macOS 26 runners. The runtime abstraction is already wired — see [ADR-0020](adr/0020-macos-bench-via-apple-containers.md) for the full design.
+> **Why isolation matters**: `npm ci` populates a node_modules directory; tests can write to disk; npm caches accumulate. Running these directly on your Mac clobbers your local state. The Linux container keeps the test environment ephemeral and reproducible — your Mac stays clean.
+>
+> **Why not native macOS containers?** Apple Containers (macOS-native sandboxing) requires macOS 26 and isn't yet available on GitHub Actions runners or most developer Macs. When it ships broadly, the `Runtime` field on `bench.Bench` is reserved to switch to it. See [ADR-0020](adr/0020-macos-bench-via-apple-containers.md).
 
-When macOS Bench support ships, the setup flow will be:
+### Install Docker on your Mac
 
-1. SSH key access to the macOS Bench (same as Linux).
-2. macOS 26 with Apple Containers installed (`container` binary).
-3. Pull the Tester Image: `ssh mac-rig-1 container pull ghcr.io/open-gsd/gsd-tester-macos:v1.0.0`.
-4. Set `runtime = "container"` in the `[[benches]]` entry.
+Either:
+- **Docker Desktop** — https://www.docker.com/products/docker-desktop (GUI; commercial license for organizations >250 employees or >$10M revenue)
+- **colima** — `brew install colima docker docker-compose` then `colima start` (open source; CLI-only)
+
+Verify with `docker version`.
+
+### Configure your Mac as a Bench
+
+In `~/.config/gsd-test/config.toml`:
 
 ```toml
 [[benches]]
-name    = "mac-rig-1"
-host    = "mac-rig-1"
-os      = "macos"
-runtime = "container"
+name = "my-mac"
+host = "local"  # or "" -- empty/local means run Docker on the current machine, no SSH
+os = "macos"
+# runtime defaults to "docker" -- leave unset
 ```
+
+Or for a remote Mac you SSH to:
+
+```toml
+[[benches]]
+name = "lab-mac-1"
+host = "lab-mac-1.local"  # SSH alias from ~/.ssh/config
+os = "macos"
+```
+
+### What gets pulled
+
+The Local Engine pulls `ghcr.io/open-gsd/gsd-tester-macos:vX.Y.Z` — which is an alias for the Linux Tester Image (same content, different tag). Pull happens automatically per ADR-0012.
+
+### Caveats
+
+- Tests run inside a Linux container; macOS-specific code paths (FSEvents, case-insensitive HFS+, macOS-only Node APIs) are not exercised by this configuration
+- For testing actual macOS behavior natively, run `node --test` directly outside the harness, or wait for Apple Containers (see [ADR-0020](adr/0020-macos-bench-via-apple-containers.md))
 
 ## Listing your Benches in config.toml
 
@@ -198,11 +223,11 @@ To always use a specific Bench, pass **`--bench <name>`** on the command line or
 
 ## OS-to-Image mapping
 
-| `os` value | Tester Image | Runtime |
-|------------|--------------|---------|
-| `linux` | `ghcr.io/open-gsd/gsd-tester-linux` | `docker` |
-| `windows` | `ghcr.io/open-gsd/gsd-tester-windows` | `docker` |
-| `macos` | `ghcr.io/open-gsd/gsd-tester-macos` | `container` (Apple Containers, preview) |
+| `os` value | Image | Runtime | Notes |
+|------------|-------|---------|-------|
+| `linux` | `ghcr.io/open-gsd/gsd-tester-linux` | `docker` | |
+| `windows` | `ghcr.io/open-gsd/gsd-tester-windows` | `docker` | requires Windows host |
+| `macos` | `ghcr.io/open-gsd/gsd-tester-macos` (alias of linux) | `docker` | Mac host running Docker Desktop or colima; tests Linux behavior |
 
 ## Probing Bench reachability
 
