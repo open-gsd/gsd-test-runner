@@ -74,6 +74,7 @@ Each `[[benches]]` block declares one Bench. All fields in a single block descri
 | `host` | `string` | No | `""` | SSH host alias from `~/.ssh/config`. Set to `"local"` or leave empty to use the Dev Workstation's own Docker daemon. |
 | `os` | `string` | **Yes** | — | Target OS this Bench provides. One of `"linux"`, `"windows"`, `"macos"`. |
 | `runtime` | `string` | No | `"docker"` | Container runtime. `"docker"` is the default for all Benches today (Linux, Windows, and macOS). `"container"` is reserved for future Apple Containers support (requires macOS 26; not usable today — see ADR-0020). |
+| `platform` | `string` | No | `""` | Optional OCI platform pin for `docker run`, e.g. `"linux/amd64"` or `"linux/arm64"`. |
 
 ### `name`
 
@@ -106,6 +107,20 @@ The OS family this Bench targets. `gsd-test` uses this to select the right Teste
 name = "win-rig-1"
 host = "win-rig-1"
 os   = "windows"
+```
+
+### `platform`
+
+Optional platform pin passed as `docker run --platform <value>`.
+
+Use this when you need deterministic architecture behavior across benches (for example, forcing both a remote Linux bench and a local macOS Docker bench to run `linux/amd64`).
+
+```toml
+[[benches]]
+name = "mac-local"
+host = "local"
+os   = "macos"
+platform = "linux/amd64"
 ```
 
 ## `[versions]`

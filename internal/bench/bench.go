@@ -48,6 +48,11 @@ type Bench struct {
 	// and Windows Benches. Use RuntimeContainer ("container") for macOS
 	// Benches running Apple Containers (macOS 26+). See ADR-0020 dec 2.
 	Runtime string
+
+	// Platform optionally pins the OCI platform for container runs, e.g.
+	// "linux/amd64" or "linux/arm64". Empty means runtime default platform
+	// selection.
+	Platform string
 }
 
 // DockerHost returns the DOCKER_HOST environment variable value for
@@ -79,7 +84,7 @@ func (b Bench) RuntimeBin() string {
 // unreachable, daemon down, SSH refused). Replaces the previously-duplicated
 // definitions in internal/pipeline and internal/images.
 type BenchDockerError struct {
-	Bench    string   // bench.Bench.Name
+	Bench    string // bench.Bench.Name
 	Args     []string
 	Stderr   string
 	ExitCode int

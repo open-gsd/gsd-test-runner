@@ -448,6 +448,7 @@ name = "bench-macos"
 host = "mac-rig.local"
 os = "macos"
 runtime = "container"
+platform = "linux/amd64"
 
 [[benches]]
 name = "bench-linux"
@@ -470,6 +471,9 @@ os = "linux"
 	}
 	if macosBench.OS != "macos" {
 		t.Errorf("Registry[0].OS = %q, want %q", macosBench.OS, "macos")
+	}
+	if macosBench.Platform != "linux/amd64" {
+		t.Errorf("Registry[0].Platform = %q, want %q", macosBench.Platform, "linux/amd64")
 	}
 
 	linuxBench := cfg.Registry[1]

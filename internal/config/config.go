@@ -73,10 +73,11 @@ type rawDefaults struct {
 }
 
 type rawBench struct {
-	Name    string `toml:"name"`
-	Host    string `toml:"host"`
-	OS      string `toml:"os"`
-	Runtime string `toml:"runtime,omitempty"` // "docker" (default; all benches today) | "container" (reserved for future Apple Containers)
+	Name     string `toml:"name"`
+	Host     string `toml:"host"`
+	OS       string `toml:"os"`
+	Runtime  string `toml:"runtime,omitempty"`  // "docker" (default; all benches today) | "container" (reserved for future Apple Containers)
+	Platform string `toml:"platform,omitempty"` // optional OCI platform override, e.g. "linux/amd64"
 }
 
 type rawTesting struct {
@@ -173,10 +174,11 @@ func validateAndTransform(raw rawConfig) (*Config, error) {
 		// can add an allowlist when the supported set is finalized.
 
 		registry = append(registry, bench.Bench{
-			Name:    rb.Name,
-			Host:    rb.Host, // empty is fine — means local
-			OS:      rb.OS,
-			Runtime: rb.Runtime, // empty defaults to "docker" via bench.RuntimeBin()
+			Name:     rb.Name,
+			Host:     rb.Host, // empty is fine — means local
+			OS:       rb.OS,
+			Runtime:  rb.Runtime, // empty defaults to "docker" via bench.RuntimeBin()
+			Platform: rb.Platform,
 		})
 	}
 	command, err := parseTestingCommand(raw.Testing.Command)
