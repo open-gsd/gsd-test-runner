@@ -368,6 +368,35 @@ func TestSubscribe_MultipleOSes(t *testing.T) {
 	}
 }
 
+func TestRenderer_EventLegSkipped(t *testing.T) {
+	var buf bytes.Buffer
+	r := renderer.New(&buf, renderer.ModeTTY)
+
+	ch := make(chan pipeline.Event, 5)
+	r.Subscribe("linux", ch)
+	drainAndClose(ch, []pipeline.Event{
+		{
+			Kind:   pipeline.EventLegSkipped,
+			Leg:    pipeline.LegBuild,
+			OS:     "linux",
+			Time:   time.Now(),
+			Detail: "no build script defined in package.json",
+		},
+	})
+	r.Wait()
+
+	out := buf.String()
+	if !strings.Contains(out, "SKIP") {
+		t.Errorf("expected SKIP keyword in output, got: %q", out)
+	}
+	if !strings.Contains(out, "build") {
+		t.Errorf("expected leg name 'build' in output, got: %q", out)
+	}
+	if !strings.Contains(out, "no build script defined in package.json") {
+		t.Errorf("expected detail string in output, got: %q", out)
+	}
+}
+
 func TestWait_BlocksUntilAllChannelsClose(t *testing.T) {
 	var buf bytes.Buffer
 	r := renderer.New(&buf, renderer.ModeTTY)

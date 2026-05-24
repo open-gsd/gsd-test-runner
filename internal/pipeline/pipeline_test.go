@@ -229,6 +229,7 @@ func TestEventKind_String_ContainsKindName(t *testing.T) {
 		{EventLegStart, "leg_start"},
 		{EventLegSuccess, "leg_success"},
 		{EventLegFailure, "leg_failure"},
+		{EventLegSkipped, "leg_skipped"},
 		{EventChildOutput, "child_output"},
 		{EventTestPass, "test_pass"},
 		{EventTestFail, "test_fail"},
@@ -1379,6 +1380,8 @@ func TestBuild_NoContainerID(t *testing.T) {
 
 // TestBuild_Success verifies Build returns nil and emits correct events on success.
 func TestBuild_Success(t *testing.T) {
+	// Stub dockerRun to return package.json with a build script.
+	stubDockerRun(t, `{"name":"x","version":"1.0.0","scripts":{"build":"tsc","test":"node --test"}}`, nil)
 	stubDockerStream(t, func(ctx context.Context, b bench.Bench, args []string, stdoutLine, stderrLine dockerexec.LineHandler) error {
 		stdoutLine("build complete")
 		stdoutLine("dist/index.js written")
@@ -1415,6 +1418,8 @@ func TestBuild_Success(t *testing.T) {
 
 // TestBuild_Failure verifies Build returns *BuildError wrapping stderr on non-zero exit.
 func TestBuild_Failure(t *testing.T) {
+	// Stub dockerRun to return package.json with a build script.
+	stubDockerRun(t, `{"name":"x","version":"1.0.0","scripts":{"build":"tsc","test":"node --test"}}`, nil)
 	stubDockerStream(t, func(ctx context.Context, b bench.Bench, args []string, stdoutLine, stderrLine dockerexec.LineHandler) error {
 		stderrLine("tsc: error TS2345: bad type")
 		return &dockerexec.ExecError{Args: args, ExitCode: 2}
@@ -1440,6 +1445,286 @@ func TestBuild_Failure(t *testing.T) {
 	}
 	if !strings.Contains(buildErr.Stderr, "tsc: error TS2345") {
 		t.Errorf("expected Stderr to contain error, got: %q", buildErr.Stderr)
+	}
+}
+
+// --- Build skip tests ---
+
+// TestBuild_NoBuildScript_Skipped verifies that when package.json has no
+// "build" script, Build returns nil and emits EventLegSkipped (not
+// EventLegSuccess), and dockerStream is never called.
+func TestBuild_NoBuildScript_Skipped(t *testing.T) {
+	// Stub dockerRun to return package.json without a build script.
+	original := dockerRun
+	dockerRun = func(ctx context.Context, b bench.Bench, args []string) (string, error) {
+		return `{"name":"x","version":"1.0.0","scripts":{"test":"node --test"}}`, nil
+	}
+	t.Cleanup(func() { dockerRun = original })
+
+	// Stub dockerStream to fail the test if called (npm run build must NOT run).
+	stubDockerStream(t, func(ctx context.Context, b bench.Bench, args []string, stdoutLine, stderrLine dockerexec.LineHandler) error {
+		t.Errorf("dockerStream called unexpectedly: npm run build should not execute when no build script")
+		return nil
+	})
+
+	p, ch := newTestPipeline(t, 32)
+	p.containerID = "test-container"
+
+	err := p.Build(context.Background())
+	if err != nil {
+		t.Fatalf("expected nil error, got: %v", err)
+	}
+
+	close(ch)
+	var events []Event
+	for e := range ch {
+		events = append(events, e)
+	}
+
+	// Must have at least LegStart and LegSkipped.
+	if len(events) < 2 {
+		t.Fatalf("expected at least 2 events (LegStart + LegSkipped), got %d: %v", len(events), events)
+	}
+	if events[0].Kind != EventLegStart {
+		t.Errorf("events[0]: expected EventLegStart, got %v", events[0].Kind)
+	}
+	if events[0].Leg != LegBuild {
+		t.Errorf("events[0]: expected Leg=LegBuild, got %v", events[0].Leg)
+	}
+
+	// Find the skipped event.
+	skippedEvents := filterEvents(events, EventLegSkipped)
+	if len(skippedEvents) != 1 {
+		t.Fatalf("expected 1 EventLegSkipped event, got %d (all events: %v)", len(skippedEvents), events)
+	}
+	if skippedEvents[0].Leg != LegBuild {
+		t.Errorf("EventLegSkipped.Leg: expected LegBuild, got %v", skippedEvents[0].Leg)
+	}
+	if !strings.Contains(skippedEvents[0].Detail, "no build script") {
+		t.Errorf("EventLegSkipped.Detail: expected to contain %q, got %q", "no build script", skippedEvents[0].Detail)
+	}
+
+	// Must have zero EventLegSuccess and zero EventLegFailure for LegBuild.
+	successEvents := filterEvents(events, EventLegSuccess)
+	for _, ev := range successEvents {
+		if ev.Leg == LegBuild {
+			t.Error("unexpected EventLegSuccess for LegBuild")
+		}
+	}
+	failureEvents := filterEvents(events, EventLegFailure)
+	for _, ev := range failureEvents {
+		if ev.Leg == LegBuild {
+			t.Error("unexpected EventLegFailure for LegBuild")
+		}
+	}
+}
+
+// TestBuild_PackageJsonReadFailure verifies that when dockerRun (cat package.json)
+// returns an ExecError, Build returns *LegError wrapping *BuildError and never
+// calls dockerStream (no npm run build).
+func TestBuild_PackageJsonReadFailure(t *testing.T) {
+	execErr := &dockerexec.ExecError{
+		Args:     []string{"exec", "--workdir", "/work", "test-container", "cat", "package.json"},
+		Stderr:   "cat: /work/package.json: No such file or directory",
+		ExitCode: 1,
+	}
+	stubDockerRun(t, "", execErr)
+	stubDockerStream(t, func(ctx context.Context, b bench.Bench, args []string, stdoutLine, stderrLine dockerexec.LineHandler) error {
+		t.Errorf("dockerStream called unexpectedly: npm run build should not execute when package.json read fails")
+		return nil
+	})
+
+	p, ch := newTestPipeline(t, 32)
+	p.containerID = "test-container"
+
+	err := p.Build(context.Background())
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+
+	var legErr *LegError
+	if !errors.As(err, &legErr) {
+		t.Fatalf("expected *LegError, got %T: %v", err, err)
+	}
+	if legErr.Leg != LegBuild {
+		t.Errorf("expected Leg=LegBuild, got %v", legErr.Leg)
+	}
+	var buildErr *BuildError
+	if !errors.As(legErr.Cause, &buildErr) {
+		t.Fatalf("expected Cause=*BuildError, got %T: %v", legErr.Cause, legErr.Cause)
+	}
+	if buildErr.Cause == nil {
+		t.Fatal("expected BuildError.Cause to be non-nil")
+	}
+	if !strings.Contains(buildErr.Cause.Error(), "read package.json") {
+		t.Errorf("expected BuildError.Cause to mention %q, got: %v", "read package.json", buildErr.Cause)
+	}
+
+	// Must emit EventLegFailure, not EventLegSkipped.
+	close(ch)
+	var events []Event
+	for e := range ch {
+		events = append(events, e)
+	}
+	failureEvents := filterEvents(events, EventLegFailure)
+	if len(failureEvents) == 0 {
+		t.Error("expected EventLegFailure event, got none")
+	}
+	skippedEvents := filterEvents(events, EventLegSkipped)
+	if len(skippedEvents) != 0 {
+		t.Errorf("expected no EventLegSkipped, got %d", len(skippedEvents))
+	}
+}
+
+// TestBuild_PackageJsonMalformed verifies that when dockerRun returns non-JSON
+// content, Build returns *LegError wrapping *BuildError mentioning "parse package.json".
+func TestBuild_PackageJsonMalformed(t *testing.T) {
+	stubDockerRun(t, "not json {{{", nil)
+	stubDockerStream(t, func(ctx context.Context, b bench.Bench, args []string, stdoutLine, stderrLine dockerexec.LineHandler) error {
+		t.Errorf("dockerStream called unexpectedly: npm run build should not execute when package.json is malformed")
+		return nil
+	})
+
+	p, ch := newTestPipeline(t, 32)
+	p.containerID = "test-container"
+
+	err := p.Build(context.Background())
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+
+	var legErr *LegError
+	if !errors.As(err, &legErr) {
+		t.Fatalf("expected *LegError, got %T: %v", err, err)
+	}
+	var buildErr *BuildError
+	if !errors.As(legErr.Cause, &buildErr) {
+		t.Fatalf("expected Cause=*BuildError, got %T: %v", legErr.Cause, legErr.Cause)
+	}
+	if buildErr.Cause == nil {
+		t.Fatal("expected BuildError.Cause to be non-nil")
+	}
+	if !strings.Contains(buildErr.Cause.Error(), "parse package.json") {
+		t.Errorf("expected BuildError.Cause to mention %q, got: %v", "parse package.json", buildErr.Cause)
+	}
+
+	close(ch)
+	var events []Event
+	for e := range ch {
+		events = append(events, e)
+	}
+	failureEvents := filterEvents(events, EventLegFailure)
+	if len(failureEvents) == 0 {
+		t.Error("expected EventLegFailure event, got none")
+	}
+}
+
+// TestBuild_EmptyScriptsObject verifies that an empty "scripts" object is
+// treated the same as no scripts: Build returns nil and EventLegSkipped is emitted.
+func TestBuild_EmptyScriptsObject(t *testing.T) {
+	stubDockerRun(t, `{"name":"x","scripts":{}}`, nil)
+	stubDockerStream(t, func(ctx context.Context, b bench.Bench, args []string, stdoutLine, stderrLine dockerexec.LineHandler) error {
+		t.Errorf("dockerStream called unexpectedly")
+		return nil
+	})
+
+	p, ch := newTestPipeline(t, 32)
+	p.containerID = "test-container"
+
+	err := p.Build(context.Background())
+	if err != nil {
+		t.Fatalf("expected nil error, got: %v", err)
+	}
+
+	close(ch)
+	var events []Event
+	for e := range ch {
+		events = append(events, e)
+	}
+	skippedEvents := filterEvents(events, EventLegSkipped)
+	if len(skippedEvents) != 1 {
+		t.Fatalf("expected 1 EventLegSkipped, got %d", len(skippedEvents))
+	}
+	if skippedEvents[0].Leg != LegBuild {
+		t.Errorf("expected Leg=LegBuild, got %v", skippedEvents[0].Leg)
+	}
+}
+
+// TestBuild_BuildScriptEmptyString verifies that a build script with an empty
+// string value is NOT skipped — even empty scripts should run (npm treats them
+// as no-ops). Build returns nil and EventLegSuccess is emitted.
+func TestBuild_BuildScriptEmptyString(t *testing.T) {
+	stubDockerRun(t, `{"name":"x","scripts":{"build":""}}`, nil)
+	streamCalled := false
+	stubDockerStream(t, func(ctx context.Context, b bench.Bench, args []string, stdoutLine, stderrLine dockerexec.LineHandler) error {
+		streamCalled = true
+		return nil
+	})
+
+	p, ch := newTestPipeline(t, 32)
+	p.containerID = "test-container"
+
+	err := p.Build(context.Background())
+	if err != nil {
+		t.Fatalf("expected nil error, got: %v", err)
+	}
+	if !streamCalled {
+		t.Error("expected dockerStream to be called for empty-string build script")
+	}
+
+	close(ch)
+	var events []Event
+	for e := range ch {
+		events = append(events, e)
+	}
+	successEvents := filterEvents(events, EventLegSuccess)
+	if len(successEvents) == 0 {
+		t.Error("expected EventLegSuccess, got none")
+	}
+	for _, ev := range successEvents {
+		if ev.Leg == LegBuild {
+			return // found it
+		}
+	}
+	t.Error("expected EventLegSuccess with Leg=LegBuild")
+}
+
+// TestRunLeg_SkipSentinel verifies the runLeg protocol for ErrLegSkipped:
+// a work function returning ("custom reason", ErrLegSkipped) causes runLeg
+// to return nil and emit EventLegStart then EventLegSkipped with Detail="custom reason".
+func TestRunLeg_SkipSentinel(t *testing.T) {
+	p, ch := newTestPipeline(t, 16)
+	p.containerID = "test-container"
+
+	work := func(ctx context.Context) (string, error) {
+		return "custom reason", ErrLegSkipped
+	}
+
+	err := p.runLeg(context.Background(), LegBuild, work)
+	if err != nil {
+		t.Fatalf("expected nil return from runLeg on ErrLegSkipped, got: %v", err)
+	}
+
+	close(ch)
+	var events []Event
+	for e := range ch {
+		events = append(events, e)
+	}
+
+	if len(events) != 2 {
+		t.Fatalf("expected 2 events (LegStart + LegSkipped), got %d: %v", len(events), events)
+	}
+	if events[0].Kind != EventLegStart {
+		t.Errorf("events[0]: expected EventLegStart, got %v", events[0].Kind)
+	}
+	if events[1].Kind != EventLegSkipped {
+		t.Errorf("events[1]: expected EventLegSkipped, got %v", events[1].Kind)
+	}
+	if events[1].Detail != "custom reason" {
+		t.Errorf("events[1].Detail: expected %q, got %q", "custom reason", events[1].Detail)
+	}
+	if events[1].Leg != LegBuild {
+		t.Errorf("events[1].Leg: expected LegBuild, got %v", events[1].Leg)
 	}
 }
 

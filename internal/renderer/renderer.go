@@ -142,6 +142,8 @@ func (r *Renderer) renderTTY(osName string, ev pipeline.Event) {
 		s = fmt.Sprintf("%s OK    %s\n", prefix, legString(ev.Leg))
 	case pipeline.EventLegFailure:
 		s = fmt.Sprintf("%s FAIL  %s: %s\n", prefix, legString(ev.Leg), ev.Detail)
+	case pipeline.EventLegSkipped:
+		s = fmt.Sprintf("%s SKIP  %s: %s\n", prefix, legString(ev.Leg), ev.Detail)
 	case pipeline.EventChildOutput:
 		// Indent + prefix with stream marker for readability.
 		tag := "1"

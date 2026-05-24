@@ -3,6 +3,7 @@ package pipeline
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -63,6 +64,13 @@ func (l Leg) String() string {
 	}
 	return fmt.Sprintf("leg(%d)", int(l))
 }
+
+// ErrLegSkipped is returned by a leg work function to signal that the leg
+// was intentionally skipped (not a failure, not a silent success). runLeg
+// recognizes it and emits EventLegSkipped instead of EventLegSuccess. The
+// first return value (diagPath) from work is repurposed as a human-readable
+// skip reason and surfaced as Event.Detail.
+var ErrLegSkipped = errors.New("leg skipped")
 
 // LegError envelopes a per-leg failure. Per ADR-0008, callers use
 // errors.As(err, &legErr) to learn which Leg failed and where to
@@ -176,6 +184,7 @@ const (
 	EventLegStart EventKind = iota
 	EventLegSuccess
 	EventLegFailure
+	EventLegSkipped  // leg intentionally skipped (not a failure, not a silent success)
 	EventChildOutput // a line of subprocess stdout/stderr
 	EventTestPass
 	EventTestFail
@@ -189,6 +198,8 @@ func (k EventKind) String() string {
 		return "leg_success"
 	case EventLegFailure:
 		return "leg_failure"
+	case EventLegSkipped:
+		return "leg_skipped"
 	case EventChildOutput:
 		return "child_output"
 	case EventTestPass:
@@ -514,15 +525,43 @@ func (e *BuildError) Error() string {
 
 func (e *BuildError) Unwrap() error { return e.Cause }
 
+// hasBuildScript probes /work/package.json inside the container and reports
+// whether a "build" script is defined under "scripts". A missing or
+// unreadable package.json is a hard error (NpmCI would have already
+// failed). An empty "scripts" object or missing "build" key returns
+// (false, nil).
+func (p *Pipeline) hasBuildScript(ctx context.Context) (bool, error) {
+	args := []string{"exec", "--workdir", "/work", p.containerID, "cat", "package.json"}
+	out, err := dockerRun(ctx, p.bench, args)
+	if err != nil {
+		return false, fmt.Errorf("read package.json: %w", err)
+	}
+	var pkg struct {
+		Scripts map[string]string `json:"scripts"`
+	}
+	if err := json.Unmarshal([]byte(out), &pkg); err != nil {
+		return false, fmt.Errorf("parse package.json: %w", err)
+	}
+	_, ok := pkg.Scripts["build"]
+	return ok, nil
+}
+
 // Build runs the project's build step inside the container.
 func (p *Pipeline) Build(ctx context.Context) error {
 	return p.runLeg(ctx, LegBuild, func(ctx context.Context) (string, error) {
 		if p.containerID == "" {
 			return "", &BuildError{Cause: errors.New("StartContainer did not run; containerID is empty")}
 		}
+		hasScript, err := p.hasBuildScript(ctx)
+		if err != nil {
+			return "", &BuildError{Cause: err}
+		}
+		if !hasScript {
+			return "no build script defined in package.json", ErrLegSkipped
+		}
 		var stderrBuf bytes.Buffer
 		args := []string{"exec", "--workdir", "/work", p.containerID, "npm", "run", "build"}
-		err := dockerStream(ctx, p.bench, args,
+		err = dockerStream(ctx, p.bench, args,
 			func(line string) {
 				p.emit(Event{Kind: EventChildOutput, Leg: LegBuild, Line: line, Stream: "stdout"})
 			},
@@ -764,6 +803,10 @@ func (p *Pipeline) runLeg(ctx context.Context, leg Leg, work func(context.Contex
 		return legErr
 	}
 	diagPath, err := work(ctx)
+	if errors.Is(err, ErrLegSkipped) {
+		p.emit(Event{Kind: EventLegSkipped, OS: p.bench.OS, Time: time.Now(), Leg: leg, Detail: diagPath})
+		return nil
+	}
 	if err != nil {
 		var legErr *LegError
 		if !errors.As(err, &legErr) {
