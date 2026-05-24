@@ -1,0 +1,118 @@
+name: Release Binaries
+
+# Triggers on tagged releases. Tag format: v<major>.<minor>.<patch> (semver).
+# The tag value (minus "v" prefix) becomes the binary version stamp.
+# For an existing tag (e.g. v1.0.0), use workflow_dispatch with version=1.0.0.
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version tag (without v prefix, e.g. 1.0.0). Used for manual triggers.'
+        required: true
+        type: string
+
+permissions:
+  contents: write  # required for gh release create / upload
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { goos: darwin,  goarch: amd64 }
+          - { goos: darwin,  goarch: arm64 }
+          - { goos: linux,   goarch: amd64 }
+          - { goos: linux,   goarch: arm64 }
+          - { goos: windows, goarch: amd64 }
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Resolve version
+        id: version
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            VERSION="${{ inputs.version }}"
+          else
+            VERSION="${GITHUB_REF_NAME#v}"
+          fi
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "tag=v${VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Build binary
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: 0
+        run: |
+          BINARY_NAME="gsd-test-v${{ steps.version.outputs.version }}-${{ matrix.goos }}-${{ matrix.goarch }}"
+          if [[ "${{ matrix.goos }}" == "windows" ]]; then
+            BINARY_NAME="${BINARY_NAME}.exe"
+          fi
+          go build -trimpath -ldflags="-s -w -X main.version=v${{ steps.version.outputs.version }}" -o "${BINARY_NAME}" ./cmd/gsd-test
+          echo "binary=${BINARY_NAME}" >> "$GITHUB_ENV"
+
+      - name: Compute SHA256
+        run: |
+          sha256sum "${binary}" > "${binary}.sha256"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.binary }}
+          path: |
+            ${{ env.binary }}
+            ${{ env.binary }}.sha256
+          retention-days: 7
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push'  # only auto-create release on real tag push
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve version
+        id: version
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "tag=v${VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts/
+
+      - name: Flatten artifacts
+        run: |
+          mkdir -p release/
+          find artifacts/ -type f \( -name "gsd-test-*" \) -exec cp {} release/ \;
+          ls -la release/
+
+      - name: Create or update GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ steps.version.outputs.tag }}"
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            echo "Release $TAG exists, uploading binaries to it..."
+            gh release upload "$TAG" release/* --clobber --repo "$GITHUB_REPOSITORY"
+          else
+            echo "Release $TAG does not exist, creating with binaries..."
+            gh release create "$TAG" release/* \
+              --title "$TAG" \
+              --notes "Auto-generated release for $TAG. See CHANGELOG / commit history for details." \
+              --repo "$GITHUB_REPOSITORY"
+          fi

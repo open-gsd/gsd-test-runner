@@ -1,6 +1,8 @@
 package main
 
 import (
+	"os"
+	"strings"
 	"testing"
 )
 
@@ -15,6 +17,9 @@ func TestParseFlags_Defaults(t *testing.T) {
 	f, err := parseFlags([]string{})
 	if err != nil {
 		t.Fatalf("parseFlags([]): unexpected error: %v", err)
+	}
+	if f.printVersion {
+		t.Error("printVersion: got true, want false")
 	}
 	if f.base != "main" {
 		t.Errorf("base: got %q, want %q", f.base, "main")
@@ -45,6 +50,16 @@ func TestParseFlags_Defaults(t *testing.T) {
 	}
 	if f.scratch != "" {
 		t.Errorf("scratch: got %q, want empty", f.scratch)
+	}
+}
+
+func TestParseFlags_Version(t *testing.T) {
+	f, err := parseFlags([]string{"--version"})
+	if err != nil {
+		t.Fatalf("parseFlags(--version): unexpected error: %v", err)
+	}
+	if !f.printVersion {
+		t.Error("printVersion: got false, want true")
 	}
 }
 
@@ -101,6 +116,43 @@ func TestParseFlags_BadFlag(t *testing.T) {
 	_, err := parseFlags([]string{"--unknown-flag"})
 	if err == nil {
 		t.Error("parseFlags(--unknown-flag): expected error, got nil")
+	}
+}
+
+// TestRun_Version verifies that --version prints the version string and exits 0.
+// run() writes to *os.File, so we use os.Pipe to capture output.
+func TestRun_Version(t *testing.T) {
+	// Override version for the test.
+	original := version
+	version = "v1.2.3-test"
+	defer func() { version = original }()
+
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe: %v", err)
+	}
+
+	// run writes to w; we read from r.
+	code := run([]string{"--version"}, w, os.Stderr)
+	w.Close()
+
+	var buf strings.Builder
+	tmp := make([]byte, 256)
+	for {
+		n, readErr := r.Read(tmp)
+		buf.Write(tmp[:n])
+		if readErr != nil {
+			break
+		}
+	}
+	r.Close()
+
+	if code != 0 {
+		t.Errorf("exit code: got %d, want 0", code)
+	}
+	got := strings.TrimSpace(buf.String())
+	if got != "v1.2.3-test" {
+		t.Errorf("output: got %q, want %q", got, "v1.2.3-test")
 	}
 }
 
