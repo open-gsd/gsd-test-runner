@@ -50,6 +50,9 @@ os = "macos-container"
 [versions]
 linux = "v1.4.0"
 windows = "v1.4.0"
+
+[testing]
+command = "npm test -- --test-reporter={{REPORTER_PATH}} --test-reporter-destination={{REPORTER_DEST}}"
 `)
 
 	cfg, err := Load(path, LoadOptions{})
@@ -91,6 +94,9 @@ windows = "v1.4.0"
 	}
 	if len(cfg.Defaults.Exclude) != 1 || cfg.Defaults.Exclude[0] != "macos-container" {
 		t.Errorf("Defaults.Exclude = %v, want [macos-container]", cfg.Defaults.Exclude)
+	}
+	if cfg.Testing.Command != "npm test -- --test-reporter={{REPORTER_PATH}} --test-reporter-destination={{REPORTER_DEST}}" {
+		t.Errorf("Testing.Command = %q, want configured command", cfg.Testing.Command)
 	}
 }
 

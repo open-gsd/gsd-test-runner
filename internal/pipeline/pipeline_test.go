@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -19,7 +20,7 @@ func newTestPipeline(t *testing.T, bufSize int) (*Pipeline, chan Event) {
 	t.Helper()
 	ch := make(chan Event, bufSize)
 	b := bench.Bench{Name: "test-bench", Host: "localhost", OS: "linux"}
-	p := New(b, images.ImageID("gsd-tester-linux:dev"), "v0.0.0-test", "/tmp/worktree", ch)
+	p := New(b, images.ImageID("gsd-tester-linux:dev"), "v0.0.0-test", "/tmp/worktree", "", ch)
 	return p, ch
 }
 
@@ -53,7 +54,7 @@ func stubDockerCapture(t *testing.T, out string, err error) *bench.Bench {
 func TestNew_NilEventChannelOK(t *testing.T) {
 	stubDocker(t, "v0.0.0-test", nil) // match so leg succeeds without panicking
 	b := bench.Bench{Name: "nil-chan-bench", Host: "local", OS: "linux"}
-	p := New(b, images.ImageID("gsd-tester-linux:dev"), "v0.0.0-test", "/tmp/worktree", nil)
+	p := New(b, images.ImageID("gsd-tester-linux:dev"), "v0.0.0-test", "/tmp/worktree", "", nil)
 	// Must not panic even though emit is called internally.
 	err := p.CheckImageVersion(context.Background())
 	if err != nil {
@@ -169,7 +170,7 @@ func TestEvent_FullChannel_DoesNotBlock(t *testing.T) {
 	// Capacity 1: fills after the first event; all subsequent emits must drop.
 	ch := make(chan Event, 1)
 	b := bench.Bench{Name: "bench", Host: "local", OS: "linux"}
-	p := New(b, images.ImageID("gsd-tester-linux:dev"), "v0.0.0-test", "/tmp/worktree", ch)
+	p := New(b, images.ImageID("gsd-tester-linux:dev"), "v0.0.0-test", "/tmp/worktree", "", ch)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
@@ -256,7 +257,7 @@ func TestCheckImageVersion_MatchingLabel_ReturnsNil(t *testing.T) {
 	stubDocker(t, "v1.2.3\n", nil)
 	ch := make(chan Event, 16)
 	b := bench.Bench{Name: "bench", Host: "local", OS: "linux"}
-	p := New(b, images.ImageID("gsd-tester-linux:v1.2.3"), "v1.2.3", "/tmp/worktree", ch)
+	p := New(b, images.ImageID("gsd-tester-linux:v1.2.3"), "v1.2.3", "/tmp/worktree", "", ch)
 
 	err := p.CheckImageVersion(context.Background())
 	if err != nil {
@@ -270,7 +271,7 @@ func TestCheckImageVersion_MismatchedLabel_ReturnsImageVersionMismatch(t *testin
 	stubDocker(t, "v1.2.2\n", nil)
 	ch := make(chan Event, 16)
 	b := bench.Bench{Name: "bench", Host: "local", OS: "linux"}
-	p := New(b, images.ImageID("gsd-tester-linux:v1.2.3"), "v1.2.3", "/tmp/worktree", ch)
+	p := New(b, images.ImageID("gsd-tester-linux:v1.2.3"), "v1.2.3", "/tmp/worktree", "", ch)
 
 	err := p.CheckImageVersion(context.Background())
 	if err == nil {
@@ -299,7 +300,7 @@ func TestCheckImageVersion_EmptyLabel_ReturnsImageVersionMismatchWithEmptyActual
 	stubDocker(t, "", nil)
 	ch := make(chan Event, 16)
 	b := bench.Bench{Name: "bench", Host: "local", OS: "linux"}
-	p := New(b, images.ImageID("gsd-tester-linux:v1.2.3"), "v1.2.3", "/tmp/worktree", ch)
+	p := New(b, images.ImageID("gsd-tester-linux:v1.2.3"), "v1.2.3", "/tmp/worktree", "", ch)
 
 	err := p.CheckImageVersion(context.Background())
 	if err == nil {
@@ -328,7 +329,7 @@ func TestCheckImageVersion_NoSuchImage_ReturnsImageNotPresent(t *testing.T) {
 	})
 	ch := make(chan Event, 16)
 	b := bench.Bench{Name: "bench", Host: "local", OS: "linux"}
-	p := New(b, images.ImageID("ghcr.io/foo:v1.2.3"), "v1.2.3", "/tmp/worktree", ch)
+	p := New(b, images.ImageID("ghcr.io/foo:v1.2.3"), "v1.2.3", "/tmp/worktree", "", ch)
 
 	err := p.CheckImageVersion(context.Background())
 	if err == nil {
@@ -374,7 +375,7 @@ func TestCheckImageVersion_LocalBench_NoDockerHostPassed(t *testing.T) {
 	captured := stubDockerCapture(t, "v1.2.3\n", nil)
 	ch := make(chan Event, 16)
 	b := bench.Bench{Name: "bench", Host: "local", OS: "linux"}
-	p := New(b, images.ImageID("gsd-tester-linux:v1.2.3"), "v1.2.3", "/tmp/worktree", ch)
+	p := New(b, images.ImageID("gsd-tester-linux:v1.2.3"), "v1.2.3", "/tmp/worktree", "", ch)
 
 	_ = p.CheckImageVersion(context.Background())
 	if captured.DockerHost() != "" {
@@ -388,7 +389,7 @@ func TestCheckImageVersion_EmptyHost_NoDockerHostPassed(t *testing.T) {
 	captured := stubDockerCapture(t, "v1.2.3\n", nil)
 	ch := make(chan Event, 16)
 	b := bench.Bench{Name: "bench", Host: "", OS: "linux"}
-	p := New(b, images.ImageID("gsd-tester-linux:v1.2.3"), "v1.2.3", "/tmp/worktree", ch)
+	p := New(b, images.ImageID("gsd-tester-linux:v1.2.3"), "v1.2.3", "/tmp/worktree", "", ch)
 
 	_ = p.CheckImageVersion(context.Background())
 	if captured.DockerHost() != "" {
@@ -402,7 +403,7 @@ func TestCheckImageVersion_RemoteBench_PassesSSHDockerHost(t *testing.T) {
 	captured := stubDockerCapture(t, "v1.2.3\n", nil)
 	ch := make(chan Event, 16)
 	b := bench.Bench{Name: "bench-linux-1", Host: "bench-linux-1", OS: "linux"}
-	p := New(b, images.ImageID("gsd-tester-linux:v1.2.3"), "v1.2.3", "/tmp/worktree", ch)
+	p := New(b, images.ImageID("gsd-tester-linux:v1.2.3"), "v1.2.3", "/tmp/worktree", "", ch)
 
 	_ = p.CheckImageVersion(context.Background())
 	want := "ssh://bench-linux-1"
@@ -417,7 +418,7 @@ func TestCheckImageVersion_EmitsLegSuccessOnMatch(t *testing.T) {
 	stubDocker(t, "v1.2.3\n", nil)
 	ch := make(chan Event, 16)
 	b := bench.Bench{Name: "bench", Host: "local", OS: "linux"}
-	p := New(b, images.ImageID("gsd-tester-linux:v1.2.3"), "v1.2.3", "/tmp/worktree", ch)
+	p := New(b, images.ImageID("gsd-tester-linux:v1.2.3"), "v1.2.3", "/tmp/worktree", "", ch)
 
 	err := p.CheckImageVersion(context.Background())
 	if err != nil {
@@ -447,7 +448,7 @@ func TestCheckImageVersion_EmitsLegFailureOnMismatch(t *testing.T) {
 	stubDocker(t, "v1.2.2\n", nil)
 	ch := make(chan Event, 16)
 	b := bench.Bench{Name: "bench", Host: "local", OS: "linux"}
-	p := New(b, images.ImageID("gsd-tester-linux:v1.2.3"), "v1.2.3", "/tmp/worktree", ch)
+	p := New(b, images.ImageID("gsd-tester-linux:v1.2.3"), "v1.2.3", "/tmp/worktree", "", ch)
 
 	_ = p.CheckImageVersion(context.Background())
 
@@ -1768,6 +1769,69 @@ func TestRunTests_Success_TestsPass(t *testing.T) {
 	err := p.RunTests(context.Background())
 	if err != nil {
 		t.Fatalf("expected nil error, got: %v", err)
+	}
+}
+
+func TestRunTests_DefaultCommand_Unchanged(t *testing.T) {
+	var commandArgs []string
+	stubDockerStream(t, func(ctx context.Context, b bench.Bench, args []string, stdoutLine, stderrLine dockerexec.LineHandler) error {
+		for _, a := range args {
+			if a == "tail" {
+				return nil
+			}
+		}
+		commandArgs = append([]string(nil), args...)
+		return nil
+	})
+
+	p, _ := newTestPipeline(t, 32)
+	p.containerID = "test-container"
+
+	err := p.RunTests(context.Background())
+	if err != nil {
+		t.Fatalf("expected nil error, got: %v", err)
+	}
+
+	want := []string{
+		"exec", "--workdir", "/work", "test-container",
+		"node", "--test",
+		"--test-reporter=/opt/gsd-test/reporter.mjs",
+		"--test-reporter-destination=/work/test-events.jsonl",
+	}
+	if !reflect.DeepEqual(commandArgs, want) {
+		t.Fatalf("RunTests command args mismatch\n got: %v\nwant: %v", commandArgs, want)
+	}
+}
+
+func TestRunTests_CustomCommand_SubstitutesReporterPlaceholders(t *testing.T) {
+	var commandArgs []string
+	stubDockerStream(t, func(ctx context.Context, b bench.Bench, args []string, stdoutLine, stderrLine dockerexec.LineHandler) error {
+		for _, a := range args {
+			if a == "tail" {
+				return nil
+			}
+		}
+		commandArgs = append([]string(nil), args...)
+		return nil
+	})
+
+	p, _ := newTestPipeline(t, 32)
+	p.containerID = "test-container"
+	p.testCommand = "npm test -- --test-reporter={{REPORTER_PATH}} --test-reporter-destination={{REPORTER_DEST}}"
+
+	err := p.RunTests(context.Background())
+	if err != nil {
+		t.Fatalf("expected nil error, got: %v", err)
+	}
+
+	want := []string{
+		"exec", "--workdir", "/work", "test-container",
+		"npm", "test", "--",
+		"--test-reporter=/opt/gsd-test/reporter.mjs",
+		"--test-reporter-destination=/work/test-events.jsonl",
+	}
+	if !reflect.DeepEqual(commandArgs, want) {
+		t.Fatalf("RunTests command args mismatch\n got: %v\nwant: %v", commandArgs, want)
 	}
 }
 
