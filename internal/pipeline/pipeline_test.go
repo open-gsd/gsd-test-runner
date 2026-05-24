@@ -623,6 +623,18 @@ func stubDockerRun(t *testing.T, out string, err error) {
 	t.Cleanup(func() { dockerRun = original })
 }
 
+func stubDockerRunCapture(t *testing.T, out string, err error) *[][]string {
+	t.Helper()
+	original := dockerRun
+	var calls [][]string
+	dockerRun = func(ctx context.Context, b bench.Bench, args []string) (string, error) {
+		calls = append(calls, append([]string(nil), args...))
+		return out, err
+	}
+	t.Cleanup(func() { dockerRun = original })
+	return &calls
+}
+
 // stubDockerRmCapture swaps dockerRm for a stub that records the args it was
 // called with. Restored via t.Cleanup.
 func stubDockerRmCapture(t *testing.T) *[][]string {
@@ -652,6 +664,30 @@ func TestStartContainer_Success(t *testing.T) {
 	}
 	if p.containerID != "abc123def456" {
 		t.Errorf("expected containerID=%q, got %q", "abc123def456", p.containerID)
+	}
+}
+
+func TestStartContainer_PassesPlatformWhenConfigured(t *testing.T) {
+	calls := stubDockerRunCapture(t, "abc123def456\n", nil)
+	stubDockerRmCapture(t)
+
+	p, _ := newTestPipeline(t, 16)
+	p.bench.Platform = "linux/amd64"
+	err := p.StartContainer(context.Background())
+	if err != nil {
+		t.Fatalf("expected nil error, got: %v", err)
+	}
+	if len(*calls) != 1 {
+		t.Fatalf("expected 1 dockerRun call, got %d", len(*calls))
+	}
+	wantArgs := []string{
+		"run", "--rm", "-d", "--workdir", "/work",
+		"--platform", "linux/amd64",
+		"gsd-tester-linux:dev",
+		"sleep", "infinity",
+	}
+	if !reflect.DeepEqual((*calls)[0], wantArgs) {
+		t.Fatalf("dockerRun args mismatch\ngot: %v\nwant: %v", (*calls)[0], wantArgs)
 	}
 }
 

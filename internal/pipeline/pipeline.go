@@ -466,11 +466,12 @@ func (p *Pipeline) CopyWorktree(ctx context.Context) error {
 func (p *Pipeline) StartContainer(ctx context.Context) error {
 	return p.runLeg(ctx, LegStartContainer, func(_ context.Context) (string, error) {
 		imageRef := string(p.image)
-		stdout, err := dockerRun(ctx, p.bench, []string{
-			"run", "--rm", "-d", "--workdir", "/work",
-			imageRef,
-			"sleep", "infinity",
-		})
+		args := []string{"run", "--rm", "-d", "--workdir", "/work"}
+		if p.bench.Platform != "" {
+			args = append(args, "--platform", p.bench.Platform)
+		}
+		args = append(args, imageRef, "sleep", "infinity")
+		stdout, err := dockerRun(ctx, p.bench, args)
 		if err != nil {
 			var execErr *dockerexec.ExecError
 			if errors.As(err, &execErr) {
