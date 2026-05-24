@@ -9,6 +9,26 @@ case-sensitive filesystem, missing system tools, etc. The Mac side is what catch
 bugs that depend on the developer's actual environment. Running both gives you the
 union of both safety nets.
 
+## Installation
+
+Download the binary for your platform from the [latest release](https://github.com/open-gsd/gsd-test-runner/releases/latest):
+
+```bash
+# macOS arm64 example
+curl -L -o gsd-test https://github.com/open-gsd/gsd-test-runner/releases/latest/download/gsd-test-v1.0.0-darwin-arm64
+chmod +x gsd-test
+mv gsd-test ~/.local/bin/
+gsd-test --version  # → v1.0.0
+```
+
+Available platforms: `darwin-amd64`, `darwin-arm64`, `linux-amd64`, `linux-arm64`, `windows-amd64.exe`.
+
+Or build from source:
+
+```bash
+go install github.com/open-gsd/gsd-test-runner/cmd/gsd-test@latest
+```
+
 ## Installed components
 
 | Path | What |

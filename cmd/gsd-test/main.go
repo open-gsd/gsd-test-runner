@@ -37,6 +37,9 @@ import (
 	"github.com/open-gsd/gsd-test-runner/internal/worktree"
 )
 
+// version is overridden at build time via -ldflags="-X main.version=v1.2.3".
+var version = "dev"
+
 // Exit codes per ADR-0009:
 //
 //	0 = all per-OS Reports are KindPass
@@ -51,6 +54,7 @@ const (
 
 // cliFlags holds the parsed CLI flag values.
 type cliFlags struct {
+	printVersion bool
 	configPath   string
 	probeBenches bool
 	targets      string
@@ -69,6 +73,7 @@ type cliFlags struct {
 func parseFlags(args []string) (cliFlags, error) {
 	fs := flag.NewFlagSet("gsd-test", flag.ContinueOnError)
 	var f cliFlags
+	fs.BoolVar(&f.printVersion, "version", false, "print version and exit")
 	fs.StringVar(&f.configPath, "config", "", "path to config.toml (default: $XDG_CONFIG_HOME/gsd-test/config.toml or ~/.config/gsd-test/config.toml)")
 	fs.BoolVar(&f.probeBenches, "probe-benches", false, "probe each Bench for reachability during config.Load")
 	fs.StringVar(&f.targets, "targets", "", "comma-separated OS targets (default: from config defaults.targets)")
@@ -100,6 +105,11 @@ func run(args []string, stdout, stderr *os.File) int {
 	if err != nil {
 		fmt.Fprintln(stderr, err)
 		return exitInconclusive
+	}
+
+	if flags.printVersion {
+		fmt.Fprintln(stdout, version)
+		return exitAllPass
 	}
 
 	// ── Phase 1: Load ──────────────────────────────────────────────────────────
