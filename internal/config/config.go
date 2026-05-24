@@ -5,9 +5,11 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/BurntSushi/toml"
+	"github.com/google/shlex"
 	"github.com/open-gsd/gsd-test-runner/internal/bench"
 	"github.com/open-gsd/gsd-test-runner/internal/dockerexec"
 )
@@ -41,7 +43,7 @@ type Defaults struct {
 
 // Testing contains optional test command configuration.
 type Testing struct {
-	Command string
+	Command []string
 }
 
 // LoadOptions controls config.Load behavior.
@@ -78,7 +80,7 @@ type rawBench struct {
 }
 
 type rawTesting struct {
-	Command string `toml:"command"`
+	Command any `toml:"command"`
 }
 
 // probeRun is the function used by probeBenches to test connectivity.
@@ -177,6 +179,13 @@ func validateAndTransform(raw rawConfig) (*Config, error) {
 			Runtime: rb.Runtime, // empty defaults to "docker" via bench.RuntimeBin()
 		})
 	}
+	command, err := parseTestingCommand(raw.Testing.Command)
+	if err != nil {
+		return nil, &InvalidConfigError{
+			Section: "testing.command",
+			Reason:  err.Error(),
+		}
+	}
 
 	return &Config{
 		Registry: registry,
@@ -188,9 +197,41 @@ func validateAndTransform(raw rawConfig) (*Config, error) {
 			Exclude: raw.Defaults.Exclude,
 		},
 		Testing: Testing{
-			Command: raw.Testing.Command,
+			Command: command,
 		},
 	}, nil
+}
+
+func parseTestingCommand(raw any) ([]string, error) {
+	switch v := raw.(type) {
+	case nil:
+		return nil, nil
+	case string:
+		trimmed := strings.TrimSpace(v)
+		if trimmed == "" {
+			return nil, nil
+		}
+		args, err := shlex.Split(trimmed)
+		if err != nil {
+			return nil, fmt.Errorf("invalid command string: %w", err)
+		}
+		return args, nil
+	case []any:
+		if len(v) == 0 {
+			return nil, nil
+		}
+		args := make([]string, 0, len(v))
+		for i, item := range v {
+			s, ok := item.(string)
+			if !ok {
+				return nil, fmt.Errorf("command array element %d must be a string", i)
+			}
+			args = append(args, s)
+		}
+		return args, nil
+	default:
+		return nil, fmt.Errorf("command must be a string or array of strings")
+	}
 }
 
 // probeBenches probes each Bench concurrently. Unreachable ones return in

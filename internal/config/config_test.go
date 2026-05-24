@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -95,8 +96,75 @@ command = "npm test -- --test-reporter={{REPORTER_PATH}} --test-reporter-destina
 	if len(cfg.Defaults.Exclude) != 1 || cfg.Defaults.Exclude[0] != "macos-container" {
 		t.Errorf("Defaults.Exclude = %v, want [macos-container]", cfg.Defaults.Exclude)
 	}
-	if cfg.Testing.Command != "npm test -- --test-reporter={{REPORTER_PATH}} --test-reporter-destination={{REPORTER_DEST}}" {
-		t.Errorf("Testing.Command = %q, want configured command", cfg.Testing.Command)
+	wantCommand := []string{
+		"npm",
+		"test",
+		"--",
+		"--test-reporter={{REPORTER_PATH}}",
+		"--test-reporter-destination={{REPORTER_DEST}}",
+	}
+	if !reflect.DeepEqual(cfg.Testing.Command, wantCommand) {
+		t.Errorf("Testing.Command = %v, want %v", cfg.Testing.Command, wantCommand)
+	}
+}
+
+func TestLoad_TestingCommand_StringQuoted_ParsesShellWords(t *testing.T) {
+	path := writeTOML(t, `
+[testing]
+command = "bash -c 'npm run pretest && node --test tests/*.test.cjs'"
+`)
+
+	cfg, err := Load(path, LoadOptions{})
+	if err != nil {
+		t.Fatalf("Load returned error: %v", err)
+	}
+
+	want := []string{
+		"bash",
+		"-c",
+		"npm run pretest && node --test tests/*.test.cjs",
+	}
+	if !reflect.DeepEqual(cfg.Testing.Command, want) {
+		t.Fatalf("Testing.Command = %v, want %v", cfg.Testing.Command, want)
+	}
+}
+
+func TestLoad_TestingCommand_Array_UsesExplicitArgv(t *testing.T) {
+	path := writeTOML(t, `
+[testing]
+command = ["bash", "-c", "npm run pretest && node --test tests/*.test.cjs"]
+`)
+
+	cfg, err := Load(path, LoadOptions{})
+	if err != nil {
+		t.Fatalf("Load returned error: %v", err)
+	}
+
+	want := []string{
+		"bash",
+		"-c",
+		"npm run pretest && node --test tests/*.test.cjs",
+	}
+	if !reflect.DeepEqual(cfg.Testing.Command, want) {
+		t.Fatalf("Testing.Command = %v, want %v", cfg.Testing.Command, want)
+	}
+}
+
+func TestLoad_TestingCommand_Array_NonStringElementError(t *testing.T) {
+	path := writeTOML(t, `
+[testing]
+command = ["bash", 123]
+`)
+
+	_, err := Load(path, LoadOptions{})
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !strings.Contains(err.Error(), "testing.command") {
+		t.Fatalf("expected testing.command error, got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "must be a string") {
+		t.Fatalf("expected element-type error, got: %v", err)
 	}
 }
 

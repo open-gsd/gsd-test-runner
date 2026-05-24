@@ -130,7 +130,7 @@ Optional test command template for the `run_tests` leg.
 
 | Field | Type | Required | Default |
 |-------|------|----------|---------|
-| `command` | `string` | No | `node --test --test-reporter={{REPORTER_PATH}} --test-reporter-destination={{REPORTER_DEST}}` |
+| `command` | `string` or `[]string` | No | `["node","--test","--test-reporter={{REPORTER_PATH}}","--test-reporter-destination={{REPORTER_DEST}}"]` |
 
 If omitted, behavior is unchanged from current releases.
 
@@ -139,11 +139,19 @@ Placeholder tokens supported in `testing.command`:
 - `{{REPORTER_PATH}}` → `/opt/gsd-test/reporter.mjs`
 - `{{REPORTER_DEST}}` → `/work/test-events.jsonl`
 
-Example:
+`command` string values are split with shell-style quote handling.
+`command` array values are passed directly as argv (recommended for multi-step `bash -c` style commands).
+
+Examples:
 
 ```toml
 [testing]
 command = "npm test -- --test-reporter={{REPORTER_PATH}} --test-reporter-destination={{REPORTER_DEST}}"
+```
+
+```toml
+[testing]
+command = ["bash", "-c", "npm run pretest && node --test tests/*.test.cjs"]
 ```
 
 ## CLI flags
@@ -206,5 +214,5 @@ linux   = "v1.0.0"
 windows = "v1.0.0"
 
 [testing]
-command = "npm test -- --test-reporter={{REPORTER_PATH}} --test-reporter-destination={{REPORTER_DEST}}"
+command = ["npm", "test", "--", "--test-reporter={{REPORTER_PATH}}", "--test-reporter-destination={{REPORTER_DEST}}"]
 ```
