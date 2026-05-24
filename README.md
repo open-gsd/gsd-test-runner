@@ -1,114 +1,70 @@
-# gsd-test-runner
+# gsd-test
 
-Dual-platform test runner for the [get-shit-done](https://github.com/gsd-build/get-shit-done) project.
-Runs Node tests both on the local Mac AND inside a Docker container on a Linux host,
-captures structured JSON Lines output from each, and surfaces platform-specific diffs.
+Run your Node test suite across Linux, Windows, and macOS in parallel — on hardware you already own — before pushing.
 
-The Linux side is what catches the bugs your Mac would miss — different homedir,
-case-sensitive filesystem, missing system tools, etc. The Mac side is what catches
-bugs that depend on the developer's actual environment. Running both gives you the
-union of both safety nets.
+`gsd-test` is a local-dev harness, not a CI system. It runs on your Dev Workstation and ships work over SSH to remote Linux and Windows machines (Benches) you control. It catches platform-specific bugs — case-sensitive filesystems, missing system tools, different home directories, path-separator divergence — in your edit loop, while the diff is still hot.
 
-## Installation
+## Features
 
-Download the binary for your platform from the [latest release](https://github.com/open-gsd/gsd-test-runner/releases/latest):
+- **Cross-platform parity** with zero CI lag. Push when you know it passes everywhere.
+- **No shared infrastructure** — your laptop orchestrates; your own remote machines execute.
+- **Fail-loud diagnostics** — every leg of the pipeline reports a distinct exit code with a diagnostics path.
+- **Versioned Tester Images** published to GHCR. Sentinel labels catch silent stale-image drift.
+- **Live progress** — see individual test events as they run, not just at the end.
+- **Machine-readable output** via `--json-events` for CI integration or your own tooling.
 
-```bash
-# macOS arm64 example
-curl -L -o gsd-test https://github.com/open-gsd/gsd-test-runner/releases/latest/download/gsd-test-v1.0.0-darwin-arm64
-chmod +x gsd-test
-mv gsd-test ~/.local/bin/
-gsd-test --version  # → v1.0.0
-```
-
-Available platforms: `darwin-amd64`, `darwin-arm64`, `linux-amd64`, `linux-arm64`, `windows-amd64.exe`.
-
-Or build from source:
+## Quick Start
 
 ```bash
-go install github.com/open-gsd/gsd-test-runner/cmd/gsd-test@latest
+# 1. Install (macOS arm64 example — see docs/installation.md for all platforms)
+curl -L -o gsd-test \
+  https://github.com/open-gsd/gsd-test-runner/releases/latest/download/gsd-test-v1.0.0-darwin-arm64
+chmod +x gsd-test && mv gsd-test ~/.local/bin/
+gsd-test --version   # → v1.0.0
+
+# 2. Configure a Bench (a remote machine you SSH to with Docker installed)
+mkdir -p ~/.config/gsd-test
+cat > ~/.config/gsd-test/config.toml <<'EOF'
+[defaults]
+targets = ["linux"]
+
+[[benches]]
+name = "lab-rig-1"
+host = "lab-rig-1.local"
+os = "linux"
+
+[versions]
+linux = "v1.0.0"
+EOF
+
+# 3. Run your tests
+cd ~/my-node-project
+gsd-test
 ```
 
-## Installed components
+## Documentation
 
-| Path | What |
-|---|---|
-| `~/.local/bin/gsd-test` | Docker remote runner. Rsyncs working tree to a Linux host, runs tests in a one-shot container, returns JSON. |
-| `~/.local/bin/gsd-test-local` | Same tests, run directly on the Mac. |
-| `~/.local/bin/gsd-test-both` | Runs both in parallel and prints a diff. |
-| `~/.local/bin/gsd-test-diff` | Python helper that compares two JSON Lines outputs. |
-| `~/.local/share/gsd-test/reporter.mjs` | Custom Node test reporter producing JSON Lines (shared by both runners). |
-| `~/.config/gsd-test/hosts` | Your SSH host aliases, one per line. Never pushed. |
+- **[Installation](docs/installation.md)** — Install the binary on macOS, Linux, or Windows
+- **[Getting Started](docs/getting-started.md)** — Your first end-to-end test run
+- **[Setting up Benches](docs/benches.md)** — Configure your Linux, Windows, and macOS hardware
+- **[Configuration Reference](docs/configuration.md)** — Every `config.toml` field explained
+- **[Troubleshooting](docs/troubleshooting.md)** — When things go wrong
+- **[Architecture](docs/architecture.md)** — How `gsd-test` is built (for contributors)
 
-## Configuration
+## How it Works (30-second version)
 
-### Hosts
+1. You run `gsd-test` from inside your Node project's git repo.
+2. It loads `~/.config/gsd-test/config.toml` — your list of remote machines (Benches), one per target OS.
+3. It constructs a PR-merged worktree (base branch merged with your current changes) in a scratch directory.
+4. For each target OS, it ensures the Tester Image is present on the corresponding Bench, then spawns a container, copies your worktree in, and runs `npm ci` + `npm run build` + `node --test`.
+5. Per-OS results stream back as live events; a final per-OS pass/fail summary prints at the end.
 
-Edit `~/.config/gsd-test/hosts`. One SSH alias per line. Examples:
+**Exit codes:** `0` all platforms pass · `1` at least one platform failed · `2` infrastructure problem (see [Troubleshooting](docs/troubleshooting.md))
 
-    dockerhost1
-    dockerhost2
+## License
 
-These must be reachable via key-based SSH (no password prompt) and have Docker installed.
+MIT. See [LICENSE](LICENSE) if present, or check the repository root.
 
-### SSH config
+## Contributing
 
-In `~/.ssh/config`:
-
-    Host dockerhost1 dockerhost2
-      HostName %h.example.com
-      User youruser
-      ControlMaster auto
-      ControlPath ~/.ssh/cm-%r@%h:%p
-      ControlPersist 10m
-
-### Build the Docker image on each host (one-time)
-
-    scp ~/projects/dev-tools/get-shit-done/Dockerfile dockerhost1:~/gsd-test.Dockerfile
-    ssh dockerhost1 'mkdir -p ~/gsd-test && mv ~/gsd-test.Dockerfile ~/gsd-test/Dockerfile && cd ~/gsd-test && docker build -t gsd-test:node22 .'
-
-## Daily use
-
-From inside the get-shit-done project:
-
-    gsd-test-both                       # run both, print diff (usual case)
-    gsd-test                            # docker only
-    gsd-test-local                      # mac only
-    gsd-test tests/foo.test.cjs         # single test file on docker
-    gsd-test-both --no-build            # skip build:sdk for a faster iteration
-
-Output (default): JSON Lines on stdout, progress on stderr.
-With `gsd-test-both`: human diff summary on stdout, progress on stderr.
-
-## Claude Code integration
-
-### Claude Code
-
-    cp ~/projects/dev-tools/get-shit-done/claude-commands/test.md ~/.claude/commands/test.md
-
-Now `/test` in Claude Code runs `gsd-test-both` and analyzes the diff.
-
-#### Stop hook (optional)
-
-Merge `~/projects/dev-tools/get-shit-done/claude-stop-hook.json` into `~/.claude/settings.json`.
-It runs `gsd-test-both` after every Claude turn, gated to fire only inside the GSD project.
-
-### Codex CLI (best-effort)
-
-    cp ~/projects/dev-tools/get-shit-done/codex-prompts/test.md ~/.codex/prompts/test.md
-
-Then `/test` (or however your Codex version invokes user prompts) should
-trigger the test+diff run. Codex's prompt-file convention has been less stable
-than Claude Code's, so if your version doesn't pick this up, just call
-`gsd-test-both` directly from inside the Codex shell — the scripts are
-agent-agnostic and work from any CLI's bash tool regardless of where the
-prompt file lives.
-
-## Exit codes
-
-| Code | Meaning |
-|---|---|
-| 0 | All tests passed (both platforms) |
-| 1 | Some tests failed |
-| 2 | Configuration error (missing hosts file, missing project root) |
-| 3 | No reachable Docker host |
+PRs welcome. See [docs/architecture.md](docs/architecture.md) for the design context and ADRs in [docs/adr/](docs/adr/).
