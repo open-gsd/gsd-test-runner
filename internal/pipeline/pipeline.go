@@ -21,10 +21,16 @@ import (
 // Reporter writes per-test JSONL events. The Drain leg copies this file to the
 // Dev Workstation via docker cp.
 const containerJSONLPath = "/work/test-events.jsonl"
-const defaultTestCommand = "node --test --test-reporter={{REPORTER_PATH}} --test-reporter-destination={{REPORTER_DEST}}"
 const reporterPathPlaceholder = "{{REPORTER_PATH}}"
 const reporterDestPlaceholder = "{{REPORTER_DEST}}"
 const defaultReporterPath = "/opt/gsd-test/reporter.mjs"
+
+var defaultTestCommandArgs = []string{
+	"node",
+	"--test",
+	"--test-reporter={{REPORTER_PATH}}",
+	"--test-reporter-destination={{REPORTER_DEST}}",
+}
 
 // ErrNotImplemented is the Cause of every LegError returned by the
 // skeleton. Real implementations will replace it with typed Cause
@@ -348,8 +354,8 @@ type Pipeline struct {
 	// by Parse. Empty until Drain succeeds.
 	drainedPath string
 	// testCommand is the optional command template for the RunTests leg.
-	// Empty means "use defaultTestCommand".
-	testCommand string
+	// Empty means "use defaultTestCommandArgs".
+	testCommand []string
 }
 
 // New constructs a Pipeline. The expectedVersion parameter is the
@@ -359,7 +365,7 @@ type Pipeline struct {
 // (select-with-default), so a full or unread channel silently drops
 // events. Real callers should buffer generously and drain in a
 // goroutine.
-func New(b bench.Bench, img images.ImageID, expectedVersion string, worktreePath string, testCommand string, events chan<- Event) *Pipeline {
+func New(b bench.Bench, img images.ImageID, expectedVersion string, worktreePath string, testCommand []string, events chan<- Event) *Pipeline {
 	return &Pipeline{
 		bench:           b,
 		image:           img,
@@ -372,22 +378,19 @@ func New(b bench.Bench, img images.ImageID, expectedVersion string, worktreePath
 }
 
 func (p *Pipeline) runTestsCommandArgs() []string {
-	template := strings.TrimSpace(p.testCommand)
-	if template == "" {
-		template = defaultTestCommand
+	command := p.testCommand
+	if len(command) == 0 {
+		command = defaultTestCommandArgs
 	}
-	command := strings.NewReplacer(
+	replacer := strings.NewReplacer(
 		reporterPathPlaceholder, defaultReporterPath,
 		reporterDestPlaceholder, containerJSONLPath,
-	).Replace(template)
-	fields := strings.Fields(command)
-	if len(fields) == 0 {
-		fields = strings.Fields(strings.NewReplacer(
-			reporterPathPlaceholder, defaultReporterPath,
-			reporterDestPlaceholder, containerJSONLPath,
-		).Replace(defaultTestCommand))
+	)
+	args := make([]string, len(command))
+	for i, part := range command {
+		args[i] = replacer.Replace(part)
 	}
-	return fields
+	return args
 }
 
 // CheckImageVersion verifies the Image-version sentinel on the Bench
