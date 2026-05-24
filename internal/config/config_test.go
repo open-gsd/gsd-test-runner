@@ -367,6 +367,43 @@ os = "macos-container"
 	}
 }
 
+func TestLoad_BenchWithRuntimeField(t *testing.T) {
+	path := writeTOML(t, `
+[[benches]]
+name = "bench-macos"
+host = "mac-rig.local"
+os = "macos"
+runtime = "container"
+
+[[benches]]
+name = "bench-linux"
+host = "linux-rig.local"
+os = "linux"
+# no runtime field — should default to "" (docker via RuntimeBin)
+`)
+
+	cfg, err := Load(path, LoadOptions{})
+	if err != nil {
+		t.Fatalf("Load returned error: %v", err)
+	}
+	if len(cfg.Registry) != 2 {
+		t.Fatalf("Registry len = %d, want 2", len(cfg.Registry))
+	}
+
+	macosBench := cfg.Registry[0]
+	if macosBench.Runtime != "container" {
+		t.Errorf("Registry[0].Runtime = %q, want %q", macosBench.Runtime, "container")
+	}
+	if macosBench.OS != "macos" {
+		t.Errorf("Registry[0].OS = %q, want %q", macosBench.OS, "macos")
+	}
+
+	linuxBench := cfg.Registry[1]
+	if linuxBench.Runtime != "" {
+		t.Errorf("Registry[1].Runtime = %q, want empty string (omitted defaults to docker)", linuxBench.Runtime)
+	}
+}
+
 // --- Table-driven validation tests ---
 
 func TestValidateAndTransform_Errors(t *testing.T) {

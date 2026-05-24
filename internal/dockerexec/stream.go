@@ -24,7 +24,7 @@ type LineHandler func(line string)
 // Stdout/stderr are streamed line-by-line via bufio.Scanner. Stream blocks
 // until the subprocess exits and the line-reader goroutines drain.
 func Stream(ctx context.Context, b bench.Bench, args []string, stdoutLine, stderrLine LineHandler) error {
-	cmd := exec.CommandContext(ctx, "docker", args...)
+	cmd := exec.CommandContext(ctx, b.RuntimeBin(), args...)
 	if host := b.DockerHost(); host != "" {
 		cmd.Env = append(os.Environ(), "DOCKER_HOST="+host)
 	}

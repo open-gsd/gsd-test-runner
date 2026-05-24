@@ -64,9 +64,10 @@ type rawDefaults struct {
 }
 
 type rawBench struct {
-	Name string `toml:"name"`
-	Host string `toml:"host"`
-	OS   string `toml:"os"`
+	Name    string `toml:"name"`
+	Host    string `toml:"host"`
+	OS      string `toml:"os"`
+	Runtime string `toml:"runtime,omitempty"` // empty defaults to "docker" via bench.RuntimeBin()
 }
 
 // probeRun is the function used by probeBenches to test connectivity.
@@ -159,9 +160,10 @@ func validateAndTransform(raw rawConfig) (*Config, error) {
 		// can add an allowlist when the supported set is finalized.
 
 		registry = append(registry, bench.Bench{
-			Name: rb.Name,
-			Host: rb.Host, // empty is fine — means local
-			OS:   rb.OS,
+			Name:    rb.Name,
+			Host:    rb.Host,    // empty is fine — means local
+			OS:      rb.OS,
+			Runtime: rb.Runtime, // empty defaults to "docker" via bench.RuntimeBin()
 		})
 	}
 
