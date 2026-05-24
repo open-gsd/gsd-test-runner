@@ -144,40 +144,6 @@ jobs:
           $token = "${{ secrets.GITHUB_TOKEN }}"
           $token | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
 
-      - name: Switch Docker to Windows containers mode
-        shell: pwsh
-        run: |
-          # GitHub Actions windows-2022 runners default Docker to Linux containers (WSL2).
-          # Windows-container builds require switching the daemon to Windows mode.
-          Write-Host "Stopping Docker service..."
-          Stop-Service -Name docker -Force -ErrorAction SilentlyContinue
-
-          Write-Host "Switching to Windows containers..."
-          & 'C:\Program Files\Docker\Docker\DockerCli.exe' -SwitchDaemon
-
-          Write-Host "Starting Docker service..."
-          Start-Service -Name docker
-
-          # Wait for daemon
-          $timeout = 60
-          $elapsed = 0
-          while ($elapsed -lt $timeout) {
-            try {
-              docker info | Out-Null
-              if ($LASTEXITCODE -eq 0) {
-                Write-Host "Docker daemon ready after $elapsed seconds"
-                docker version
-                break
-              }
-            } catch {}
-            Start-Sleep -Seconds 2
-            $elapsed += 2
-          }
-          if ($elapsed -ge $timeout) {
-            Write-Error "Docker daemon did not become ready within $timeout seconds"
-            exit 1
-          }
-
       - name: Build Windows Tester Image
         shell: pwsh
         run: |
