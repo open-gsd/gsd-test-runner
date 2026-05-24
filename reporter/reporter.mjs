@@ -68,7 +68,7 @@ export default async function* (source) {
       // "afterEach".
       const hookType = (data && data.context && data.context.type) || null;
 
-      const name = buildTestName(data && data.context);
+      const name = buildTestName(data && data.context) || (data && data.name) || '';
       const file = repoRelative(data && data.file);
       const durationMs = (ctx && typeof ctx.duration === 'number') ? ctx.duration : 0;
       const retryCount = (data && typeof data.currentAttempt === 'number')
