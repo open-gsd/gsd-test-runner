@@ -322,7 +322,7 @@ if ssh "$HOST" "find ~/$MIRROR_DIR -maxdepth 4 ! -user $REMOTE_USER -print -quit
 fi
 
 log "rsync → $HOST:~/$MIRROR_DIR"
-rsync -az --delete \
+rsync -az --delete --force \
   --exclude='node_modules' \
   --exclude='.git' \
   --exclude='.claude' \
@@ -344,9 +344,9 @@ if $SKIP_BUILD; then
   BUILD_BLOCK="echo '» skipping build:sdk + lint:skill-deps (--no-build)' 1>&2"
 else
   BUILD_BLOCK="echo '» build:sdk...' 1>&2
-npm run build:sdk $NPM_FLAGS 1>&2
+npm run build:sdk --if-present $NPM_FLAGS 1>&2
 echo '» lint:skill-deps...' 1>&2
-npm run lint:skill-deps $NPM_FLAGS 1>&2"
+npm run lint:skill-deps --if-present $NPM_FLAGS 1>&2"
 fi
 
 TEST_TARGETS="tests/*.test.cjs"
@@ -513,7 +513,7 @@ fi
 log "rsync → $HOST:~/$MIRROR_DIR"
 # rsync over SSH to a Windows host requires rsync on the remote side
 # (available via WSL2, Cygwin, or MSYS2 in the OpenSSH server's PATH).
-rsync -az --delete \
+rsync -az --delete --force \
   --exclude='node_modules' \
   --exclude='.git' \
   --exclude='.claude' \
@@ -535,9 +535,9 @@ if $SKIP_BUILD; then
   BUILD_BLOCK='Write-Host "» skipping build:sdk + lint:skill-deps (--no-build)" -ForegroundColor Cyan'
 else
   BUILD_BLOCK='Write-Host "» build:sdk..." -ForegroundColor Cyan
-npm run build:sdk '"$NPM_FLAGS"' 2>&1 | Out-Host
+npm run build:sdk --if-present '"$NPM_FLAGS"' 2>&1 | Out-Host
 Write-Host "» lint:skill-deps..." -ForegroundColor Cyan
-npm run lint:skill-deps '"$NPM_FLAGS"' 2>&1 | Out-Host'
+npm run lint:skill-deps --if-present '"$NPM_FLAGS"' 2>&1 | Out-Host'
 fi
 
 TEST_TARGETS="tests/*.test.cjs"
@@ -636,6 +636,8 @@ Usage: gsd-test-local [--no-build] [--verbose] [--quiet] [test-file...]
 Runs Node tests locally on the Mac, emitting JSON Lines to stdout.
 USAGE_END
       exit 0 ;;
+    --reset) shift ;;
+    --both)  shift ;;
     *) PASSTHROUGH+=("$1"); shift ;;
   esac
 done
@@ -663,9 +665,9 @@ fi
 
 if ! $SKIP_BUILD; then
   log "build:sdk..."
-  npm run build:sdk $NPM_FLAGS >&2
+  npm run build:sdk --if-present $NPM_FLAGS >&2
   log "lint:skill-deps..."
-  npm run lint:skill-deps $NPM_FLAGS >&2
+  npm run lint:skill-deps --if-present $NPM_FLAGS >&2
 fi
 
 if [[ ${#PASSTHROUGH[@]} -gt 0 ]]; then
@@ -785,7 +787,11 @@ DIFF_RC=$?
   fi
 } >&2
 
-exit $DIFF_RC
+OVERALL_RC=0
+for _rc in "$LRC" "$DRC" "$WRC" "$DIFF_RC"; do
+  if [ -n "$_rc" ] && [ "$_rc" -ne 0 ]; then OVERALL_RC=1; fi
+done
+exit $OVERALL_RC
 __GSDBOTH_END__
 chmod +x "$DEST_BIN/gsd-test-both"
 
@@ -821,6 +827,41 @@ def normalize_path(p):
         return p[idx+1:]
     return p
 
+def extract_result(evt):
+    """
+    Normalize a parsed JSON event to (outcome, key, err) where:
+      outcome  = 'test:pass' or 'test:fail'
+      key      = (normalized_file, name)
+      err      = first line of error message (may be empty)
+
+    Accepts two schemas:
+      1. reporter.mjs (ADR-0013): {type:'test_event', kind:'pass'|'fail',
+                                    file, name, error?, ...}
+      2. Raw passthrough:         {type:'test:pass'|'test:fail', data:{file,name,...}}
+
+    Returns None if the event is not a test result.
+    """
+    t = evt.get('type')
+    if t == 'test_event':
+        kind = evt.get('kind')
+        if kind not in ('pass', 'fail'):
+            return None
+        outcome = 'test:pass' if kind == 'pass' else 'test:fail'
+        key = (normalize_path(evt.get('file', '')), evt.get('name', ''))
+        err = evt.get('error', '') or ''
+        # error field in reporter.mjs is already the first line of the message
+        return (outcome, key, err)
+    elif t in ('test:pass', 'test:fail'):
+        d = evt.get('data', {}) or {}
+        key = (normalize_path(d.get('file', '')), d.get('name', ''))
+        err = ''
+        details = d.get('details') or {}
+        error = details.get('error') or {}
+        if isinstance(error, dict):
+            err = error.get('message', '') or ''
+        return (t, key, err)
+    return None
+
 def load(path):
     results = {}
     if not os.path.exists(path):
@@ -833,19 +874,13 @@ def load(path):
                 continue
             try:
                 evt = json.loads(line)
-            except json.JSONDecodeError:
+            except Exception:
                 continue
-            t = evt.get('type')
-            if t not in ('test:pass', 'test:fail'):
+            r = extract_result(evt)
+            if r is None:
                 continue
-            d = evt.get('data', {}) or {}
-            key = (normalize_path(d.get('file', '')), d.get('name', ''))
-            err = ''
-            details = d.get('details') or {}
-            error = details.get('error') or {}
-            if isinstance(error, dict):
-                err = error.get('message', '') or ''
-            results[key] = (t, err)
+            outcome, key, err = r
+            results[key] = (outcome, err)
     return results
 
 if len(sys.argv) not in (3, 4):
@@ -1132,10 +1167,10 @@ and analyze the diff.
 ## Useful jq one-liners
 
     # All failures on Linux:
-    jq -c 'select(.type=="test:fail") | {file: .data.file, name: .data.name}' /tmp/gsd-test-docker-*.jsonl
+    jq -c 'select((.type=="test:fail") or (.type=="test_event" and .kind=="fail")) | {file: (.data.file // .file), name: (.data.name // .name)}' /tmp/gsd-test-docker-*.jsonl
 
     # Test names grouped by file (most-broken files first):
-    jq -r 'select(.type=="test:fail") | .data.file' /tmp/gsd-test-docker-*.jsonl | sort | uniq -c | sort -rn
+    jq -r 'select((.type=="test:fail") or (.type=="test_event" and .kind=="fail")) | (.data.file // .file)' /tmp/gsd-test-docker-*.jsonl | sort | uniq -c | sort -rn
 __SLASHCMD_END__
 
 # ---------- codex prompt (best-effort) ----------
@@ -1174,8 +1209,8 @@ error. Don't paste full stack traces.
 
 ## Useful one-liners
 
-    jq -c 'select(.type=="test:fail") | {file: .data.file, name: .data.name}' /tmp/gsd-test-docker-*.jsonl
-    jq -r 'select(.type=="test:fail") | .data.file' /tmp/gsd-test-docker-*.jsonl | sort | uniq -c | sort -rn
+    jq -c 'select((.type=="test:fail") or (.type=="test_event" and .kind=="fail")) | {file: (.data.file // .file), name: (.data.name // .name)}' /tmp/gsd-test-docker-*.jsonl
+    jq -r 'select((.type=="test:fail") or (.type=="test_event" and .kind=="fail")) | (.data.file // .file)' /tmp/gsd-test-docker-*.jsonl | sort | uniq -c | sort -rn
 __CODEXPROMPT_END__
 
 # ---------- claude-stop-hook.json ----------
