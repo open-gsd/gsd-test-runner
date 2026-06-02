@@ -16,17 +16,17 @@ Each binary ships with a `.sha256` sidecar file for integrity verification. To v
 ```bash
 # Download sidecar
 curl -L -o gsd-test.sha256 \
-  https://github.com/open-gsd/gsd-test-runner/releases/latest/download/gsd-test-v1.0.0-darwin-arm64.sha256
+  https://github.com/open-gsd/gsd-test-runner/releases/latest/download/gsd-test-v1.3.2-darwin-arm64.sha256
 shasum -a 256 -c gsd-test.sha256
 ```
 
-Binaries are named `gsd-test-v<version>-<os>-<arch>` (plus `.exe` for Windows). Replace `v1.0.0` in the commands below with the current release version.
+Binaries are named `gsd-test-v<version>-<os>-<arch>` (plus `.exe` for Windows). Replace `v1.3.2` in the commands below with the current release version.
 
 ### macOS (Apple Silicon / arm64)
 
 ```bash
 curl -L -o gsd-test \
-  https://github.com/open-gsd/gsd-test-runner/releases/latest/download/gsd-test-v1.0.0-darwin-arm64
+  https://github.com/open-gsd/gsd-test-runner/releases/latest/download/gsd-test-v1.3.2-darwin-arm64
 chmod +x gsd-test
 mv gsd-test ~/.local/bin/
 gsd-test --version
@@ -35,14 +35,14 @@ gsd-test --version
 Expected output:
 
 ```text
-v1.0.0
+v1.3.2
 ```
 
 ### macOS (Intel / amd64)
 
 ```bash
 curl -L -o gsd-test \
-  https://github.com/open-gsd/gsd-test-runner/releases/latest/download/gsd-test-v1.0.0-darwin-amd64
+  https://github.com/open-gsd/gsd-test-runner/releases/latest/download/gsd-test-v1.3.2-darwin-amd64
 chmod +x gsd-test
 mv gsd-test ~/.local/bin/
 gsd-test --version
@@ -52,7 +52,7 @@ gsd-test --version
 
 ```bash
 curl -L -o gsd-test \
-  https://github.com/open-gsd/gsd-test-runner/releases/latest/download/gsd-test-v1.0.0-linux-amd64
+  https://github.com/open-gsd/gsd-test-runner/releases/latest/download/gsd-test-v1.3.2-linux-amd64
 chmod +x gsd-test
 mv gsd-test ~/.local/bin/
 gsd-test --version
@@ -62,7 +62,7 @@ gsd-test --version
 
 ```bash
 curl -L -o gsd-test \
-  https://github.com/open-gsd/gsd-test-runner/releases/latest/download/gsd-test-v1.0.0-linux-arm64
+  https://github.com/open-gsd/gsd-test-runner/releases/latest/download/gsd-test-v1.3.2-linux-arm64
 chmod +x gsd-test
 mv gsd-test ~/.local/bin/
 gsd-test --version
@@ -74,7 +74,7 @@ In PowerShell:
 
 ```powershell
 Invoke-WebRequest `
-  -Uri https://github.com/open-gsd/gsd-test-runner/releases/latest/download/gsd-test-v1.0.0-windows-amd64.exe `
+  -Uri https://github.com/open-gsd/gsd-test-runner/releases/latest/download/gsd-test-v1.3.2-windows-amd64.exe `
   -OutFile gsd-test.exe
 Move-Item gsd-test.exe "$env:LOCALAPPDATA\Microsoft\WindowsApps\gsd-test.exe"
 gsd-test --version
