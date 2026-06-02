@@ -145,3 +145,53 @@ test('test:pass with neither data.name nor data.context yields empty name withou
   assert.equal(rec.type, 'test_event');
   assert.equal(rec.name, '');
 });
+
+// ---------------------------------------------------------------------------
+// Test 6: /work/ container paths are stripped to repo-relative
+// ---------------------------------------------------------------------------
+test('repoRelative strips /work/ prefix from container paths', async () => {
+  const events = [
+    {
+      type: 'test:pass',
+      data: {
+        name: 'container path test',
+        file: '/work/tests/a.test.cjs',
+        details: { duration: 1 },
+      },
+    },
+  ];
+
+  const records = await collectOutput(events);
+  assert.equal(records.length, 1);
+  assert.equal(records[0].file, 'tests/a.test.cjs');
+});
+
+// ---------------------------------------------------------------------------
+// Test 7: host-absolute paths under cwd become repo-relative
+// ---------------------------------------------------------------------------
+test('repoRelative converts host-absolute path under cwd to repo-relative', async () => {
+  // Construct a path that is under the current working directory.
+  // process.cwd() is the repo root when running `node --test` from the repo.
+  // We use path.join here only to build the input value for the reporter.
+  const { join } = await import('node:path');
+  const absoluteFile = join(process.cwd(), 'tests', 'b.test.cjs');
+
+  const events = [
+    {
+      type: 'test:pass',
+      data: {
+        name: 'host path test',
+        file: absoluteFile,
+        details: { duration: 1 },
+      },
+    },
+  ];
+
+  const records = await collectOutput(events);
+  assert.equal(records.length, 1);
+  // The reporter must produce a relative path, never the absolute host path.
+  assert.equal(records[0].file, 'tests/b.test.cjs',
+    `Expected repo-relative 'tests/b.test.cjs', got: ${records[0].file}`);
+  assert.ok(!records[0].file.startsWith('/'),
+    `file must not be absolute, got: ${records[0].file}`);
+});

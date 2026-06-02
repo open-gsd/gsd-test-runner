@@ -73,6 +73,12 @@ if [[ ! -f "$WINDOWS_HOSTS_FILE" ]]; then
 fi
 
 # ---------- shared JSON reporter ----------
+# KEEP IN SYNC with reporter/reporter.mjs in the gsd-test-runner repo.
+# Drift between this embedded copy and the canonical file caused empty-name
+# bugs on Node 26 (data.context absent; data.name fallback was missing).
+# All three embedded reporter heredocs in this installer must be byte-identical
+# to reporter/reporter.mjs. The quoted heredoc delimiter ('__REPORTER_END__')
+# prevents shell expansion of $, backticks, and ${...} inside the JS body.
 echo "» writing reporter.mjs..."
 cat > "$DEST_SHARE/reporter.mjs" <<'__REPORTER_END__'
 // Custom Node test reporter: emits one JSON line per test runner event.
@@ -81,6 +87,8 @@ cat > "$DEST_SHARE/reporter.mjs" <<'__REPORTER_END__'
 // {type, data} lines for the drain/parse legs.
 //
 // Handles Error objects so message/stack survive JSON.stringify.
+
+import path from 'node:path';
 
 /**
  * Build the fully-qualified test name by walking the context chain.
@@ -98,15 +106,23 @@ function buildTestName(context) {
 }
 
 /**
- * Strip the /work/ container prefix from file paths so the stored path is
- * repo-relative. Leaves non-/work/ paths untouched (handles non-container
- * runs).
+ * Normalize a file path to be repo-relative.
+ * Container fast-path: strip leading /work/ prefix.
+ * Host path: compute path.relative(cwd, file) — works because node --test
+ * is invoked from the repo root on all legs (cwd === repo root).
+ * Falls back to the original file string if the result is empty, starts
+ * with '..', or is still absolute (guards against unexpected cwd values).
  */
 function repoRelative(file) {
-  if (typeof file === 'string' && file.startsWith('/work/')) {
+  if (typeof file !== 'string' || file === '') return '';
+  if (file.startsWith('/work/')) {
     return file.slice('/work/'.length);
   }
-  return file || '';
+  const rel = path.relative(process.cwd(), file);
+  if (rel === '' || rel.startsWith('..') || path.isAbsolute(rel)) {
+    return file;
+  }
+  return rel;
 }
 
 /**
@@ -145,7 +161,7 @@ export default async function* (source) {
       // "afterEach".
       const hookType = (data && data.context && data.context.type) || null;
 
-      const name = buildTestName(data && data.context);
+      const name = buildTestName(data && data.context) || (data && data.name) || '';
       const file = repoRelative(data && data.file);
       const durationMs = (ctx && typeof ctx.duration === 'number') ? ctx.duration : 0;
       const retryCount = (data && typeof data.currentAttempt === 'number')
@@ -360,12 +376,126 @@ fi
 REMOTE_SCRIPT=$(cat <<REMOTE_END
 set -e
 cd /work
+# KEEP IN SYNC with reporter/reporter.mjs in the gsd-test-runner repo.
+# Quoted heredoc delimiter prevents shell expansion of $, backticks, and
+# \${...} inside the JS body (both on the local shell building REMOTE_SCRIPT
+# and on the remote shell running it).
 cat > /tmp/reporter.mjs <<'JSONREPORTER_END'
+// Custom Node test reporter: emits one JSON line per test runner event.
+// For test pass/fail events, emits a structured test_event record per
+// ADR-0013 (schema_version=1). All other events are emitted as raw
+// {type, data} lines for the drain/parse legs.
+//
+// Handles Error objects so message/stack survive JSON.stringify.
+
+import path from 'node:path';
+
+/**
+ * Build the fully-qualified test name by walking the context chain.
+ * Node's test runner attaches .context.name and .context.parent.
+ * We accumulate from the root down, joining with " > ".
+ */
+function buildTestName(context) {
+  const parts = [];
+  let cur = context;
+  while (cur) {
+    if (cur.name) parts.unshift(cur.name);
+    cur = cur.parent || null;
+  }
+  return parts.join(' > ');
+}
+
+/**
+ * Normalize a file path to be repo-relative.
+ * Container fast-path: strip leading /work/ prefix.
+ * Host path: compute path.relative(cwd, file) — works because node --test
+ * is invoked from the repo root on all legs (cwd === repo root).
+ * Falls back to the original file string if the result is empty, starts
+ * with '..', or is still absolute (guards against unexpected cwd values).
+ */
+function repoRelative(file) {
+  if (typeof file !== 'string' || file === '') return '';
+  if (file.startsWith('/work/')) {
+    return file.slice('/work/'.length);
+  }
+  const rel = path.relative(process.cwd(), file);
+  if (rel === '' || rel.startsWith('..') || path.isAbsolute(rel)) {
+    return file;
+  }
+  return rel;
+}
+
+/**
+ * Classify an error object into one of the six ADR-0013 ErrorClass values.
+ *   assertion  — AssertionError or ERR_ASSERTION code
+ *   timeout    — error message contains "timed out"
+ *   setup      — error thrown inside a before/beforeEach hook
+ *   teardown   — error thrown inside an after/afterEach hook
+ *   throw      — any other unhandled throw inside a test body
+ *   unknown    — fallback
+ */
+function classifyError(err, hookType) {
+  if (!err) return 'unknown';
+  // Hook-sourced failures take priority over the error type.
+  if (hookType === 'before' || hookType === 'beforeEach') return 'setup';
+  if (hookType === 'after' || hookType === 'afterEach') return 'teardown';
+  if (err.name === 'AssertionError' || err.code === 'ERR_ASSERTION') return 'assertion';
+  if (typeof err.message === 'string' && err.message.includes('timed out')) return 'timeout';
+  if (err instanceof Error || err.stack) return 'throw';
+  return 'unknown';
+}
+
 export default async function* (source) {
   for await (const e of source) {
-    yield JSON.stringify({ type: e.type, data: e.data }, (k, v) =>
-      v instanceof Error ? { name: v.name, message: v.message, stack: v.stack, code: v.code, ...v } : v
-    ) + '\n';
+    const type = e.type;
+    const data = e.data;
+
+    if (type === 'test:pass' || type === 'test:fail') {
+      const ctx = data && data.details;
+      const err = ctx && ctx.error;
+      const isPassing = type === 'test:pass';
+
+      // Determine hook type if this failure originated inside a lifecycle hook.
+      // Node surfaces hook failures as test:fail on the hook's synthetic test
+      // node; its context.type may be "before", "after", "beforeEach", or
+      // "afterEach".
+      const hookType = (data && data.context && data.context.type) || null;
+
+      const name = buildTestName(data && data.context) || (data && data.name) || '';
+      const file = repoRelative(data && data.file);
+      const durationMs = (ctx && typeof ctx.duration === 'number') ? ctx.duration : 0;
+      const retryCount = (data && typeof data.currentAttempt === 'number')
+        ? Math.max(0, data.currentAttempt - 1)
+        : 0;
+
+      const record = {
+        type: 'test_event',
+        kind: isPassing ? 'pass' : 'fail',
+        file,
+        name,
+        duration_ms: durationMs,
+        retry_count: retryCount,
+      };
+
+      if (!isPassing && err) {
+        const errMsg = (typeof err.message === 'string') ? err.message.split('\n')[0] : String(err);
+        record.error = errMsg;
+        record.error_class = classifyError(err, hookType);
+        record.stack = (err && err.stack) ? err.stack : '';
+        // Captured output lives on data.details.output in newer Node versions.
+        record.output = (ctx && typeof ctx.output === 'string') ? ctx.output : '';
+      }
+
+      yield JSON.stringify(record) + '\n';
+    } else {
+      // All other event types (test:diagnostic, test:plan, test:start, etc.)
+      // are passed through verbatim for forward compatibility.
+      yield JSON.stringify({ type, data }, (k, v) =>
+        v instanceof Error
+          ? { name: v.name, message: v.message, stack: v.stack, code: v.code, ...v }
+          : v
+      ) + '\n';
+    }
   }
 }
 JSONREPORTER_END
@@ -551,13 +681,129 @@ fi
 # The reporter script is embedded inline inside the PowerShell heredoc because
 # Windows containers don't have a shared volume path from the Mac host. We
 # write it to a temp location inside the container at runtime.
-REPORTER_CONTENT='export default async function* (source) {
-  for await (const e of source) {
-    yield JSON.stringify({ type: e.type, data: e.data }, (k, v) =>
-      v instanceof Error ? { name: v.name, message: v.message, stack: v.stack, code: v.code, ...v } : v
-    ) + "\\n";
+# KEEP IN SYNC with reporter/reporter.mjs in the gsd-test-runner repo.
+# Quoted heredoc delimiter ('REPORTER_CONTENT_END') prevents shell expansion
+# of $, backticks, and ${...} inside the JS body.
+REPORTER_CONTENT=$(cat <<'REPORTER_CONTENT_END'
+// Custom Node test reporter: emits one JSON line per test runner event.
+// For test pass/fail events, emits a structured test_event record per
+// ADR-0013 (schema_version=1). All other events are emitted as raw
+// {type, data} lines for the drain/parse legs.
+//
+// Handles Error objects so message/stack survive JSON.stringify.
+
+import path from 'node:path';
+
+/**
+ * Build the fully-qualified test name by walking the context chain.
+ * Node's test runner attaches .context.name and .context.parent.
+ * We accumulate from the root down, joining with " > ".
+ */
+function buildTestName(context) {
+  const parts = [];
+  let cur = context;
+  while (cur) {
+    if (cur.name) parts.unshift(cur.name);
+    cur = cur.parent || null;
   }
-}'
+  return parts.join(' > ');
+}
+
+/**
+ * Normalize a file path to be repo-relative.
+ * Container fast-path: strip leading /work/ prefix.
+ * Host path: compute path.relative(cwd, file) — works because node --test
+ * is invoked from the repo root on all legs (cwd === repo root).
+ * Falls back to the original file string if the result is empty, starts
+ * with '..', or is still absolute (guards against unexpected cwd values).
+ */
+function repoRelative(file) {
+  if (typeof file !== 'string' || file === '') return '';
+  if (file.startsWith('/work/')) {
+    return file.slice('/work/'.length);
+  }
+  const rel = path.relative(process.cwd(), file);
+  if (rel === '' || rel.startsWith('..') || path.isAbsolute(rel)) {
+    return file;
+  }
+  return rel;
+}
+
+/**
+ * Classify an error object into one of the six ADR-0013 ErrorClass values.
+ *   assertion  — AssertionError or ERR_ASSERTION code
+ *   timeout    — error message contains "timed out"
+ *   setup      — error thrown inside a before/beforeEach hook
+ *   teardown   — error thrown inside an after/afterEach hook
+ *   throw      — any other unhandled throw inside a test body
+ *   unknown    — fallback
+ */
+function classifyError(err, hookType) {
+  if (!err) return 'unknown';
+  // Hook-sourced failures take priority over the error type.
+  if (hookType === 'before' || hookType === 'beforeEach') return 'setup';
+  if (hookType === 'after' || hookType === 'afterEach') return 'teardown';
+  if (err.name === 'AssertionError' || err.code === 'ERR_ASSERTION') return 'assertion';
+  if (typeof err.message === 'string' && err.message.includes('timed out')) return 'timeout';
+  if (err instanceof Error || err.stack) return 'throw';
+  return 'unknown';
+}
+
+export default async function* (source) {
+  for await (const e of source) {
+    const type = e.type;
+    const data = e.data;
+
+    if (type === 'test:pass' || type === 'test:fail') {
+      const ctx = data && data.details;
+      const err = ctx && ctx.error;
+      const isPassing = type === 'test:pass';
+
+      // Determine hook type if this failure originated inside a lifecycle hook.
+      // Node surfaces hook failures as test:fail on the hook's synthetic test
+      // node; its context.type may be "before", "after", "beforeEach", or
+      // "afterEach".
+      const hookType = (data && data.context && data.context.type) || null;
+
+      const name = buildTestName(data && data.context) || (data && data.name) || '';
+      const file = repoRelative(data && data.file);
+      const durationMs = (ctx && typeof ctx.duration === 'number') ? ctx.duration : 0;
+      const retryCount = (data && typeof data.currentAttempt === 'number')
+        ? Math.max(0, data.currentAttempt - 1)
+        : 0;
+
+      const record = {
+        type: 'test_event',
+        kind: isPassing ? 'pass' : 'fail',
+        file,
+        name,
+        duration_ms: durationMs,
+        retry_count: retryCount,
+      };
+
+      if (!isPassing && err) {
+        const errMsg = (typeof err.message === 'string') ? err.message.split('\n')[0] : String(err);
+        record.error = errMsg;
+        record.error_class = classifyError(err, hookType);
+        record.stack = (err && err.stack) ? err.stack : '';
+        // Captured output lives on data.details.output in newer Node versions.
+        record.output = (ctx && typeof ctx.output === 'string') ? ctx.output : '';
+      }
+
+      yield JSON.stringify(record) + '\n';
+    } else {
+      // All other event types (test:diagnostic, test:plan, test:start, etc.)
+      // are passed through verbatim for forward compatibility.
+      yield JSON.stringify({ type, data }, (k, v) =>
+        v instanceof Error
+          ? { name: v.name, message: v.message, stack: v.stack, code: v.code, ...v }
+          : v
+      ) + '\n';
+    }
+  }
+}
+REPORTER_CONTENT_END
+)
 
 REPORTER_B64="$(printf '%s' "$REPORTER_CONTENT" | base64 | tr -d '\n')"
 

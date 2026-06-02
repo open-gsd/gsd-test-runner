@@ -5,6 +5,8 @@
 //
 // Handles Error objects so message/stack survive JSON.stringify.
 
+import path from 'node:path';
+
 /**
  * Build the fully-qualified test name by walking the context chain.
  * Node's test runner attaches .context.name and .context.parent.
@@ -21,15 +23,23 @@ function buildTestName(context) {
 }
 
 /**
- * Strip the /work/ container prefix from file paths so the stored path is
- * repo-relative. Leaves non-/work/ paths untouched (handles non-container
- * runs).
+ * Normalize a file path to be repo-relative.
+ * Container fast-path: strip leading /work/ prefix.
+ * Host path: compute path.relative(cwd, file) — works because node --test
+ * is invoked from the repo root on all legs (cwd === repo root).
+ * Falls back to the original file string if the result is empty, starts
+ * with '..', or is still absolute (guards against unexpected cwd values).
  */
 function repoRelative(file) {
-  if (typeof file === 'string' && file.startsWith('/work/')) {
+  if (typeof file !== 'string' || file === '') return '';
+  if (file.startsWith('/work/')) {
     return file.slice('/work/'.length);
   }
-  return file || '';
+  const rel = path.relative(process.cwd(), file);
+  if (rel === '' || rel.startsWith('..') || path.isAbsolute(rel)) {
+    return file;
+  }
+  return rel;
 }
 
 /**
