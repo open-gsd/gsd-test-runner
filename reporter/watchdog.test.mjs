@@ -92,3 +92,26 @@ test('reaps a real hanging node child', async () => {
   assert.ok(res.kill.signalChain.some((s) => s.startsWith('SIGKILL')),
     'a SIGTERM-ignoring child must escalate to SIGKILL');
 });
+
+// ── CLI argument parsing (pure) ──────────────────────────────────────────────
+
+import { parseWatchdogArgs } from './watchdog.mjs';
+
+test('parseWatchdogArgs splits flags from the wrapped command', () => {
+  const got = parseWatchdogArgs(
+    ['--deadline-ms', '180000', '--grace-ms', '5000', '--reason', 'hard_cap',
+     '--granularity', 'process', '--', 'node', '--test', 'a.test.js']);
+  assert.equal(got.deadlineMs, 180000);
+  assert.equal(got.graceMs, 5000);
+  assert.equal(got.reason, 'hard_cap');
+  assert.equal(got.granularity, 'process');
+  assert.equal(got.command, 'node');
+  assert.deepEqual(got.args, ['--test', 'a.test.js']);
+});
+
+test('parseWatchdogArgs applies defaults when flags omitted', () => {
+  const got = parseWatchdogArgs(['--deadline-ms', '50', '--', 'sleep', '1']);
+  assert.equal(got.deadlineMs, 50);
+  assert.equal(got.graceMs, 5000); // default
+  assert.equal(got.command, 'sleep');
+});

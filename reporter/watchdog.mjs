@@ -10,6 +10,11 @@
 // in a live container.
 
 import { spawn } from 'node:child_process';
+import { pathToFileURL } from 'node:url';
+
+// Exit code the watchdog returns when it reaped the run, distinct from a test
+// failure (1) so the Local Engine can tell "killed" from "failed".
+export const EXIT_REAPED = 75;
 
 const TEST_START = 'test:start';
 const TEST_DONE = new Set(['test:pass', 'test:fail', 'test:complete']);
@@ -150,4 +155,43 @@ export function runWithWatchdog(opts) {
       }
     });
   });
+}
+
+/**
+ * parseWatchdogArgs splits the watchdog's own flags from the wrapped command.
+ * Form: --deadline-ms N [--grace-ms N] [--reason R] [--granularity G] -- CMD ARGS...
+ * Everything after the literal "--" is the command to run under the watchdog.
+ */
+export function parseWatchdogArgs(argv) {
+  const out = { deadlineMs: 0, graceMs: 5000, reason: 'estimate_overrun', granularity: '', command: '', args: [] };
+  let i = 0;
+  for (; i < argv.length; i++) {
+    const a = argv[i];
+    if (a === '--') { i++; break; }
+    else if (a === '--deadline-ms') out.deadlineMs = Number(argv[++i]);
+    else if (a === '--grace-ms') out.graceMs = Number(argv[++i]);
+    else if (a === '--reason') out.reason = argv[++i];
+    else if (a === '--granularity') out.granularity = argv[++i];
+  }
+  out.command = argv[i] ?? '';
+  out.args = argv.slice(i + 1);
+  return out;
+}
+
+/**
+ * main is the container entrypoint: parse args, run the wrapped command under
+ * the watchdog, print the result envelope as JSON on stdout, and exit with
+ * EXIT_REAPED when reaped (distinct from a test failure).
+ */
+export async function main(argv) {
+  const { deadlineMs, graceMs, reason, granularity, command, args } = parseWatchdogArgs(argv);
+  const res = await runWithWatchdog({ command, args, deadlineMs, graceMs, reason, granularity });
+  process.stdout.write(JSON.stringify(res) + '\n');
+  if (res.outcome === 'reaped') return EXIT_REAPED;
+  return res.exitCode ?? 0;
+}
+
+// Run as a CLI when invoked directly (node watchdog.mjs ...), not when imported.
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  main(process.argv.slice(2)).then((code) => process.exit(code));
 }
