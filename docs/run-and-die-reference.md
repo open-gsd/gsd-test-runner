@@ -57,7 +57,16 @@ When `testCommand` is the `node --test` path, these flags are appended (ADR-0021
 | `--test-force-exit` | always |
 | `--test-timeout` | the effective deadline (ms) |
 | `--experimental-test-isolation` | the `isolation` value |
-| `--test-concurrency` | `concurrency`, only when set |
+| `--test-concurrency` | `concurrency` when set, otherwise the CPU cap (`2`) — always pinned to bound orphan fan-out |
+| `--test-reporter` / `--test-reporter-destination` | `/opt/gsd-test/reporter.mjs` to `stdout`, so the watchdog receives structured events for `last_active_test` and per-test telemetry |
+
+### Dependency install and build
+
+Before the watchdog arms, the in-image entry script runs `npm ci` and
+`npm run build --if-present` **when a `package.json` is present**. A missing
+`package.json` or build script is skipped; a failing `npm ci` aborts the run
+before any test executes. This keeps `npm ci`/build time out of the effective
+deadline, which times only the test phase.
 
 ## Result envelope
 
@@ -76,6 +85,7 @@ The output of `gsd-test submit --execute`. Schema version 2 — a superset of th
 | `duration_ms` | number | Wall-clock duration of the run. |
 | `total` / `passed` / `failed` | integer | Test counts. |
 | `failures` | array | One entry per failed test (`file`, `name`, `duration_ms`, `retry_count`, `error`, `error_class`, `stack`, `output`). |
+| `per_test` | array | Per-test telemetry (`file`, `name`, `duration_ms`, `status`, `exited_clean`) derived from the reporter events the watchdog observed. `status` is `passed`, `failed`, or `killed`; `exited_clean` is `false` for a test still in flight at a reap. |
 | `kill` | object | Present only when `outcome` is `reaped`. See below. |
 
 ### `kill` object
@@ -90,6 +100,12 @@ The output of `gsd-test submit --execute`. Schema version 2 — a superset of th
 | `reaped_by` | string | `in_container` (Tier 1 watchdog) or `external` (Tier 2 reaper). |
 | `signal_chain` | string[] | E.g. `["SIGTERM@30000","SIGKILL@30200"]`. |
 | `granularity` | string | `"process"` when the run used `isolation: "none"` (attribution is best-effort); absent otherwise. |
+
+`last_active_test` and `in_flight_tests` depend on the reporter having emitted a
+`test:start` event before the kill. A test that blocks the runner's event loop
+synchronously (a tight CPU loop) also blocks the reporter, so these fields may be
+empty even though the container was reaped — attribution is best-effort. The
+container-teardown guarantee is unaffected.
 
 ## Container labels
 

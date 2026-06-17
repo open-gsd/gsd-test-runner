@@ -61,6 +61,8 @@ gsd-test submit --execute --spec-file spec.json | jq '.kill.last_active_test, .k
 
 If `kill.granularity` is `"process"`, the run used `isolation: "none"` and these fields are best-effort — re-run with the default process isolation to get exact per-test attribution.
 
+If `kill.last_active_test` is empty, the runaway most likely wedged the runner with a synchronous CPU loop, which blocks the reporter from emitting events. Look at `per_test` for the last test with `status: "passed"` — the culprit is usually the next one to start — or add focused logging to the suspect file and re-run.
+
 For the pattern *across* runs rather than a single one, read the leaderboard (below).
 
 ## How to see your repeat offenders

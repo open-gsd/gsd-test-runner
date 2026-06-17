@@ -14,8 +14,9 @@ A run-and-die run is one-shot and self-terminating:
 
 1. The agent submits a run spec to the Local Engine (`gsd-test submit`) instead of running `node --test`.
 2. The Engine builds a disposable, resource-capped container on a Bench and copies the worktree in.
-3. Inside the container a **watchdog** wraps `node --test` under a hard deadline.
-4. The container runs, streams back a structured result, and is removed (`--rm`). Nothing persists; no process outlives the container.
+3. Inside the container, dependencies are installed and the project is built (`npm ci` + `npm run build`, when a `package.json` is present) — *before* the deadline starts, so install time is never charged against it.
+4. A **watchdog** then wraps `node --test` under a hard deadline.
+5. The container runs, streams back a structured result, and is removed (`--rm`). Nothing persists; no process outlives the container.
 
 The result is a *loud* outcome. A run that gets killed comes back as `outcome: "reaped"` with a record of exactly where it was when it died — never a silent hang.
 
@@ -40,6 +41,8 @@ Why not a long-lived reaper daemon on each Bench? Benches are personal hardware 
 
 Killing a runaway is damage control; the point is to *fix* the test that keeps running away. Every run records per-test telemetry — durations, which test tripped the reaper, clean-exit flags — to a per-repo log on the workstation. Aggregated across runs this yields a "runaway leaderboard": the tests that repeatedly trip the reaper are the bugged ones. Bump the estimate and you have papered over the problem; read the leaderboard and you fix the root cause.
 
+The leaderboard is a *learning* tool, and it has a known blind spot worth naming (Goodhart's Law): because it currently ranks on reaper trips, you can make a leaky test fall off it simply by raising its estimate so it stops being killed — without fixing the leak. The honest leading indicator is a handle leak on a test that *completes* (`exited_clean: false` on a passing test), which the estimate cannot hide; capturing that requires per-test handle sampling, which is a planned addition. Until then, treat a falling trip-count with suspicion, not satisfaction.
+
 ## How it relates to the normal flow
 
 Run-and-die is additive, not a replacement. The ordinary `gsd-test` run (no subcommand) still drives the five-phase pipeline across your configured targets and produces per-OS reports — see [Getting Started](getting-started.md) and [Architecture](architecture.md). Run-and-die is a second front door (`gsd-test submit`) aimed at *agents*, built on the same machinery: the same Benches, the same Tester Images, the same copy-in worktree, the same JSON result shape (extended with the `kill` record). The result envelope is `schema_version: 2` — additive over the per-OS report, with `outcome` and `kill` fields added.
@@ -49,3 +52,4 @@ Run-and-die is additive, not a replacement. The ordinary `gsd-test` run (no subc
 - **`isolation: "none"` is faster but less precise.** Under process isolation a wedged test is a contained child the watchdog reaps with exact attribution. Under `none` all tests share one process, so a hang wedges everything and the kill record marks attribution best-effort. Use `none` only for suites you know are clean.
 - **The estimate is load-bearing.** A wildly low estimate reaps healthy runs; the telemetry median fallback and the 30-second floor blunt this, but a good estimate is still better than none.
 - **Windows kill is verified by integration, not signals.** The `taskkill /T` path is implemented, but its orphan-free guarantee is asserted by a Bench integration test rather than by signal semantics — see [ADR-0021 Decision 4](adr/0021-run-and-die-execution-and-two-tier-reaping.md).
+- **Attribution is best-effort, and weakest exactly when you most want it.** `kill.last_active_test` needs the reporter to have emitted a `test:start` before the kill. A test that wedges the runner with a synchronous CPU loop blocks the reporter too, so the kill record may not name the culprit even though the container was reaped. The teardown guarantee always holds; the *pointing finger* does not.

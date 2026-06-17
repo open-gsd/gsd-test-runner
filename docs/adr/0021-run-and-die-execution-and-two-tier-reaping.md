@@ -90,4 +90,16 @@ Landed (TDD, verified — Go suite + `node --test` + live Docker where noted):
 
 Also landed: `gsd-test submit --execute` wires the front door through Bench selection + `images.EnsurePresent` + copy-in (`dispatch.Exec`) into the watchdog run (proven end-to-end against the real Linux Tester Image); the OCI image-version sentinel check on this path (`dispatch.VerifyImageVersion`, ADR-0011); and the telemetry-median estimate fallback with per-run append to the persistent Workstation log (`telemetry.MedianDurationMs` / `RepoLogPath` under `$XDG_STATE_HOME`).
 
-Remaining: the Windows orphaned-`node.exe` Bench gate (Decision 4) — the `taskkill /T` path and a gated integration test (`TestE2E_Windows_WatchdogReapsViaTaskkill`) exist, but verification requires a Windows-container Bench (skips on Linux/macOS daemons).
+Gap-closure round (TDD + live Docker):
+
+- Concurrency is now pinned by default (CPU cap) to bound orphan fan-out (§D/§E).
+- The entry script runs `npm ci` + `npm run build` before the watchdog when a `package.json` is present, so run-and-die works for real projects and the deadline times only the test phase (D1) — proven against the real Linux Tester Image.
+- The Tier-2 reaper is wired: `submit --execute` sweeps stale containers on contact (proven by reaping a planted container).
+- Per-test telemetry is captured via the JSON reporter (`--test-reporter`), the watchdog aligned to the reporter's real event schema; `report.PerTest`/`RunRecord.PerTest` populate, so the leaderboard has data.
+
+Remaining / honestly deferred:
+
+- **Windows orphaned-`node.exe` gate** (Decision 4) — `taskkill /T` path + gated test exist; needs a Windows-container Bench.
+- **Independent leak signal for the leaderboard** — `last_active_test` and the leaderboard are best-effort: a synchronous CPU wedge blocks the reporter, so attribution can be empty, and the leaderboard's single signal (reaper trips) is gameable by raising the estimate (Goodhart). The fix is per-test handle sampling, which travels with the run-spec `telemetry` field (`sampleHandlesMs`/`captureStacks`, §A) — not yet implemented.
+- **PR-merged worktree** — `submit` accepts a `repo` path only; the `{base, prBranch}` form (§A) and worktree construction are not wired (the main `run()` path does PR-merge).
+- **Agent skill artifact** — the routing hook + Codex shim + README exist; a formal skill is not yet shipped.
