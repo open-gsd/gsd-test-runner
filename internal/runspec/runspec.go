@@ -60,6 +60,9 @@ const (
 const (
 	defaultOverrunFactor = 1.5
 	defaultHardCapMs     = 3600000 // 1h absolute ceiling
+	// minDeadlineMs floors the effective deadline so a tiny estimate can't
+	// reap a suite during runner warmup (ADR-0021 Decision 1).
+	minDeadlineMs = 30000
 )
 
 // Budget bounds a run's wall-clock (ADR-0021 Decision 1). The effective
@@ -72,6 +75,36 @@ type Budget struct {
 	EstimateMs    *int64  `json:"estimateMs"`
 	OverrunFactor float64 `json:"overrunFactor"`
 	HardCapMs     int64   `json:"hardCapMs"`
+}
+
+// EffectiveDeadlineMs computes the wall-clock budget for the RunTests leg per
+// ADR-0021 Decision 1: min(base*OverrunFactor, HardCapMs), floored at
+// minDeadlineMs. The base is the agent's EstimateMs when set; otherwise the
+// telemetry median when one is known (telemetryMedianMs > 0); otherwise there
+// is no basis for an early kill and the hard cap is returned unchanged.
+//
+// The clock is expected to start at the beginning of the RunTests leg, not at
+// container start — npm ci/build variance must not be charged against the
+// estimate.
+func (b Budget) EffectiveDeadlineMs(telemetryMedianMs int64) int64 {
+	var base int64
+	switch {
+	case b.EstimateMs != nil:
+		base = *b.EstimateMs
+	case telemetryMedianMs > 0:
+		base = telemetryMedianMs
+	default:
+		return b.HardCapMs
+	}
+
+	deadline := int64(float64(base) * b.OverrunFactor)
+	if deadline < minDeadlineMs {
+		deadline = minDeadlineMs
+	}
+	if deadline > b.HardCapMs {
+		deadline = b.HardCapMs
+	}
+	return deadline
 }
 
 // Spec is a validated run spec.

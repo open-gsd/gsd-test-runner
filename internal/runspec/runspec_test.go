@@ -147,3 +147,55 @@ func TestNewRunID_UniqueAndFormatted(t *testing.T) {
 		t.Errorf("NewRunID format = %q, want 36-char v4 uuid", a)
 	}
 }
+
+func TestBudget_EffectiveDeadline_EstimateWithinCap(t *testing.T) {
+	est := int64(120000)
+	b := Budget{EstimateMs: &est, OverrunFactor: 1.5, HardCapMs: 3600000}
+	if got := b.EffectiveDeadlineMs(0); got != 180000 {
+		t.Errorf("EffectiveDeadlineMs = %d, want 180000", got)
+	}
+}
+
+func TestBudget_EffectiveDeadline_Cases(t *testing.T) {
+	est := func(v int64) *int64 { return &v }
+	tests := []struct {
+		name         string
+		budget       Budget
+		telemetryMed int64
+		want         int64
+	}{
+		{
+			name:   "clamped to hard cap when estimate*factor exceeds it",
+			budget: Budget{EstimateMs: est(3000000), OverrunFactor: 1.5, HardCapMs: 3600000},
+			want:   3600000,
+		},
+		{
+			name:         "telemetry median used when no estimate",
+			budget:       Budget{OverrunFactor: 1.5, HardCapMs: 3600000},
+			telemetryMed: 100000,
+			want:         150000,
+		},
+		{
+			name:   "no estimate and no telemetry falls back to hard cap",
+			budget: Budget{OverrunFactor: 1.5, HardCapMs: 3600000},
+			want:   3600000,
+		},
+		{
+			name:   "tiny estimate floored to minimum",
+			budget: Budget{EstimateMs: est(1000), OverrunFactor: 1.5, HardCapMs: 3600000},
+			want:   30000,
+		},
+		{
+			name:   "custom overrun factor respected",
+			budget: Budget{EstimateMs: est(100000), OverrunFactor: 3.0, HardCapMs: 3600000},
+			want:   300000,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.budget.EffectiveDeadlineMs(tt.telemetryMed); got != tt.want {
+				t.Errorf("EffectiveDeadlineMs = %d, want %d", got, tt.want)
+			}
+		})
+	}
+}
