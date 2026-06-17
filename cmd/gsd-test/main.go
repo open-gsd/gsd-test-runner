@@ -18,8 +18,10 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"os/signal"
 	"strings"
@@ -34,6 +36,7 @@ import (
 	"github.com/open-gsd/gsd-test-runner/internal/refs"
 	"github.com/open-gsd/gsd-test-runner/internal/renderer"
 	"github.com/open-gsd/gsd-test-runner/internal/report"
+	"github.com/open-gsd/gsd-test-runner/internal/runspec"
 	"github.com/open-gsd/gsd-test-runner/internal/worktree"
 )
 
@@ -100,6 +103,13 @@ func main() {
 func run(args []string, stdout, stderr *os.File) int {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
+
+	// Subcommand dispatch. `submit` is the agent-facing run-spec front door
+	// (issue #60, ADR-0021): the agent submits a run spec instead of invoking
+	// node locally.
+	if len(args) > 0 && args[0] == "submit" {
+		return runSubmit(args[1:], stdout, stderr)
+	}
 
 	flags, err := parseFlags(args)
 	if err != nil {
@@ -245,6 +255,59 @@ func run(args []string, stdout, stderr *os.File) int {
 	}
 	if sawFail {
 		return exitSomeFailed
+	}
+	return exitAllPass
+}
+
+// runSubmit implements `gsd-test submit`: read a JSON run spec (from --spec-file
+// or stdin), validate it via runspec.Parse, assign a RunID if the agent omitted
+// one, and echo the normalized spec as JSON on stdout. This is only the front
+// door (accept + normalize); dispatching the run to a Bench is a later slice.
+//
+// Exit codes: 0 = accepted; 2 = spec could not be read or failed validation
+// (inconclusive — no run was started), consistent with the fail-loud contract.
+func runSubmit(args []string, stdout, stderr *os.File) int {
+	fs := flag.NewFlagSet("gsd-test submit", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	specFile := fs.String("spec-file", "-", `path to the JSON run spec, or "-" for stdin`)
+	if err := fs.Parse(args); err != nil {
+		return exitInconclusive
+	}
+
+	var (
+		data []byte
+		err  error
+	)
+	if *specFile == "-" {
+		data, err = io.ReadAll(os.Stdin)
+	} else {
+		data, err = os.ReadFile(*specFile)
+	}
+	if err != nil {
+		fmt.Fprintf(stderr, "submit: read spec: %v\n", err)
+		return exitInconclusive
+	}
+
+	spec, err := runspec.Parse(data)
+	if err != nil {
+		fmt.Fprintf(stderr, "submit: invalid run spec: %v\n", err)
+		return exitInconclusive
+	}
+
+	if spec.RunID == "" {
+		id, idErr := runspec.NewRunID()
+		if idErr != nil {
+			fmt.Fprintf(stderr, "submit: assign run id: %v\n", idErr)
+			return exitInconclusive
+		}
+		spec.RunID = id
+	}
+
+	enc := json.NewEncoder(stdout)
+	enc.SetIndent("", "  ")
+	if encErr := enc.Encode(spec); encErr != nil {
+		fmt.Fprintf(stderr, "submit: encode spec: %v\n", encErr)
+		return exitInconclusive
 	}
 	return exitAllPass
 }

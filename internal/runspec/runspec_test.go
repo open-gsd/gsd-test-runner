@@ -129,3 +129,21 @@ func TestParse_MalformedJSON_Errors(t *testing.T) {
 		t.Errorf("malformed JSON should not be an *InvalidSpecError, got %v", err)
 	}
 }
+
+func TestNewRunID_UniqueAndFormatted(t *testing.T) {
+	a, err := NewRunID()
+	if err != nil {
+		t.Fatalf("NewRunID: %v", err)
+	}
+	b, err := NewRunID()
+	if err != nil {
+		t.Fatalf("NewRunID: %v", err)
+	}
+	if a == b {
+		t.Errorf("NewRunID returned duplicate ids: %q", a)
+	}
+	// RFC-4122 v4: 8-4-4-4-12 hex, version nibble '4', length 36.
+	if len(a) != 36 || a[14] != '4' {
+		t.Errorf("NewRunID format = %q, want 36-char v4 uuid", a)
+	}
+}

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"os"
 	"strings"
 	"testing"
@@ -197,5 +198,101 @@ func TestCommaSplit_TrimsWhitespace(t *testing.T) {
 	}
 	if got[1] != "windows" {
 		t.Errorf("commaSplit[1]: got %q, want %q", got[1], "windows")
+	}
+}
+
+// ── submit subcommand ───────────────────────────────────────────────────────
+
+// readPipe drains an *os.File read-end fully into a string.
+func readPipe(r *os.File) string {
+	var buf strings.Builder
+	tmp := make([]byte, 256)
+	for {
+		n, readErr := r.Read(tmp)
+		buf.Write(tmp[:n])
+		if readErr != nil {
+			break
+		}
+	}
+	r.Close()
+	return buf.String()
+}
+
+// writeSpecFile writes a run spec JSON to a temp file and returns its path.
+func writeSpecFile(t *testing.T, body string) string {
+	t.Helper()
+	path := strings.TrimSuffix(t.TempDir(), "/") + "/spec.json"
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatalf("writeSpecFile: %v", err)
+	}
+	return path
+}
+
+func TestRunSubmit_ValidSpec_AssignsRunID(t *testing.T) {
+	path := writeSpecFile(t, `{"repo":"/work","target":"linux"}`)
+
+	rOut, wOut, _ := os.Pipe()
+	code := run([]string{"submit", "--spec-file", path}, wOut, os.Stderr)
+	wOut.Close()
+	out := readPipe(rOut)
+
+	if code != 0 {
+		t.Fatalf("exit code: got %d, want 0; output=%q", code, out)
+	}
+	var got map[string]any
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		t.Fatalf("stdout is not JSON: %v\noutput=%q", err, out)
+	}
+	if got["runId"] == nil || got["runId"] == "" {
+		t.Errorf("runId: got %v, want non-empty", got["runId"])
+	}
+	if got["target"] != "linux" {
+		t.Errorf("target: got %v, want linux", got["target"])
+	}
+	cmd, _ := got["testCommand"].([]any)
+	if len(cmd) != 2 || cmd[0] != "node" || cmd[1] != "--test" {
+		t.Errorf("testCommand: got %v, want [node --test]", got["testCommand"])
+	}
+}
+
+func TestRunSubmit_PreservesProvidedRunID(t *testing.T) {
+	path := writeSpecFile(t, `{"runId":"fixed-abc-123","repo":"/work","target":"linux"}`)
+
+	rOut, wOut, _ := os.Pipe()
+	code := run([]string{"submit", "--spec-file", path}, wOut, os.Stderr)
+	wOut.Close()
+	out := readPipe(rOut)
+
+	if code != 0 {
+		t.Fatalf("exit code: got %d, want 0; output=%q", code, out)
+	}
+	var got map[string]any
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		t.Fatalf("stdout is not JSON: %v", err)
+	}
+	if got["runId"] != "fixed-abc-123" {
+		t.Errorf("runId: got %v, want fixed-abc-123", got["runId"])
+	}
+}
+
+func TestRunSubmit_InvalidSpec_Exit2(t *testing.T) {
+	path := writeSpecFile(t, `{"repo":"/work","target":"solaris"}`)
+
+	rOut, wOut, _ := os.Pipe()
+	rErr, wErr, _ := os.Pipe()
+	code := run([]string{"submit", "--spec-file", path}, wOut, wErr)
+	wOut.Close()
+	wErr.Close()
+	out := readPipe(rOut)
+	errOut := readPipe(rErr)
+
+	if code != exitInconclusive {
+		t.Errorf("exit code: got %d, want %d", code, exitInconclusive)
+	}
+	if strings.TrimSpace(out) != "" {
+		t.Errorf("stdout: got %q, want empty (no run accepted)", out)
+	}
+	if !strings.Contains(errOut, "target") {
+		t.Errorf("stderr: got %q, want it to name the bad field 'target'", errOut)
 	}
 }
