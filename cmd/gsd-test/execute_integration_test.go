@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -207,4 +208,165 @@ func TestE2E_SubmitExecute_PRMergedWorktree(t *testing.T) {
 	if !strings.Contains(out, "pr feature works") {
 		t.Errorf("PR test did not run in the merged worktree; per_test:\n%s", out)
 	}
+}
+
+// TestE2E_RunAsync_WaitMatchesBlocking drives the full async path end-to-end:
+//
+//  1. `gsd-test run --async` spawns a detached worker (re-exec of the real binary)
+//     and returns exit 0 immediately with a dispatched-notice containing the run-id.
+//  2. `gsd-test status <id>` returns immediately (non-blocking) with state=running
+//     or state=done — either is valid depending on timing.
+//  3. `gsd-test wait <id>` blocks until the worker finishes the real container run
+//     and renders the verdict (ℹ tests / ℹ pass).
+//  4. A blocking `gsd-test run` produces the same passing verdict, proving async
+//     wait and blocking run agree.
+//
+// The test builds the real `gsd-test` binary so that os.Executable() (used by the
+// async worker spawn) resolves to a binary that routes `__run-worker`, not the test
+// binary. XDG_STATE_HOME is set explicitly on every subprocess so the worker writes
+// run-state to the test's temp dir, never the real ~/.local/state.
+//
+// This test is Docker-gated: ensureTesterImage skips when `docker version` fails.
+func TestE2E_RunAsync_WaitMatchesBlocking(t *testing.T) {
+	ensureTesterImage(t)
+
+	// stateDir is the shared XDG_STATE_HOME for all subprocesses. We set it
+	// explicitly on each exec.Command — NOT via t.Setenv — so the detached worker
+	// process inherits it too.
+	stateDir := t.TempDir()
+
+	// Build the real gsd-test binary into its own temp dir so os.Executable()
+	// inside the subprocess resolves to a binary that routes __run-worker.
+	root, err := filepath.Abs("../..")
+	if err != nil {
+		t.Fatal(err)
+	}
+	binDir := t.TempDir()
+	bin := filepath.Join(binDir, "gsd-test")
+	buildCmd := exec.Command("go", "build", "-o", bin, "./cmd/gsd-test")
+	buildCmd.Dir = root
+	if out, buildErr := buildCmd.CombinedOutput(); buildErr != nil {
+		t.Fatalf("build gsd-test binary: %v\n%s", buildErr, out)
+	}
+
+	// Set up a worktree temp dir with a single passing test and a config.toml.
+	// cmd.Dir is set to worktree on every run/wait/status subprocess so that
+	// repoRoot() (which falls back to cwd when not inside a git repo) picks up
+	// the correct directory.
+	worktree := t.TempDir()
+	passTest := "import { test } from 'node:test';\nimport assert from 'node:assert';\n" +
+		"test('passes', () => { assert.ok(true); });\n"
+	if err := os.WriteFile(filepath.Join(worktree, "ok.test.mjs"), []byte(passTest), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfgPath := filepath.Join(worktree, "config.toml")
+	cfg := "[defaults]\ntargets = [\"linux\"]\n\n" +
+		"[[benches]]\nname = \"local-linux\"\nhost = \"local\"\nos = \"linux\"\n\n" +
+		"[versions]\nlinux = \"e2e\"\n\n" +
+		"[testing]\ncommand = \"node --test\"\n"
+	if err := os.WriteFile(cfgPath, []byte(cfg), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	subEnv := append(os.Environ(), "XDG_STATE_HOME="+stateDir)
+
+	// ── Step 1: dispatch async ────────────────────────────────────────────────
+
+	asyncCmd := exec.Command(bin,
+		"run", "--async",
+		"--config", cfgPath,
+		"--target", "linux",
+		"--estimate-ms", "120000",
+	)
+	asyncCmd.Dir = worktree
+	asyncCmd.Env = subEnv
+	asyncOut, asyncErr := asyncCmd.CombinedOutput()
+	if asyncErr != nil {
+		t.Fatalf("run --async: exit error: %v\noutput:\n%s", asyncErr, asyncOut)
+	}
+
+	// Parse the run-id from the dispatched-notice line.
+	// Format: "dispatched run-id=<id>  (use ...)"
+	var runID string
+	for _, field := range strings.Fields(string(asyncOut)) {
+		if strings.HasPrefix(field, "run-id=") {
+			runID = strings.TrimPrefix(field, "run-id=")
+			// Strip any trailing punctuation (e.g. comma).
+			runID = strings.TrimRight(runID, ",;.")
+			break
+		}
+	}
+	if runID == "" {
+		t.Fatalf("could not parse run-id from async output:\n%s", asyncOut)
+	}
+	t.Logf("async run-id: %s", runID)
+
+	// ── Step 2: status (non-blocking) ────────────────────────────────────────
+
+	statusCmd := exec.Command(bin, "status", runID)
+	statusCmd.Env = subEnv
+	statusOut, statusErr := statusCmd.CombinedOutput()
+	if statusErr != nil {
+		t.Fatalf("status %s: exit error: %v\noutput:\n%s", runID, statusErr, statusOut)
+	}
+	statusStr := string(statusOut)
+	if !strings.Contains(statusStr, "state=running") && !strings.Contains(statusStr, "state=done") {
+		t.Errorf("status output must contain state=running or state=done; got:\n%s", statusStr)
+	}
+
+	// ── Step 3: wait (blocking) ───────────────────────────────────────────────
+
+	const waitTimeout = 180 * time.Second
+	waitCtx, waitCancel := context.WithTimeout(context.Background(), waitTimeout)
+	defer waitCancel()
+
+	waitCmd := exec.CommandContext(waitCtx, bin, "wait", runID)
+	waitCmd.Env = subEnv
+	waitOut, waitErr := waitCmd.CombinedOutput()
+	if waitCtx.Err() == context.DeadlineExceeded {
+		t.Fatalf("wait %s: timed out after %s — potential silent-hang regression\noutput so far:\n%s",
+			runID, waitTimeout, waitOut)
+	}
+	if waitErr != nil {
+		t.Fatalf("wait %s: exit error: %v\noutput:\n%s", runID, waitErr, waitOut)
+	}
+	waitStr := string(waitOut)
+	if !strings.Contains(waitStr, "ℹ tests") {
+		t.Errorf("wait output missing 'ℹ tests'; got:\n%s", waitStr)
+	}
+	if !strings.Contains(waitStr, "ℹ pass") {
+		t.Errorf("wait output missing 'ℹ pass'; got:\n%s", waitStr)
+	}
+	if !strings.Contains(waitStr, "ok.test.mjs") {
+		t.Errorf("wait output missing passing test file 'ok.test.mjs'; got:\n%s", waitStr)
+	}
+
+	// ── Step 4: fidelity check — blocking run must agree ─────────────────────
+
+	blockCtx, blockCancel := context.WithTimeout(context.Background(), waitTimeout)
+	defer blockCancel()
+
+	blockCmd := exec.CommandContext(blockCtx, bin,
+		"run",
+		"--config", cfgPath,
+		"--target", "linux",
+		"--estimate-ms", "120000",
+	)
+	blockCmd.Dir = worktree
+	blockCmd.Env = subEnv
+	blockOut, blockErr := blockCmd.CombinedOutput()
+	if blockCtx.Err() == context.DeadlineExceeded {
+		t.Fatalf("blocking run: timed out after %s\noutput:\n%s", waitTimeout, blockOut)
+	}
+	if blockErr != nil {
+		t.Fatalf("blocking run: exit error: %v\noutput:\n%s", blockErr, blockOut)
+	}
+	blockStr := string(blockOut)
+	if !strings.Contains(blockStr, "ℹ pass") {
+		t.Errorf("blocking run output missing 'ℹ pass'; got:\n%s", blockStr)
+	}
+	// Both async wait and blocking run must agree: both pass.
+	t.Logf("async wait verdict: %s", waitStr)
+	t.Logf("blocking run verdict: %s", blockStr)
 }
