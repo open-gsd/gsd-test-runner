@@ -170,7 +170,7 @@ func TestLeaderboard_RanksKilledTestsCorrectly(t *testing.T) {
 		// Run 1: slowTest killed → reaper trip for slowTest
 		{RunID: "r1", Outcome: "reaped", PerTest: []TestStat{
 			{File: "slow_test.go", Name: "TestSlow", Status: "killed"},
-			{File: "fast_test.go", Name: "TestFast", Status: "passed"},
+			{File: "fast_test.go", Name: "TestFast", Status: "passed", ExitedClean: true},
 		}},
 		// Run 2: slowTest killed
 		{RunID: "r2", Outcome: "reaped", PerTest: []TestStat{
@@ -186,8 +186,8 @@ func TestLeaderboard_RanksKilledTestsCorrectly(t *testing.T) {
 		}},
 		// Run 5: all passed
 		{RunID: "r5", Outcome: "passed", PerTest: []TestStat{
-			{File: "slow_test.go", Name: "TestSlow", Status: "passed"},
-			{File: "fast_test.go", Name: "TestFast", Status: "passed"},
+			{File: "slow_test.go", Name: "TestSlow", Status: "passed", ExitedClean: true},
+			{File: "fast_test.go", Name: "TestFast", Status: "passed", ExitedClean: true},
 		}},
 	}
 
@@ -206,7 +206,7 @@ func TestLeaderboard_RanksKilledTestsCorrectly(t *testing.T) {
 func TestLeaderboard_ExcludesZeroTrips(t *testing.T) {
 	records := []RunRecord{
 		{RunID: "r1", Outcome: "passed", PerTest: []TestStat{
-			{File: "a_test.go", Name: "TestA", Status: "passed"},
+			{File: "a_test.go", Name: "TestA", Status: "passed", ExitedClean: true},
 		}},
 	}
 	got := Leaderboard(records)
@@ -248,7 +248,7 @@ func TestLeaderboard_RunCountIsCorrect(t *testing.T) {
 	records := []RunRecord{
 		{RunID: "r1", Outcome: "reaped", PerTest: []TestStat{{File: "f_test.go", Name: "TestFoo", Status: "killed"}}},
 		{RunID: "r2", Outcome: "reaped", PerTest: []TestStat{{File: "f_test.go", Name: "TestFoo", Status: "killed"}}},
-		{RunID: "r3", Outcome: "passed", PerTest: []TestStat{{File: "f_test.go", Name: "TestFoo", Status: "passed"}}},
+		{RunID: "r3", Outcome: "passed", PerTest: []TestStat{{File: "f_test.go", Name: "TestFoo", Status: "passed", ExitedClean: true}}},
 	}
 	got := Leaderboard(records)
 	if len(got) != 1 {
@@ -282,5 +282,26 @@ func TestMedianDurationMs_EvenCountAverages(t *testing.T) {
 	}
 	if got := MedianDurationMs(recs, "linux"); got != 150 {
 		t.Errorf("MedianDurationMs = %d, want 150", got)
+	}
+}
+
+func TestLeaderboard_CountsUncleanExitsAsIndependentSignal(t *testing.T) {
+	// A test that completes (passes) but leaks a handle is a suspect even though
+	// it was never killed — the estimate-proof signal (Goodhart).
+	records := []RunRecord{
+		{RunID: "r1", Outcome: "passed", PerTest: []TestStat{
+			{File: "leaky_test.go", Name: "TestLeak", Status: "passed", ExitedClean: false},
+			{File: "clean_test.go", Name: "TestClean", Status: "passed", ExitedClean: true},
+		}},
+		{RunID: "r2", Outcome: "passed", PerTest: []TestStat{
+			{File: "leaky_test.go", Name: "TestLeak", Status: "passed", ExitedClean: false},
+		}},
+	}
+	got := Leaderboard(records)
+	if len(got) != 1 {
+		t.Fatalf("got %d suspects, want 1 (the leaky test): %+v", len(got), got)
+	}
+	if got[0].File != "leaky_test.go" || got[0].UncleanExits != 2 || got[0].ReaperTrips != 0 {
+		t.Errorf("suspect = %+v, want leaky_test.go UncleanExits=2 ReaperTrips=0", got[0])
 	}
 }

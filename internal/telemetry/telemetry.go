@@ -36,10 +36,11 @@ type RunRecord struct {
 
 // SuspectTest is an entry in the runaway leaderboard.
 type SuspectTest struct {
-	File        string
-	Name        string
-	ReaperTrips int // number of runs in which this test had Status=="killed"
-	Runs        int // total number of runs in which this test appeared
+	File         string
+	Name         string
+	ReaperTrips  int // runs in which this test had Status=="killed"
+	UncleanExits int // runs in which it completed but leaked a handle (exited_clean=false)
+	Runs         int // total runs in which this test appeared
 }
 
 // MalformedLineError is returned by Load when a line cannot be decoded as JSON.
@@ -143,7 +144,7 @@ func Load(path string) ([]RunRecord, error) {
 // ReaperTrips descending, then File ascending as a stable tiebreaker.
 func Leaderboard(records []RunRecord) []SuspectTest {
 	type key struct{ file, name string }
-	type stats struct{ trips, runs int }
+	type stats struct{ trips, unclean, runs int }
 	agg := make(map[key]*stats)
 
 	for _, rec := range records {
@@ -155,27 +156,36 @@ func Leaderboard(records []RunRecord) []SuspectTest {
 				agg[k] = s
 			}
 			s.runs++
-			if ts.Status == "killed" {
+			switch {
+			case ts.Status == "killed":
 				s.trips++
+			case !ts.ExitedClean:
+				// Completed but leaked a handle — the estimate-proof signal
+				// (raising the budget cannot hide it). Goodhart defence.
+				s.unclean++
 			}
 		}
 	}
 
 	var suspects []SuspectTest
 	for k, s := range agg {
-		if s.trips >= 1 {
+		if s.trips >= 1 || s.unclean >= 1 {
 			suspects = append(suspects, SuspectTest{
-				File:        k.file,
-				Name:        k.name,
-				ReaperTrips: s.trips,
-				Runs:        s.runs,
+				File:         k.file,
+				Name:         k.name,
+				ReaperTrips:  s.trips,
+				UncleanExits: s.unclean,
+				Runs:         s.runs,
 			})
 		}
 	}
 
+	// Rank by total suspicion (trips + unclean) so neither signal alone can be
+	// gamed; File ascending as a stable tiebreaker.
+	score := func(s SuspectTest) int { return s.ReaperTrips + s.UncleanExits }
 	sort.Slice(suspects, func(i, j int) bool {
-		if suspects[i].ReaperTrips != suspects[j].ReaperTrips {
-			return suspects[i].ReaperTrips > suspects[j].ReaperTrips
+		if score(suspects[i]) != score(suspects[j]) {
+			return score(suspects[i]) > score(suspects[j])
 		}
 		return suspects[i].File < suspects[j].File
 	})

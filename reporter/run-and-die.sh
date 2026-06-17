@@ -16,4 +16,9 @@ if [ -f package.json ]; then
   echo "gsd-test: building (npm run build --if-present)" >&2
   npm run build --if-present >&2
 fi
+# Per-test leak detection (ADR-0021 §F): preload the probe into each node --test
+# child and point it at a scratch dir the watchdog reads after the run. Set after
+# npm ci/build so install processes aren't probed.
+export GSD_LEAK_DIR="${GSD_LEAK_DIR:-/tmp/gsd-leaks}"
+export NODE_OPTIONS="--import /opt/gsd-test/leak-probe.mjs${NODE_OPTIONS:+ $NODE_OPTIONS}"
 exec node /opt/gsd-test/watchdog.mjs "$@"

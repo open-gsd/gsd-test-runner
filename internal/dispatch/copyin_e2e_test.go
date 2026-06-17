@@ -168,3 +168,41 @@ func TestE2E_CopyIn_NpmCiAndBuild(t *testing.T) {
 		t.Fatalf("Outcome = %q, want passed (npm ci + build must run before tests)", rep.Outcome)
 	}
 }
+
+// TestE2E_CopyIn_LeakProbeFlagsLeakyTest proves the independent leak signal
+// (ADR-0021 §F): a test that PASSES but leaks a timer is force-exited by
+// --test-force-exit; the preloaded leak probe catches the leftover handle and
+// the watchdog marks the test exited_clean:false — a signal raising the
+// estimate cannot hide (Goodhart).
+func TestE2E_CopyIn_LeakProbeFlagsLeakyTest(t *testing.T) {
+	requireDocker(t)
+	image := buildTesterImage(t)
+
+	wt := writeWorktree(t, "leaky.test.mjs",
+		"import { test } from 'node:test';\n"+
+			"test('passes but leaks a timer', () => { setInterval(() => {}, 100000); });\n")
+
+	spec := runspec.Spec{
+		RunID: "e2e-leak", Repo: wt, Target: "linux",
+		TestCommand: []string{"node", "--test"},
+		Budget:      runspec.Budget{OverrunFactor: 1.5, HardCapMs: 3600000},
+		Isolation:   runspec.IsolationProcess,
+	}
+	rep, err := dispatch.RunCopyIn(context.Background(), localRunner, spec, image, wt,
+		time.Now().Add(time.Hour).UnixMilli(), 60000, time.Now())
+	if err != nil {
+		t.Fatalf("RunCopyIn: %v", err)
+	}
+	if rep.Outcome != report.OutcomePassed {
+		t.Fatalf("Outcome = %q, want passed (the test passes; it just leaks)", rep.Outcome)
+	}
+	var flagged bool
+	for _, ts := range rep.PerTest {
+		if ts.File == "leaky.test.mjs" && !ts.ExitedClean {
+			flagged = true
+		}
+	}
+	if !flagged {
+		t.Errorf("leaky test not flagged exited_clean=false; per_test: %+v", rep.PerTest)
+	}
+}

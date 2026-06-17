@@ -10,4 +10,7 @@ if exist package.json (
   echo gsd-test: building ^(npm run build --if-present^) 1>&2
   call npm run build --if-present 1>&2
 )
+REM Per-test leak detection (ADR-0021 §F): preload the probe into each node --test child.
+if not defined GSD_LEAK_DIR set GSD_LEAK_DIR=%TEMP%\gsd-leaks
+set NODE_OPTIONS=--import C:/opt/gsd-test/leak-probe.mjs %NODE_OPTIONS%
 node C:\opt\gsd-test\watchdog.mjs %*

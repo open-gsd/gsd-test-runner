@@ -33,5 +33,6 @@ COPY reporter/watchdog.mjs C:/opt/gsd-test/watchdog.mjs
 
 # Run-and-die entry script (Windows). npm ci + build then the watchdog.
 COPY reporter/run-and-die.cmd C:/opt/gsd-test/run-and-die.cmd
+COPY reporter/leak-probe.mjs C:/opt/gsd-test/leak-probe.mjs
 
 WORKDIR C:/work

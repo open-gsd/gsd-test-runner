@@ -137,3 +137,30 @@ test('parseWatchdogArgs applies defaults when flags omitted', () => {
   assert.equal(got.graceMs, 5000); // default
   assert.equal(got.command, 'sleep');
 });
+
+// ── mergeLeaks — folds leak-probe reports into per-test telemetry ────────────
+
+import { mergeLeaks } from './watchdog.mjs';
+import { mkdtempSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+
+test('mergeLeaks marks a completed test whose file leaked as not clean', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'gsd-leak-'));
+  writeFileSync(join(dir, 'leaky.json'),
+    JSON.stringify({ file: '/work/leaky.test.js', leaked: ['Timeout'] }));
+
+  const perTest = [
+    { file: 'leaky.test.js', name: 'leaks', status: 'passed', exitedClean: true },
+    { file: 'clean.test.js', name: 'ok', status: 'passed', exitedClean: true },
+  ];
+  const merged = mergeLeaks(perTest, dir);
+  assert.equal(merged[0].exitedClean, false, 'leaky test should be marked unclean');
+  assert.equal(merged[1].exitedClean, true, 'clean test untouched');
+});
+
+test('mergeLeaks is a no-op without a leak dir or reports', () => {
+  const perTest = [{ file: 'a.test.js', name: 'x', status: 'passed', exitedClean: true }];
+  assert.deepEqual(mergeLeaks(perTest, undefined), perTest);
+  assert.deepEqual(mergeLeaks(perTest, '/no/such/dir'), perTest);
+});

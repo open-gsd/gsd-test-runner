@@ -39,6 +39,10 @@ COPY reporter/watchdog.mjs /opt/gsd-test/watchdog.mjs
 COPY reporter/run-and-die.sh /opt/gsd-test/run-and-die.sh
 RUN chmod +x /opt/gsd-test/run-and-die.sh
 
+# Per-test leak probe, preloaded into each node --test child via NODE_OPTIONS
+# (set by the entry script) to flag tests that leak handles (ADR-0021 §F).
+COPY reporter/leak-probe.mjs /opt/gsd-test/leak-probe.mjs
+
 # Working directory matches Local Engine's CopyWorktree target (/work).
 # Container is started idle (sleep infinity per Pipeline.StartContainer);
 # legs docker exec into this WORKDIR.

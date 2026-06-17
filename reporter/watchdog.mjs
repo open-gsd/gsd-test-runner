@@ -11,6 +11,8 @@
 
 import { spawn } from 'node:child_process';
 import { pathToFileURL } from 'node:url';
+import fs from 'node:fs';
+import path from 'node:path';
 
 // Exit code the watchdog returns when it reaped the run, distinct from a test
 // failure (1) so the Local Engine can tell "killed" from "failed".
@@ -86,6 +88,36 @@ export class ActiveTracker {
     }
     return out;
   }
+}
+
+/**
+ * mergeLeaks folds leak-probe reports (leak-probe.mjs, one JSON file per leaked
+ * test file in leakDir) into per-test telemetry: a completed test whose file
+ * leaked an OS resource is marked exited_clean:false. Killed tests are left
+ * alone (they are already the reaper's signal). This is the independent,
+ * estimate-proof leaderboard signal (ADR-0021 §F).
+ */
+export function mergeLeaks(perTest, leakDir) {
+  if (!leakDir) return perTest;
+  let files;
+  try {
+    files = fs.readdirSync(leakDir);
+  } catch {
+    return perTest; // no reports → nothing leaked (or probe not installed)
+  }
+  const leaked = new Set();
+  for (const f of files) {
+    try {
+      const rec = JSON.parse(fs.readFileSync(path.join(leakDir, f), 'utf8'));
+      if (rec && rec.file) leaked.add(normFile(rec.file));
+    } catch {
+      /* skip unreadable report */
+    }
+  }
+  if (leaked.size === 0) return perTest;
+  return perTest.map((t) =>
+    t.status !== 'killed' && leaked.has(t.file) ? { ...t, exitedClean: false } : t,
+  );
 }
 
 /**
@@ -193,7 +225,7 @@ export function runWithWatchdog(opts) {
     child.on('exit', (code) => {
       clearTimeout(deadlineTimer);
       clearTimeout(killTimer);
-      const perTest = tracker.perTest(Date.now(), !!kill);
+      const perTest = mergeLeaks(tracker.perTest(Date.now(), !!kill), process.env.GSD_LEAK_DIR);
       if (kill) {
         kill.elapsedMs = elapsed();
         resolve({ outcome: 'reaped', exitCode: code, kill, perTest });
