@@ -54,7 +54,7 @@ func parseJSONL(r io.Reader) (passed, total int, failures []report.FailedTest, e
 
 		var ev struct {
 			Type       string  `json:"type"`
-			Kind       string  `json:"kind"`        // "pass" | "fail"
+			Kind       string  `json:"kind"` // "pass" | "fail"
 			File       string  `json:"file"`
 			Name       string  `json:"name"`
 			Error      string  `json:"error"`

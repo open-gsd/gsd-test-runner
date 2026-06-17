@@ -38,9 +38,9 @@ const (
 //	r.AddResult("windows", windowsReport, windowsErr)
 //	r.Wait()  // blocks until all subscribed channels close + final summary printed
 type Renderer struct {
-	out    io.Writer
-	mode   Mode
-	mu     sync.Mutex // guards writes to out
+	out  io.Writer
+	mode Mode
+	mu   sync.Mutex // guards writes to out
 
 	eventsWG  sync.WaitGroup // tracks subscribed event-consumer goroutines
 	results   map[string]osResult
