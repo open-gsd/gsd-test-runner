@@ -39,7 +39,7 @@ A single JSON object. Unknown fields are ignored; invalid values are rejected wi
 | `budget.hardCapMs` | integer | `3600000` | Absolute ceiling (one hour). |
 | `isolation` | string | `process` | `process` (one child per test file) or `none` (one shared runner process). |
 | `concurrency` | integer \| null | `null` | Pins `--test-concurrency` when set; `null` pins to the CPU cap. |
-| `telemetry.sampleHandlesMs` | integer | `0` | Open-handle sampling interval. Accepted and validated (`>= 0`); the sampling behaviour is **not yet implemented** (reserved surface). |
+| `telemetry.sampleHandlesMs` | integer | `0` | *Periodic* open-handle sampling interval. Accepted and validated (`>= 0`); periodic sampling is **not yet implemented** (reserved). Exit-time leak detection runs regardless — see [Per-test leak detection](#per-test-leak-detection). |
 | `telemetry.captureStacks` | boolean | `false` | Request stack capture for leaked handles. Reserved surface, as above. |
 
 ### Effective deadline
@@ -165,4 +165,14 @@ Each run appends one JSON line to `$XDG_STATE_HOME/gsd-test/<repo>/telemetry.jso
 | `reap_reason` | string | Kill reason when reaped (omitted otherwise). |
 | `per_test` | array | `{ file, name, duration_ms, status, peak_rss_bytes, exited_clean }` per test. |
 
-The median `duration_ms` over `passed` runs of a target is the deadline fallback when a spec gives no estimate. Tests whose `per_test` status is `killed` across runs form the runaway leaderboard.
+The median `duration_ms` over `passed` runs of a target is the deadline fallback when a spec gives no estimate. The runaway leaderboard ranks tests by two signals: `killed` status (reaper trips) and `exited_clean: false` on a completed test (leaks — see below).
+
+## Per-test leak detection
+
+A leak probe (`/opt/gsd-test/leak-probe.mjs`) is preloaded into each `node --test` child via `NODE_OPTIONS=--import` (set by the entry script, pointed at `$GSD_LEAK_DIR`). It records the open OS resources at child start and, at process exit, writes anything still open to `$GSD_LEAK_DIR`. The watchdog folds those reports into `per_test`, marking a completed test `exited_clean: false`.
+
+Because `--test-force-exit` exits the process even with an open handle, a test that *passes but leaks* (a dangling timer, socket, child process) is still flagged — a signal independent of the deadline. Caveats:
+
+- **File-level.** Under process isolation the probe runs once per test *file*; it attributes a leak to the file, not to a specific test within a multi-test file.
+- **No-op under `isolation: "none"`.** There is no per-file child and no test file in the process argv, so the probe does not run.
+- **Best-effort.** A missing report simply means no signal, never a run failure.

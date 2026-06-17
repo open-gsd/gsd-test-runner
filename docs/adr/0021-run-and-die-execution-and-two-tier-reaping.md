@@ -103,7 +103,16 @@ Deferred-set round:
 - **Run-spec `telemetry` field** — added (`sampleHandlesMs`/`captureStacks`, §A) and validated; it is the accepted, documented surface. The sampling *behaviour* is still unimplemented.
 - **Agent skill** — shipped at `agent-integration/skills/run-and-die/SKILL.md`.
 
+- **Independent leak signal for the leaderboard** — done. A leak probe
+  (`reporter/leak-probe.mjs`) is preloaded into each `node --test` child via
+  `NODE_OPTIONS=--import`, so it runs *in the test's own child* (solving the
+  "reporter runs in the parent" blocker) and reports handles still open at exit.
+  The watchdog marks such tests `exited_clean:false`, and the leaderboard ranks
+  on reaper trips **and** unclean exits — the second signal is estimate-proof
+  (Goodhart). Proven end-to-end (a passing-but-leaky test is flagged). File-level
+  and best-effort; no-op under `isolation:"none"`.
+
 Still deferred:
 
 - **Windows orphaned-`node.exe` gate** (Decision 4) — `taskkill /T` path + gated test exist; needs a Windows-container Bench.
-- **Independent leak signal for the leaderboard** — `last_active_test` and the leaderboard remain best-effort: a synchronous CPU wedge blocks the reporter (attribution empty), and the single signal (reaper trips) is gameable by raising the estimate (Goodhart). A genuine fix needs per-test, in-*test-process* handle sampling; under process isolation the reporter runs in the parent, not the test's child, so it cannot observe the test's handles — hence the deferral. The `telemetry` field is the surface for it when implemented.
+- **Periodic handle sampling** — the run-spec `telemetry.sampleHandlesMs` / `captureStacks` knobs (periodic, in-flight sampling with stacks) remain reserved; exit-time leak detection above covers the common case.
