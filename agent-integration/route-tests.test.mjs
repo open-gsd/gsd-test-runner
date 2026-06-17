@@ -123,14 +123,14 @@ test('rejects: npm run testing (prefix match guard)', () => {
 // rewrite
 // ---------------------------------------------------------------------------
 
-test('rewrite returns gsd-test submit command for node --test', () => {
-  assert.equal(rewrite('node --test'), 'gsd-test submit --spec-file -');
+test('rewrite returns the gsd-test run executor for node --test', () => {
+  assert.equal(rewrite('node --test'), 'gsd-test run');
 });
 
-test('rewrite returns gsd-test submit command for npm test', () => {
-  assert.equal(rewrite('npm test'), 'gsd-test submit --spec-file -');
+test('rewrite returns the gsd-test run executor for npm test', () => {
+  assert.equal(rewrite('npm test'), 'gsd-test run');
 });
 
 test('rewrite returns same string regardless of input', () => {
-  assert.equal(rewrite('CI=1 npm run test -- --reporter=tap'), 'gsd-test submit --spec-file -');
+  assert.equal(rewrite('CI=1 npm run test -- --reporter=tap'), 'gsd-test run');
 });

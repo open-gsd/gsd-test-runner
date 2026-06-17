@@ -71,7 +71,10 @@ export function isTestCommand(command) {
  * @returns {string}
  */
 export function rewrite(_command) {
-  return 'gsd-test submit --spec-file -';
+  // The explicit executor (issue #67, ADR-0022): a named command that runs the
+  // suite in Docker and prints a node:test verdict, so the agent just swaps
+  // `node --test` → `gsd-test run` rather than hand-crafting a run spec.
+  return 'gsd-test run';
 }
 
 // ---------------------------------------------------------------------------
@@ -115,11 +118,15 @@ export async function main() {
 
   const reason =
     `Local \`node --test\` / \`npm test\` invocations are intercepted by the ` +
-    `gsd-test agent hook (ADR-0021 §G, issue #60). Running node --test directly ` +
+    `gsd-test agent hook (ADR-0022, issue #60/#65). Running node --test directly ` +
     `on the Dev Workstation creates orphaned node processes that outlive the agent ` +
-    `turn and can wedge the machine. Submit a run spec to the front door instead:\n\n` +
+    `turn and can wedge the machine. Run your tests safely in Docker instead — ` +
+    `it returns the same node:test verdict (and a loud, attributed failure if a ` +
+    `test runs away):\n\n` +
     `  ${rewrite(command)}\n\n` +
-    `Pipe a JSON run spec on stdin (see ADR-0021 and agent-integration/README.md).`;
+    `Pass test path patterns as args (e.g. \`gsd-test run src/foo.test.mjs\`); ` +
+    `\`--target\` selects the OS. See agent-integration/README.md and the ` +
+    `run-and-die skill.`;
 
   const decision = {
     hookSpecificOutput: {

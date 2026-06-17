@@ -1,51 +1,59 @@
 ---
 name: run-and-die-tests
-description: Run a project's Node tests without leaking orphaned processes onto this machine. Use whenever you would run `node --test`, `npm test`, or `npm run test` — submit a run spec to `gsd-test submit` instead of spawning the test process locally. Also use when reading a run result that came back reaped, or when a previous local test run left hung `node` processes behind.
+description: Run a project's Node tests without leaking orphaned processes onto this machine. Use whenever you would run `node --test`, `npm test`, or `npm run test` — call `gsd-test run` instead of spawning the test process locally. Also use when a run comes back reaped, or when a previous local test run left hung `node` processes behind.
 ---
 
-# Run-and-die tests via `gsd-test submit`
+# Run-and-die tests via `gsd-test run`
 
 Never run `node --test` / `npm test` directly. A hanging test leaks orphaned
-`node` processes onto this workstation and can take it down. Instead submit a
-**run spec** to the Local Engine, which runs the suite in a disposable container
-on a Bench under a watchdog that kills runaways and then dies.
+`node` processes onto this workstation and can take it down. Instead run
+`gsd-test run`: it executes the suite in a disposable container on a Bench under
+a watchdog that kills runaways and then dies, and prints the same `node --test`
+verdict you would expect — so you use it exactly like `node --test`.
 
-## Submitting a run
+## Running tests
 
-Pipe a JSON run spec to `gsd-test submit --execute --spec-file -`:
+Swap `node --test` (or `npm test`) for `gsd-test run`:
 
 ```bash
-echo '{"repo":"'"$PWD"'","target":"linux","budget":{"estimateMs":120000}}' \
-  | gsd-test submit --execute --spec-file -
+gsd-test run                      # run the whole suite
+gsd-test run src/foo.test.mjs     # run specific test files (path patterns)
+gsd-test run --target windows     # pick the OS (linux | windows | macos-container)
+gsd-test run --estimate-ms 120000 # hint the suite's normal duration in ms
 ```
 
-Minimum fields: `repo` (absolute source path) and `target` (`linux` | `windows`
-| `macos-container`). Give `budget.estimateMs` (the suite's normal duration in
-ms) whenever you can — it lets the watchdog kill a runaway early instead of
-waiting out the hour. To test a PR-merged tree, add `base` and `prBranch`
-together instead of pointing `repo` at a pre-merged checkout.
+`gsd-test run` infers the repo from the current directory. `--estimate-ms` lets
+the watchdog kill a runaway early instead of waiting out the hour; give it
+whenever you know the suite's normal duration.
 
 ## Reading the result
 
-The command prints one JSON result envelope and sets its exit code:
+`gsd-test run` prints a `node --test`-style summary and sets its exit code:
 
-- `0` — `outcome: "passed"`.
-- `1` — `outcome: "failed"` or `"reaped"`.
-- `2` — the spec was invalid or the run could not start (read stderr).
+- `0` — all tests passed.
+- `1` — a test failed **or** the run was reaped (a runaway killed by the watchdog).
+- `2` — the run could not start (read stderr).
 
-When `outcome` is **`reaped`**, the run was killed for exceeding its deadline —
-this is a real signal, not a flake. Read `kill.last_active_test` and
-`kill.in_flight_tests`: they name the runaway. Fix that test (a leaked timer,
-socket, or infinite loop); do **not** just raise the estimate. If
-`kill.last_active_test` is empty, the test wedged the runner synchronously
-(blocking even the reporter) — check `per_test` for the last `passed` entry; the
-culprit is usually the next test to start.
+A **REAPED** block means the run exceeded its deadline and was killed — a real
+signal, not a flake. It names the runaway (the last active / in-flight test).
+Fix that test (a leaked timer, socket, or infinite loop); do **not** just raise
+the estimate. If the runaway is unattributed, the test wedged the runner
+synchronously — check the last `✔` line; the culprit is usually the next test.
+
+A `⚠ left a handle open at exit` note on a passing test flags a leak (a dangling
+timer/socket/child) even though the test passed — worth fixing.
 
 ## Do not
 
-- Do not fall back to running `node --test` locally if a submit fails — fix the
-  spec or the Bench instead.
-- Do not retry a `reaped` run unchanged hoping it passes — diagnose the runaway.
+- Do not fall back to running `node --test` locally if `gsd-test run` fails —
+  fix the invocation or the Bench instead.
+- Do not retry a reaped run unchanged hoping it passes — diagnose the runaway.
+
+## Advanced
+
+For programmatic use or a raw JSON envelope, the lower-level front door is
+`gsd-test submit --execute --spec-file -` (pipe a JSON run spec). `gsd-test run`
+is the wrapper over it and is what you want for everyday test runs.
 
 See the project docs: `docs/run-and-die.md` (concepts),
 `docs/run-and-die-how-to.md` (tasks), `docs/run-and-die-reference.md` (every

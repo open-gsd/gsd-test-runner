@@ -43,8 +43,12 @@ Add a `PreToolUse` hook to `.claude/settings.json`:
 
 The hook reads the Claude Code payload from stdin. If the Bash command is a
 node test invocation, it writes a `deny` decision to stdout and Claude Code
-blocks the tool call. If the command is unrelated, the hook exits 0 silently
-and the tool call proceeds normally.
+blocks the tool call. The deny reason routes the agent to **`gsd-test run`**
+(issue #67, ADR-0022) — the executor that runs the suite in Docker and returns a
+`node --test`-style verdict, so the agent simply swaps `node --test` →
+`gsd-test run`. If the command is unrelated, the hook exits 0 silently and the
+tool call proceeds normally. The [`run-and-die` skill](skills/run-and-die/SKILL.md)
+teaches the agent how to use `gsd-test run` and read a reaped result.
 
 ## Using the Codex shim
 
