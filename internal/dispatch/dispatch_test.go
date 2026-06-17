@@ -38,6 +38,7 @@ func TestRunnerArgs_NodePath_AllHardeningFlagsInOrder(t *testing.T) {
 		"--test-force-exit",
 		"--test-timeout=180000",
 		"--experimental-test-isolation=process",
+		"--test-concurrency=2",
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("TestRunnerArgs =\n  %v\nwant\n  %v", got, want)
@@ -53,6 +54,7 @@ func TestRunnerArgs_NodePath_WithPatterns(t *testing.T) {
 		"--test-force-exit",
 		"--test-timeout=60000",
 		"--experimental-test-isolation=process",
+		"--test-concurrency=2",
 		"test/**/*.test.js",
 		"src/**/*.test.js",
 	}
@@ -70,6 +72,7 @@ func TestRunnerArgs_NodePath_IsolationNone(t *testing.T) {
 		"--test-force-exit",
 		"--test-timeout=90000",
 		"--experimental-test-isolation=none",
+		"--test-concurrency=2",
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("TestRunnerArgs =\n  %v\nwant\n  %v", got, want)
@@ -92,14 +95,19 @@ func TestRunnerArgs_NodePath_ConcurrencyPinWhenSet(t *testing.T) {
 	}
 }
 
-func TestRunnerArgs_NodePath_ConcurrencyNotSetWhenNil(t *testing.T) {
+func TestRunnerArgs_NodePath_ConcurrencyPinnedToCPUCapWhenNil(t *testing.T) {
 	spec := baseSpec()
-	// Concurrency is nil by default; ensure no --test-concurrency flag appears.
+	// Concurrency is nil by default; it must still be pinned (to the CPU cap) so
+	// the orphan fan-out inside the container is bounded (ADR-0021 §D/§E).
 	got := dispatch.TestRunnerArgs(spec, 30000)
+	var found bool
 	for _, arg := range got {
-		if len(arg) >= 19 && arg[:19] == "--test-concurrency=" {
-			t.Errorf("unexpected %q in args when Concurrency == nil: %v", arg, got)
+		if arg == "--test-concurrency="+dispatch.DefaultCPUs {
+			found = true
 		}
+	}
+	if !found {
+		t.Errorf("expected --test-concurrency=%s when Concurrency == nil, got %v", dispatch.DefaultCPUs, got)
 	}
 }
 

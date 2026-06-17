@@ -60,8 +60,14 @@ func TestRunnerArgs(spec runspec.Spec, effectiveDeadlineMs int64) []string {
 	result = append(result, fmt.Sprintf("--test-timeout=%d", effectiveDeadlineMs))
 	result = append(result, fmt.Sprintf("--experimental-test-isolation=%s", spec.Isolation))
 
+	// Pin concurrency explicitly to bound the orphan fan-out inside the
+	// container (ADR-0021 §D/§E). An agent-supplied value wins; otherwise pin to
+	// the CPU cap (DefaultCPUs) so the default is bounded, not left to the
+	// runner's host-derived default.
 	if spec.Concurrency != nil {
 		result = append(result, fmt.Sprintf("--test-concurrency=%d", *spec.Concurrency))
+	} else {
+		result = append(result, "--test-concurrency="+DefaultCPUs)
 	}
 
 	result = append(result, spec.TestPathPatterns...)
