@@ -39,8 +39,8 @@ A single JSON object. Unknown fields are ignored; invalid values are rejected wi
 | `budget.hardCapMs` | integer | `3600000` | Absolute ceiling (one hour). |
 | `isolation` | string | `process` | `process` (one child per test file) or `none` (one shared runner process). |
 | `concurrency` | integer \| null | `null` | Pins `--test-concurrency` when set; `null` pins to the CPU cap. |
-| `telemetry.sampleHandlesMs` | integer | `0` | *Periodic* open-handle sampling interval. Accepted and validated (`>= 0`); periodic sampling is **not yet implemented** (reserved). Exit-time leak detection runs regardless — see [Per-test leak detection](#per-test-leak-detection). |
-| `telemetry.captureStacks` | boolean | `false` | Request stack capture for leaked handles. Reserved surface, as above. |
+| `telemetry.sampleHandlesMs` | integer | `0` | *Periodic* open-handle sampling interval. `0` (the default) disables it; a positive value samples open handles every N ms during the run. Validated (`>= 0`). Best-effort and file-level; a no-op under `isolation: none`. Exit-time leak detection runs regardless — see [Per-test leak detection](#per-test-leak-detection) and [Periodic handle sampling](#periodic-handle-sampling). |
+| `telemetry.captureStacks` | boolean | `false` | When sampling is on, also capture the creation stack of each live async resource, grouped by type, in every sample. Inert without a positive `sampleHandlesMs`. |
 
 ### Effective deadline
 
@@ -90,6 +90,7 @@ The output of `gsd-test submit --execute`. Schema version 2 — a superset of th
 | `total` / `passed` / `failed` | integer | Test counts. |
 | `failures` | array | One entry per failed test (`file`, `name`, `duration_ms`, `retry_count`, `error`, `error_class`, `stack`, `output`). |
 | `per_test` | array | Per-test telemetry (`file`, `name`, `duration_ms`, `status`, `exited_clean`) derived from the reporter events the watchdog observed. `status` is `passed`, `failed`, or `killed`; `exited_clean` is `false` for a test still in flight at a reap. |
+| `handle_samples` | array | Present only when `telemetry.sampleHandlesMs > 0`. One entry per test file (`file`, `samples`); each sample is `{ at_ms, open, leaked[], stacks? }`. See [Periodic handle sampling](#periodic-handle-sampling). |
 | `kill` | object | Present only when `outcome` is `reaped`. See below. |
 
 ### `kill` object
@@ -176,3 +177,13 @@ Because `--test-force-exit` exits the process even with an open handle, a test t
 - **File-level.** Under process isolation the probe runs once per test *file*; it attributes a leak to the file, not to a specific test within a multi-test file.
 - **No-op under `isolation: "none"`.** There is no per-file child and no test file in the process argv, so the probe does not run.
 - **Best-effort.** A missing report simply means no signal, never a run failure.
+
+## Periodic handle sampling
+
+Set `telemetry.sampleHandlesMs` to a positive interval to make the same probe sample open handles *while the test runs*, not only at exit. Every `sampleHandlesMs` it appends a snapshot — `{ at_ms, open, leaked[], stacks? }` — to a per-file sidecar in `$GSD_LEAK_DIR`, flushed synchronously so a `SIGKILL` cannot lose it. The watchdog reads the sidecars before the container is torn down and surfaces them as `handle_samples` on the result envelope.
+
+Unlike the exit-time signal, this survives a **reaped** run: a test that hangs and is killed never reaches `process.exit`, but its periodic samples still show how its open handles accumulated up to the kill. `leaked` uses the same load-time-baseline semantics as exit-time detection.
+
+Set `telemetry.captureStacks: true` to also record the creation stack of each live async resource, grouped by async resource type, in every sample (`stacks`). This is heavier (an `async_hooks` hook records every resource's init stack) and is inert unless sampling is enabled.
+
+Same caveats as leak detection apply: file-level, a no-op under `isolation: "none"`, and best-effort (per-type stack capacity is bounded; promise `destroy` is GC-timed, so stacks are a creation-site snapshot, not a precise live set).
