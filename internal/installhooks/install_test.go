@@ -19,6 +19,8 @@ func TestInstall_BothRuntimes_WritesAssetsHookAndManifest(t *testing.T) {
 		".claude/skills/run-and-die/SKILL.md",
 		".claude/settings.json",
 		".gsd-test/codex-shim.sh",
+		".gsd-test/codex-bin/node",
+		".gsd-test/codex-bin/npm",
 		".gsd-test/install-manifest.json",
 	} {
 		if _, err := os.Stat(filepath.Join(root, rel)); err != nil {
@@ -30,14 +32,23 @@ func TestInstall_BothRuntimes_WritesAssetsHookAndManifest(t *testing.T) {
 	if !strings.Contains(string(settings), "route-tests.mjs") || !strings.Contains(string(settings), `"Bash"`) {
 		t.Errorf("settings.json missing the guard hook:\n%s", settings)
 	}
-	// The Codex shim must be executable.
-	info, _ := os.Stat(filepath.Join(root, ".gsd-test/codex-shim.sh"))
-	if info.Mode()&0o100 == 0 {
-		t.Errorf("codex-shim.sh not executable: %v", info.Mode())
+	// The Codex shim + node/npm wrappers must be executable.
+	for _, rel := range []string{".gsd-test/codex-shim.sh", ".gsd-test/codex-bin/node", ".gsd-test/codex-bin/npm"} {
+		info, _ := os.Stat(filepath.Join(root, rel))
+		if info == nil || info.Mode()&0o100 == 0 {
+			t.Errorf("%s not executable: %v", rel, info)
+		}
 	}
-	// No node-shadowing PATH file is created (ADR-0022 D1/D5).
+	// The node/npm shims must export GSD_SHIM_DIR so the shim skips its own dir
+	// and never recurses (issue #78).
+	nodeShim, _ := os.ReadFile(filepath.Join(root, ".gsd-test/codex-bin/node"))
+	if !strings.Contains(string(nodeShim), "GSD_SHIM_DIR=") {
+		t.Errorf("codex-bin/node missing GSD_SHIM_DIR recursion guard:\n%s", nodeShim)
+	}
+	// The node shims live ONLY under the Codex-scoped codex-bin dir — never at a
+	// path that would shadow the human's interactive node (ADR-0022 D1/D5).
 	if _, err := os.Stat(filepath.Join(root, ".gsd-test", "node")); err == nil {
-		t.Error("installer must not create a node-shadowing shim")
+		t.Error("node shim must be confined to codex-bin, not .gsd-test root")
 	}
 }
 

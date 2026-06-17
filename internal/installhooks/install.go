@@ -37,6 +37,13 @@ func ManifestPath(root string) string {
 	return filepath.Join(root, ".gsd-test", "install-manifest.json")
 }
 
+// CodexBinDir is the directory holding the Codex node/npm PATH shims. The user
+// puts this first on Codex's exec PATH (via shell_environment_policy) so Codex's
+// node/npm route through the gsd-test shim; it never touches the human's PATH.
+func CodexBinDir(root string) string {
+	return filepath.Join(root, ".gsd-test", "codex-bin")
+}
+
 // Install writes the selected runtime integration under opts.Root and returns
 // the manifest (also persisted to ManifestPath). It is idempotent: re-running
 // converges (the settings merge is non-destructive and dedup'd, files are
@@ -85,13 +92,26 @@ func Install(opts Options) (Manifest, error) {
 
 	if opts.Codex {
 		shim := filepath.Join(opts.Root, ".gsd-test", "codex-shim.sh")
-		if err := writeFile(shim, agentintegration.CodexShim(), 0o755); err != nil {
+		if err := writeExec(shim, agentintegration.CodexShim()); err != nil {
 			return Manifest{}, err
 		}
-		if err := os.Chmod(shim, 0o755); err != nil { // repair mode on reinstall (WriteFile only sets it on create)
-			return Manifest{}, fmt.Errorf("chmod %s: %w", shim, err)
-		}
 		man.Files = append(man.Files, shim)
+
+		// node/npm PATH shims. The user puts CodexBinDir(Root) first on Codex's
+		// exec PATH (via shell_environment_policy); each wrapper exports
+		// GSD_SHIM_DIR so codex-shim.sh skips this dir and resolves the real
+		// binary (no recursion). This shadows node/npm only inside Codex's
+		// configured PATH — never the human's interactive shell (ADR-0022 D1/D5).
+		codexBin := CodexBinDir(opts.Root)
+		for _, name := range []string{"node", "npm"} {
+			wrapper := filepath.Join(codexBin, name)
+			content := fmt.Sprintf("#!/bin/sh\n# gsd-test Codex %s shim (issue #78) — routes `%s --test`/`%s test` to `gsd-test run`.\nGSD_SHIM_DIR=%q exec sh %q %s \"$@\"\n",
+				name, name, name, codexBin, shim, name)
+			if err := writeExec(wrapper, []byte(content)); err != nil {
+				return Manifest{}, err
+			}
+			man.Files = append(man.Files, wrapper)
+		}
 	}
 
 	// Accumulate with any prior install so a single --uninstall reverses
@@ -197,6 +217,18 @@ func writeFile(path string, data []byte, mode os.FileMode) error {
 	}
 	if err := os.WriteFile(path, data, mode); err != nil {
 		return fmt.Errorf("write %s: %w", path, err)
+	}
+	return nil
+}
+
+// writeExec writes an executable file, repairing the mode on reinstall (WriteFile
+// only applies its mode when creating the file).
+func writeExec(path string, data []byte) error {
+	if err := writeFile(path, data, 0o755); err != nil {
+		return err
+	}
+	if err := os.Chmod(path, 0o755); err != nil {
+		return fmt.Errorf("chmod %s: %w", path, err)
 	}
 	return nil
 }

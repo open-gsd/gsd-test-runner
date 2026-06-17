@@ -31,7 +31,7 @@ Options considered:
 **Decision:** the executor is the **explicit `gsd-test run` wrapper** (option C). It is the one place that performs the handoff, and agents are *routed* to it rather than having `node` transparently shadowed:
 
 - **Claude Code** — the `PreToolUse` hook keeps denying `node --test` / `npm test`, but its reason now names `gsd-test run` (a command that actually executes and returns a verdict, not a hand-built run spec), and the `run-and-die` skill teaches the agent to call `gsd-test run`. The agent invokes it by name.
-- **Codex** — `codex-shim.sh` rewrites a matched `node --test …` / `npm test` into `gsd-test run …` and execs it (Codex's only interception point is the exec `PATH`, so the shim redirects to the wrapper rather than shadowing `node` for general use).
+- **Codex** — `codex-shim.sh` rewrites a matched `node --test …` / `npm test` into `gsd-test run …` and execs it. Codex's only interception point is the exec `PATH`, so the installer provides `node`/`npm` shims in a `codex-bin/` dir that the user puts first on **Codex's** `shell_environment_policy` PATH (issue #78). Those shims pass every non-test command through to the real binary — found by skipping their own directory, compared by canonicalised (symlink-resolved) path so the shadow can never recurse. The shadow is therefore Codex-scoped and transparent for non-test use; the human's interactive `node` is untouched (the installer never edits a login PATH).
 
 This keeps the magic low and visible: there is exactly one executor (`gsd-test run`), it is a named command, and nothing transparently shadows `node` for non-test use. The PATH-shim transparency route (A) is rejected — its `node`-shadowing blast radius is not worth the invisibility (see Alternatives).
 
