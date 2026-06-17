@@ -27,9 +27,12 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 
 	"github.com/open-gsd/gsd-test-runner/internal/bench"
 	"github.com/open-gsd/gsd-test-runner/internal/config"
+	"github.com/open-gsd/gsd-test-runner/internal/dispatch"
+	"github.com/open-gsd/gsd-test-runner/internal/dockerexec"
 	"github.com/open-gsd/gsd-test-runner/internal/images"
 	"github.com/open-gsd/gsd-test-runner/internal/pipeline"
 	"github.com/open-gsd/gsd-test-runner/internal/plan"
@@ -260,16 +263,20 @@ func run(args []string, stdout, stderr *os.File) int {
 }
 
 // runSubmit implements `gsd-test submit`: read a JSON run spec (from --spec-file
-// or stdin), validate it via runspec.Parse, assign a RunID if the agent omitted
-// one, and echo the normalized spec as JSON on stdout. This is only the front
-// door (accept + normalize); dispatching the run to a Bench is a later slice.
+// or stdin), validate it via runspec.Parse, and assign a RunID if the agent
+// omitted one. Without --execute it echoes the normalized spec (the accept +
+// normalize front door); with --execute it dispatches the run-and-die run to a
+// Bench and emits the per-OS Report (issue #60, ADR-0021).
 //
-// Exit codes: 0 = accepted; 2 = spec could not be read or failed validation
-// (inconclusive — no run was started), consistent with the fail-loud contract.
+// Exit codes: 0 = accepted / all passed; 1 = the run failed or was reaped;
+// 2 = the spec could not be read/validated or the run could not be started
+// (inconclusive), consistent with the fail-loud contract.
 func runSubmit(args []string, stdout, stderr *os.File) int {
 	fs := flag.NewFlagSet("gsd-test submit", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	specFile := fs.String("spec-file", "-", `path to the JSON run spec, or "-" for stdin`)
+	execute := fs.Bool("execute", false, "dispatch the run to a Bench (default: validate + normalize only)")
+	configPath := fs.String("config", "", "path to config.toml (used with --execute)")
 	if err := fs.Parse(args); err != nil {
 		return exitInconclusive
 	}
@@ -303,6 +310,10 @@ func runSubmit(args []string, stdout, stderr *os.File) int {
 		spec.RunID = id
 	}
 
+	if *execute {
+		return executeSpec(*spec, *configPath, stdout, stderr)
+	}
+
 	enc := json.NewEncoder(stdout)
 	enc.SetIndent("", "  ")
 	if encErr := enc.Encode(spec); encErr != nil {
@@ -310,6 +321,77 @@ func runSubmit(args []string, stdout, stderr *os.File) int {
 		return exitInconclusive
 	}
 	return exitAllPass
+}
+
+// executeSpec dispatches a validated run spec to a Bench and emits the per-OS
+// Report. It resolves the Bench + Tester Image for spec.Target (reusing config,
+// the Bench selector, and images.EnsurePresent), then runs the copy-in
+// run-and-die path under the watchdog (dispatch.RunCopyIn) via a dockerexec
+// Runner. The reaped/failed container exit code is carried in the watchdog
+// envelope, which dockerexec.Run preserves on stdout — so reaps surface as a
+// loud OutcomeReaped Report, never a silent hang.
+func executeSpec(spec runspec.Spec, configPath string, stdout, stderr *os.File) int {
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer cancel()
+
+	cfg, err := config.Load(configPath, config.LoadOptions{})
+	if err != nil {
+		fmt.Fprintf(stderr, "submit --execute: config.Load: %v\n", err)
+		return exitInconclusive
+	}
+	selector, err := bench.NewSelector(cfg.Registry, bench.Options{})
+	if err != nil {
+		fmt.Fprintf(stderr, "submit --execute: bench.NewSelector: %v\n", err)
+		return exitInconclusive
+	}
+	b, err := selector.Pick(spec.Target)
+	if err != nil {
+		fmt.Fprintf(stderr, "submit --execute: no Bench for target %q: %v\n", spec.Target, err)
+		return exitInconclusive
+	}
+
+	// ImageID matches the plan/pipeline convention (untagged ghcr path); the
+	// expected version is verified via the OCI sentinel label, not the docker
+	// tag (sentinel verification for the run-and-die path is a follow-up, like
+	// the pipeline's CheckImageVersion leg).
+	imageID := images.ImageID(fmt.Sprintf("ghcr.io/open-gsd/gsd-tester-%s", spec.Target))
+	if err := images.EnsurePresent(ctx, b, imageID, images.EnsurePresentOptions{
+		FallbackDockerfile: "dockerfiles/" + spec.Target + ".Dockerfile",
+		FallbackContextDir: ".",
+	}); err != nil {
+		fmt.Fprintf(stderr, "submit --execute: EnsurePresent: %v\n", err)
+		return exitInconclusive
+	}
+
+	// dockerexec.Run preserves stdout on a non-zero container exit (the reaped
+	// envelope), which dispatch.Exec relies on to distinguish a reap from a
+	// launch failure.
+	runner := func(ctx context.Context, args ...string) ([]byte, error) {
+		out, runErr := dockerexec.Run(ctx, b, args)
+		return []byte(out), runErr
+	}
+
+	now := time.Now()
+	eff := spec.Budget.EffectiveDeadlineMs(0) // telemetry median wiring is a follow-up
+	deadlineEpochMs := now.Add(time.Duration(eff) * time.Millisecond).UnixMilli()
+
+	rep, err := dispatch.RunCopyIn(ctx, runner, spec, string(imageID), spec.Repo, deadlineEpochMs, eff, now)
+	if err != nil {
+		fmt.Fprintf(stderr, "submit --execute: run: %v\n", err)
+		return exitInconclusive
+	}
+
+	enc := json.NewEncoder(stdout)
+	enc.SetIndent("", "  ")
+	if encErr := enc.Encode(rep); encErr != nil {
+		fmt.Fprintf(stderr, "submit --execute: encode report: %v\n", encErr)
+		return exitInconclusive
+	}
+
+	if rep.Outcome == report.OutcomePassed {
+		return exitAllPass
+	}
+	return exitSomeFailed
 }
 
 // ensureImagesParallel runs images.EnsurePresent for each unique (Bench, ImageID)
