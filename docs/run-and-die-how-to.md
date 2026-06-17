@@ -1,0 +1,121 @@
+# Run-and-die How-to Guides
+
+Task-focused recipes for working with run-and-die. Each assumes you already know what you want to do. For the schemas and flags these reference, see the [reference](run-and-die-reference.md); for the concepts, see [Run-and-die Execution](run-and-die.md).
+
+## How to stop an agent from running tests locally
+
+The whole point is that an agent never spawns a local `node --test`. Wire the interception once per agent.
+
+**Claude Code.** Add a `PreToolUse` hook on the `Bash` tool to `.claude/settings.json`:
+
+```json
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          { "type": "command", "command": "node agent-integration/route-tests.mjs" }
+        ]
+      }
+    ]
+  }
+}
+```
+
+The hook denies any `node --test` / `npm test` command and tells the agent to submit a run spec instead. Unrelated commands pass through untouched.
+
+**Codex.** Route Codex's shell path through the shim:
+
+```bash
+agent-integration/codex-shim.sh <command...>
+```
+
+It blocks node test commands with a routing message and `exec`s everything else unchanged.
+
+See [`agent-integration/README.md`](../agent-integration/README.md) for the full wiring, and install the bundled Claude Code skill at `agent-integration/skills/run-and-die/` so the agent knows the run-spec contract and how to read a reaped result.
+
+## How to test a PR-merged tree
+
+To run the suite against a branch merged onto its base — without checking out and merging yourself — give `base` and `prBranch` instead of pointing `repo` at a pre-merged checkout:
+
+```bash
+echo '{"repo":"'"$PWD"'","target":"linux","base":"main","prBranch":"feat/x"}' \
+  | gsd-test submit --execute --spec-file -
+```
+
+The Engine resolves both refs in `repo`, constructs a PR-merged worktree (a real `git merge`; conflicts surface as a failure before any container starts), and runs that. Set both fields or neither — supplying only one is rejected.
+
+## How to submit a run from your own tooling
+
+Pipe a spec to `gsd-test submit` on stdin and parse the JSON it returns:
+
+```bash
+echo '{"repo":"'"$PWD"'","target":"linux","budget":{"estimateMs":120000}}' \
+  | gsd-test submit --execute --spec-file -
+```
+
+`--spec-file -` reads stdin. Without `--execute`, `submit` only validates and normalises the spec (assigning a `runId`) and prints it back — use that to check a spec before running it.
+
+The exit code tells you the outcome at a glance: `0` passed, `1` failed or reaped, `2` the spec was invalid or the run could not start. The full result is the [result envelope](run-and-die-reference.md#result-envelope) on stdout.
+
+## How to find which test is running away
+
+When a run comes back `"outcome": "reaped"`, the `kill` block tells you where it died:
+
+```bash
+gsd-test submit --execute --spec-file spec.json | jq '.kill.last_active_test, .kill.in_flight_tests'
+```
+
+- `kill.last_active_test` is the test that was running when the deadline fired — your prime suspect.
+- `kill.in_flight_tests` lists everything still executing, with `started_ms_ago` so you can see what had been running longest.
+
+If `kill.granularity` is `"process"`, the run used `isolation: "none"` and these fields are best-effort — re-run with the default process isolation to get exact per-test attribution.
+
+If `kill.last_active_test` is empty, the runaway most likely wedged the runner with a synchronous CPU loop, which blocks the reporter from emitting events. Look at `per_test` for the last test with `status: "passed"` — the culprit is usually the next one to start — or add focused logging to the suspect file and re-run.
+
+For the pattern *across* runs rather than a single one, read the leaderboard (below).
+
+## How to see your repeat offenders
+
+Telemetry accumulates per-repo on your workstation. Each run appends a record to:
+
+```
+$XDG_STATE_HOME/gsd-test/<repo>/telemetry.jsonl
+```
+
+(falling back to `~/.local/state/gsd-test/...`). A test that trips the reaper across several runs is a bugged test, not a slow one — fix it rather than raising its estimate. Inspect the raw log with `jq`:
+
+```bash
+jq -r 'select(.reaped) | .reap_reason + "\t" + .run_id' \
+  ~/.local/state/gsd-test/<repo>/telemetry.jsonl
+```
+
+See the [telemetry record reference](run-and-die-reference.md#telemetry-record) for the fields.
+
+## How to tune the deadline
+
+The watchdog kills at `min(estimateMs × overrunFactor, hardCapMs)`, floored at 30 seconds and timed from the start of the test run (not the container start). Adjust the `budget` in your spec:
+
+- **Give an estimate.** Set `budget.estimateMs` to how long the suite normally takes. This is the single most useful knob — it lets the reaper kill a runaway early instead of waiting out the hour.
+- **If a suite legitimately varies a lot,** raise `budget.overrunFactor` (default `1.5`) rather than inflating the estimate.
+- **If you omit `estimateMs` entirely,** the deadline falls back to the median of recent passing runs, then to `budget.hardCapMs` (default one hour) when there is no history.
+- **To cap the absolute worst case,** lower `budget.hardCapMs`.
+
+## How to choose an isolation mode
+
+- **Keep the default `"process"`** for any suite you do not fully trust. A wedged test is a contained child the watchdog reaps with exact attribution, and `node --test`'s own per-test timeout can catch many hangs before the watchdog needs to.
+- **Use `"none"` only for a known-clean, fast suite** where you want to skip the per-file process spawn. Be aware that a single hang then wedges the whole runner — only the watchdog can recover it, and the kill record's test attribution becomes best-effort.
+
+## How to run the same spec against more than one OS
+
+A run spec targets one OS. To cover Linux and Windows, submit two specs:
+
+```bash
+for os in linux windows; do
+  jq --arg t "$os" '.target = $t' base-spec.json \
+    | gsd-test submit --execute --spec-file -
+done
+```
+
+Each run picks its own Bench and Tester Image for that target and returns its own report. There is no cross-OS comparison — you read one report per OS, as with the ordinary `gsd-test` flow.

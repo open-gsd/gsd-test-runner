@@ -30,8 +30,12 @@ Phases 3 and 4 do I/O. Phases 1, 2, and 5 are CPU/memory only and are independen
 | `dockerexec` | `internal/dockerexec/` | Low-level docker subprocess wrapper. Sets `DOCKER_HOST=ssh://<bench.Host>`. `ExecError` type. `Stream` for line-by-line output. |
 | `pipeline` | `internal/pipeline/` | 8-leg Per-OS Pipeline. `LegError` envelope. Typed Cause errors per leg. Event emission. |
 | `parse` | `internal/pipeline/` (same package) | JSONL parser for test events emitted by the Reporter. Called by the Parse leg. |
-| `report` | `internal/report/` | `Report` type: pass/fail counts, `[]Failure` list. `KindPass` / `KindFail` discriminant. |
+| `report` | `internal/report/` | `Report` type: pass/fail counts, `[]Failure` list. `KindPass` / `KindFail` discriminant. `schema_version: 2` adds `Outcome` and the `Kill` record for reaped runs (ADR-0021). |
 | `renderer` | `internal/renderer/` | Consumes per-OS event channels. TTY mode (human) and JSON-events mode (machine). |
+| `runspec` | `internal/runspec/` | Run-and-die: parse/validate the agent run spec, defaults, `Budget.EffectiveDeadlineMs`. |
+| `dispatch` | `internal/dispatch/` | Run-and-die: hardened `node --test` / `docker run` arg builders, the copy-in `Exec`/`RunCopyIn` execution, and `VerifyImageVersion`. |
+| `reaper` | `internal/reaper/` | Run-and-die Tier-2: `Overdue` selection and the stale-label `Sweep`. |
+| `telemetry` | `internal/telemetry/` | Run-and-die: per-repo JSONL log, median fallback, runaway leaderboard. |
 
 ## The 8 pipeline legs
 
@@ -49,6 +53,19 @@ The `pipeline.Pipeline` type owns 8 legs (per ADR-0008). They run in order; a fa
 | 8 | `Parse` | Parses the JSONL file into structured `report.Failure` values. Populates `Report`. |
 
 `RunAll` runs all 8 legs and defers `docker rm -f` so the container is removed even on failure.
+
+## The run-and-die path
+
+`gsd-test submit` is a second front door, aimed at coding agents, that reuses the same Benches, Tester Images, and copy-in worktree as the pipeline above (issue #60, ADR-0021). Instead of the 8-leg idle-container pipeline it runs one disposable container under a watchdog:
+
+- `cmd/gsd-test` `runSubmit`/`executeSpec` parse the run spec (`runspec`), resolve the Bench and image, verify the version sentinel (`dispatch.VerifyImageVersion`), then call `dispatch.RunCopyIn`.
+- `dispatch.Exec` performs the copy-in one-shot: `docker create --rm` (resource-capped, deadline-labelled) → `docker cp` the worktree → `docker start -a`, streaming the watchdog envelope.
+- Inside the container, `reporter/watchdog.mjs` wraps the hardened `node --test`, enforces the deadline, and escalates `SIGTERM`→`SIGKILL` (or `taskkill /T` on Windows). It prints the result envelope and exits `75` on reap.
+- `reaper.Sweep` is the Tier-2 backstop: the Engine kills any container past its `sh.gsd-test.deadline` label on its next contact with a Bench.
+- `telemetry` appends each run to a per-repo log on the workstation for the median deadline fallback and the runaway leaderboard.
+- `agent-integration/` holds the Claude Code `PreToolUse` hook and Codex shim that route `node --test`/`npm test` to this front door.
+
+User-facing documentation: [Run-and-die Execution](run-and-die.md) and its tutorial, how-to, and reference.
 
 ## Tester Image contract
 
@@ -104,3 +121,4 @@ All design decisions live in [docs/adr/](adr/). Read them in numeric order for t
 | 0018 | Local Engine orchestration phases |
 | 0019 | Local Engine binary distribution via GitHub Release assets |
 | 0020 | macOS Bench via Apple Containers (amended 2026-05-24: pivoted to Docker on macOS) |
+| 0021 | Run-and-die execution and two-tier reaping |

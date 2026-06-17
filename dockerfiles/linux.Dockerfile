@@ -28,6 +28,21 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # This path is contractual; do not change without updating the leg.
 COPY reporter/reporter.mjs /opt/gsd-test/reporter.mjs
 
+# Tier-1 watchdog baked alongside the reporter (issue #60, ADR-0021). The
+# run-and-die path invokes it as the container entrypoint:
+#   node /opt/gsd-test/watchdog.mjs --deadline-ms N -- node --test ...
+# This path is contractual, like the reporter path above.
+COPY reporter/watchdog.mjs /opt/gsd-test/watchdog.mjs
+
+# Run-and-die entry script: runs npm ci + build (when a package.json is present)
+# then exec-s the watchdog, so the deadline times only the test phase (ADR-0021).
+COPY reporter/run-and-die.sh /opt/gsd-test/run-and-die.sh
+RUN chmod +x /opt/gsd-test/run-and-die.sh
+
+# Per-test leak probe, preloaded into each node --test child via NODE_OPTIONS
+# (set by the entry script) to flag tests that leak handles (ADR-0021 §F).
+COPY reporter/leak-probe.mjs /opt/gsd-test/leak-probe.mjs
+
 # Working directory matches Local Engine's CopyWorktree target (/work).
 # Container is started idle (sleep infinity per Pipeline.StartContainer);
 # legs docker exec into this WORKDIR.

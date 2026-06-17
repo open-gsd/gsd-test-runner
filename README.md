@@ -52,6 +52,13 @@ gsd-test
 - **[Troubleshooting](docs/troubleshooting.md)** — When things go wrong
 - **[Architecture](docs/architecture.md)** — How `gsd-test` is built (for contributors)
 
+Run-and-die (containerised `node --test` for coding agents):
+
+- **[Run-and-die Execution](docs/run-and-die.md)** — Why it exists and how two-tier reaping works
+- **[Tutorial: Your First Run-and-die Run](docs/run-and-die-tutorial.md)** — Submit a run and watch a runaway test get reaped
+- **[Run-and-die How-to Guides](docs/run-and-die-how-to.md)** — Route an agent's tests, tune the budget, find the bugged test
+- **[Run-and-die Reference](docs/run-and-die-reference.md)** — Run spec, result envelope, `submit` flags, labels, telemetry
+
 ## How it Works (30-second version)
 
 1. You run `gsd-test` from inside your Node project's git repo.

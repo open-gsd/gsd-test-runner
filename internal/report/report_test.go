@@ -12,11 +12,12 @@ import (
 // fixedTime is a stable instant used across tests.
 var fixedTime = time.Date(2026, 5, 23, 10, 0, 0, 0, time.UTC)
 
-// TestNew_SchemaVersion verifies New() always stamps SchemaVersion=1.
+// TestNew_SchemaVersion verifies New() always stamps SchemaVersion=2 (bumped
+// by ADR-0021 Decision 6).
 func TestNew_SchemaVersion(t *testing.T) {
 	r := report.New("linux", "bench-1", "ghcr.io/gsd:v1", "v1", fixedTime)
-	if r.SchemaVersion != 1 {
-		t.Errorf("expected SchemaVersion=1, got %d", r.SchemaVersion)
+	if r.SchemaVersion != 2 {
+		t.Errorf("expected SchemaVersion=2, got %d", r.SchemaVersion)
 	}
 }
 
@@ -267,5 +268,99 @@ func TestKindValues(t *testing.T) {
 	}
 	if string(report.KindFail) != "fail" {
 		t.Errorf("KindFail: want %q, got %q", "fail", string(report.KindFail))
+	}
+}
+
+// TestMarkReaped_SetsReapedOutcome verifies a reaped run is a loud, distinct
+// outcome with the kill record attached (ADR-0021 Decision 6).
+func TestMarkReaped_SetsReapedOutcome(t *testing.T) {
+	r := report.New("linux", "bench-1", "ghcr.io/gsd:v2", "v2.0.0", fixedTime)
+	r.MarkReaped(fixedTime.Add(181*time.Second), report.KillRecord{
+		Reason:              report.KillReasonEstimateOverrun,
+		EffectiveDeadlineMs: 180000,
+		ElapsedMs:           181004,
+		LastActiveTest:      &report.ActiveTest{File: "test/db.test.js", Name: "reconnects after drop"},
+		ReapedBy:            report.ReapedByInContainer,
+		SignalChain:         []string{"SIGTERM@180000", "SIGKILL@180010"},
+	})
+
+	if r.Outcome != report.OutcomeReaped {
+		t.Errorf("Outcome: want %q, got %q", report.OutcomeReaped, r.Outcome)
+	}
+	if r.Kind != report.KindFail {
+		t.Errorf("Kind: want %q (reaped is not a pass), got %q", report.KindFail, r.Kind)
+	}
+	if r.Kill == nil {
+		t.Fatal("Kill: want non-nil kill record")
+	}
+	if r.Kill.LastActiveTest == nil || r.Kill.LastActiveTest.File != "test/db.test.js" {
+		t.Errorf("Kill.LastActiveTest: want test/db.test.js, got %+v", r.Kill.LastActiveTest)
+	}
+	if r.Kill.Reason != report.KillReasonEstimateOverrun {
+		t.Errorf("Kill.Reason: want estimate_overrun, got %q", r.Kill.Reason)
+	}
+}
+
+func TestFinalize_SetsOutcome(t *testing.T) {
+	pass := report.New("linux", "b", "img", "v", fixedTime)
+	pass.Finalize(fixedTime.Add(time.Second))
+	if pass.Outcome != report.OutcomePassed {
+		t.Errorf("passed run Outcome: want %q, got %q", report.OutcomePassed, pass.Outcome)
+	}
+
+	fail := report.New("linux", "b", "img", "v", fixedTime)
+	fail.Failures = []report.FailedTest{{File: "x.test.js", Name: "boom"}}
+	fail.Finalize(fixedTime.Add(time.Second))
+	if fail.Outcome != report.OutcomeFailed {
+		t.Errorf("failed run Outcome: want %q, got %q", report.OutcomeFailed, fail.Outcome)
+	}
+}
+
+func TestJSON_KillPresentOnlyWhenReaped(t *testing.T) {
+	// Non-reaped: kill omitted, outcome present.
+	clean := report.New("linux", "b", "img", "v", fixedTime)
+	clean.Finalize(fixedTime.Add(time.Second))
+	cb, _ := json.Marshal(clean)
+	var cm map[string]any
+	json.Unmarshal(cb, &cm)
+	if _, ok := cm["kill"]; ok {
+		t.Error("non-reaped report should omit the kill key")
+	}
+	if cm["outcome"] != "passed" {
+		t.Errorf("outcome: want passed, got %v", cm["outcome"])
+	}
+
+	// Reaped: kill present with reason + reaped_by.
+	reaped := report.New("linux", "b", "img", "v", fixedTime)
+	reaped.MarkReaped(fixedTime.Add(time.Second), report.KillRecord{
+		Reason:   report.KillReasonHardCap,
+		ReapedBy: report.ReapedByExternal,
+	})
+	rb, _ := json.Marshal(reaped)
+	var rm map[string]any
+	json.Unmarshal(rb, &rm)
+	if rm["outcome"] != "reaped" {
+		t.Errorf("outcome: want reaped, got %v", rm["outcome"])
+	}
+	kill, ok := rm["kill"].(map[string]any)
+	if !ok {
+		t.Fatalf("reaped report should carry a kill object, got %v", rm["kill"])
+	}
+	if kill["reason"] != "hard_cap" || kill["reaped_by"] != "external" {
+		t.Errorf("kill: want reason=hard_cap reaped_by=external, got %v", kill)
+	}
+}
+
+func TestOutcomeValues(t *testing.T) {
+	cases := map[report.Outcome]string{
+		report.OutcomePassed:     "passed",
+		report.OutcomeFailed:     "failed",
+		report.OutcomeReaped:     "reaped",
+		report.OutcomeInfraError: "infra_error",
+	}
+	for got, want := range cases {
+		if string(got) != want {
+			t.Errorf("Outcome value: got %q, want %q", string(got), want)
+		}
 	}
 }

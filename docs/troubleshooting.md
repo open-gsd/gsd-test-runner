@@ -240,3 +240,39 @@ Run with `--json-events` for structured output that is easier to pipe and grep:
 ```bash
 gsd-test --json-events 2>&1 | grep '"kind":"leg_failure"'
 ```
+
+---
+
+## A run comes back `"outcome": "reaped"`
+
+**Error**
+
+```json
+{ "outcome": "reaped", "kill": { "reason": "estimate_overrun", "last_active_test": { "file": "db.test.js", "name": "reconnects" } } }
+```
+
+**Cause**
+
+A `gsd-test submit` run exceeded its deadline and the watchdog killed it. This is a loud, intended result — not a crash. `kill.reason` is `estimate_overrun` (ran past `estimate × overrunFactor`), `hard_cap` (hit the one-hour ceiling), or `external_reaper` (the in-container watchdog wedged and the Engine killed the container).
+
+**Solution**
+
+Read `kill.last_active_test` — that is the test that was running when the deadline fired. Fix the runaway (a leaked timer, socket, or infinite loop) rather than raising the estimate. If the same test reaps across runs, it is on your [runaway leaderboard](run-and-die-how-to.md#how-to-see-your-repeat-offenders). If the run was *not* actually runaway, your estimate is too low — raise `budget.estimateMs`. See the [run-and-die how-to guides](run-and-die-how-to.md).
+
+---
+
+## submit --execute: image version mismatch
+
+**Error**
+
+```text
+submit --execute: image ghcr.io/open-gsd/gsd-tester-linux version mismatch: want "v1.4.0", got "v1.3.0"
+```
+
+**Cause**
+
+The Tester Image present on the Bench carries a different `sh.gsd-test.image-version` sentinel than the version configured for this target in `[versions]`. The run was stopped before starting so a stale image cannot silently produce wrong results.
+
+**Solution**
+
+Pull or rebuild the Tester Image for that target so its version matches `[versions].<os>` in your config, or update the configured version. See [Configuration Reference](configuration.md) and [Setting up Benches](benches.md).
