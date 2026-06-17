@@ -19,6 +19,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -44,6 +45,7 @@ import (
 	"github.com/open-gsd/gsd-test-runner/internal/report"
 	"github.com/open-gsd/gsd-test-runner/internal/runrender"
 	"github.com/open-gsd/gsd-test-runner/internal/runspec"
+	"github.com/open-gsd/gsd-test-runner/internal/runstate"
 	"github.com/open-gsd/gsd-test-runner/internal/telemetry"
 	"github.com/open-gsd/gsd-test-runner/internal/worktree"
 )
@@ -62,6 +64,16 @@ const (
 	exitSomeFailed   = 1
 	exitInconclusive = 2
 )
+
+// spawnFunc launches a detached worker process and returns its PID.
+// The real implementation lives in spawn_unix.go / spawn_other.go; tests
+// inject a fake to avoid spawning real processes (ADR-0022 Decision 3, #70).
+type spawnFunc func(runID, configPath string) (pid int, err error)
+
+// defaultSpawn is the package-level spawn seam. Tests override and restore it
+// with defer. The real value is set to realSpawn (defined in spawn_unix.go or
+// spawn_other.go depending on build tags).
+var defaultSpawn spawnFunc = realSpawn
 
 // cliFlags holds the parsed CLI flag values.
 type cliFlags struct {
@@ -132,6 +144,24 @@ func run(args []string, stdout, stderr *os.File) int {
 	// ADR-0022 Decision 5).
 	if len(args) > 0 && args[0] == "install-agent-hooks" {
 		return runInstallHooks(args[1:], stdout, stderr)
+	}
+
+	// `wait` blocks until an async run completes, then renders its verdict
+	// (ADR-0022 Decision 3, issue #70).
+	if len(args) > 0 && args[0] == "wait" {
+		return waitRun(args[1:], stdout, stderr)
+	}
+
+	// `status` reports whether an async run is in-flight or done, without
+	// blocking (ADR-0022 Decision 3, issue #70).
+	if len(args) > 0 && args[0] == "status" {
+		return statusRun(args[1:], stdout, stderr)
+	}
+
+	// `__run-worker` is the internal detached worker entry point. It is not
+	// documented in help text; it is invoked exclusively by realSpawn.
+	if len(args) > 0 && args[0] == "__run-worker" {
+		return runWorker(args[1:], stdout, stderr)
 	}
 
 	flags, err := parseFlags(args)
@@ -348,12 +378,22 @@ func runSubmit(args []string, stdout, stderr *os.File) int {
 // repo + passed test patterns, dispatches it to a Bench via dispatchRun, and
 // renders the result as node:test-style output + exit code. Positional args are
 // treated as test path patterns; flags configure target, config, and estimate.
+// runRun implements `gsd-test run`: the explicit wrapper agents call instead of
+// `node --test` (issue #67, ADR-0022). It builds a run spec from the current
+// repo + passed test patterns, dispatches it to a Bench via dispatchRun, and
+// renders the result as node:test-style output + exit code. Positional args are
+// treated as test path patterns; flags configure target, config, and estimate.
+//
+// When --async is set, delegation is immediate: a detached worker process is
+// spawned and the function returns exit 0 after printing a dispatched-notice
+// (ADR-0022 Decision 3, issue #70).
 func runRun(args []string, stdout, stderr *os.File) int {
 	fs := flag.NewFlagSet("gsd-test run", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	target := fs.String("target", "linux", "target OS: linux | windows | macos-container")
 	configPath := fs.String("config", "", "path to config.toml")
 	estimateMs := fs.Int64("estimate-ms", 0, "expected suite duration in ms (tightens the watchdog deadline)")
+	async := fs.Bool("async", false, "submit and return immediately; use `gsd-test wait <run-id>` to collect the result")
 	if err := fs.Parse(args); err != nil {
 		return exitInconclusive
 	}
@@ -389,6 +429,10 @@ func runRun(args []string, stdout, stderr *os.File) int {
 		spec.RunID = id
 	}
 
+	if *async {
+		return runAsync(*spec, *configPath, stdout, stderr, defaultSpawn)
+	}
+
 	// Notify the caller the handoff is happening (ADR-0022 Decision 4) so it does
 	// not re-run locally or treat the wait as a hang.
 	fmt.Fprintf(stderr, "↪ gsd-test: handed off to Docker (run-id=%s, target=%s) — do not re-run locally\n", spec.RunID, spec.Target)
@@ -401,6 +445,183 @@ func runRun(args []string, stdout, stderr *os.File) int {
 	text, code := runrender.Render(rep)
 	fmt.Fprint(stdout, text)
 	return code
+}
+
+// runAsync handles `gsd-test run --async` (ADR-0022 Decision 3, issue #70).
+// It writes initial runstate, spawns a detached worker via spawn, prints a
+// dispatched-notice to stdout, and returns exit 0 immediately. The run
+// continues in the worker process; use `gsd-test wait <run-id>` to collect
+// the result.
+func runAsync(spec runspec.Spec, configPath string, stdout, stderr *os.File, spawn spawnFunc) int {
+	now := time.Now().UTC()
+	st := runstate.State{
+		RunID:     spec.RunID,
+		Target:    spec.Target,
+		Repo:      spec.Repo,
+		Status:    runstate.StatusRunning,
+		StartedAt: now,
+		UpdatedAt: now,
+		Spec:      spec,
+	}
+	if err := runstate.Save(st); err != nil {
+		fmt.Fprintf(stderr, "run --async: save initial state: %v\n", err)
+		return exitInconclusive
+	}
+
+	pid, err := spawn(spec.RunID, configPath)
+	if err != nil {
+		fmt.Fprintf(stderr, "run --async: spawn worker: %v\n", err)
+		// Mark the state as done/failed so status/wait don't hang.
+		st.Status = runstate.StatusDone
+		st.ExitCode = exitInconclusive
+		st.Err = fmt.Sprintf("spawn failed: %v", err)
+		st.UpdatedAt = time.Now().UTC()
+		_ = runstate.Save(st) // best-effort
+		return exitInconclusive
+	}
+
+	// Record the worker PID (best-effort; a subsequent Load will use it for
+	// liveness checks in waitRun).
+	st.PID = pid
+	st.UpdatedAt = time.Now().UTC()
+	_ = runstate.Save(st) // best-effort: if this fails the pid is just 0
+
+	fmt.Fprintf(stdout, "dispatched run-id=%s  (use `gsd-test wait %s` to collect the result, `gsd-test status %s` to check progress)\n",
+		spec.RunID, spec.RunID, spec.RunID)
+	return exitAllPass
+}
+
+// runWorker implements the hidden `gsd-test __run-worker` subcommand
+// (ADR-0022 Decision 3, issue #70). It is invoked exclusively by realSpawn
+// as a detached process. It loads the runstate, calls dispatchRun, and writes
+// the final state (done + Report or done + Err) before exiting.
+func runWorker(args []string, stdout, stderr *os.File) int {
+	fs := flag.NewFlagSet("gsd-test __run-worker", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	runID := fs.String("run-id", "", "run id (required)")
+	configPath := fs.String("config", "", "path to config.toml")
+	if err := fs.Parse(args); err != nil {
+		return exitInconclusive
+	}
+	if *runID == "" {
+		fmt.Fprintln(stderr, "__run-worker: --run-id is required")
+		return exitInconclusive
+	}
+
+	st, err := runstate.Load(*runID)
+	if err != nil {
+		fmt.Fprintf(stderr, "__run-worker: load state for %s: %v\n", *runID, err)
+		return exitInconclusive
+	}
+
+	rep, ok := dispatchRun(st.Spec, *configPath, "run --async", stderr)
+	st.UpdatedAt = time.Now().UTC()
+	if ok {
+		_, code := runrender.Render(rep)
+		st.Report = &rep
+		st.ExitCode = code
+		st.Status = runstate.StatusDone
+	} else {
+		st.Status = runstate.StatusDone
+		st.ExitCode = exitInconclusive
+		st.Err = "dispatch failed"
+	}
+	if saveErr := runstate.Save(st); saveErr != nil {
+		fmt.Fprintf(stderr, "__run-worker: save final state: %v\n", saveErr)
+	}
+	return st.ExitCode
+}
+
+// waitRun implements `gsd-test wait <run-id>` (ADR-0022 Decision 3, issue #70).
+// It polls until the run reaches Status=done, then renders the verdict identically
+// to a blocking `gsd-test run`. It never renders a partial result.
+func waitRun(args []string, stdout, stderr *os.File) int {
+	if len(args) == 0 {
+		fmt.Fprintln(stderr, "wait: usage: gsd-test wait <run-id>")
+		return exitInconclusive
+	}
+	runID := args[0]
+
+	st, err := runstate.Load(runID)
+	if err != nil {
+		if isErrNotFound(err) {
+			fmt.Fprintf(stderr, "wait: unknown run-id %s\n", runID)
+			return exitInconclusive
+		}
+		fmt.Fprintf(stderr, "wait: load state: %v\n", err)
+		return exitInconclusive
+	}
+
+	// Poll until done.
+	for st.Status == runstate.StatusRunning {
+		time.Sleep(200 * time.Millisecond)
+
+		// Liveness guard: if the worker PID is no longer alive and the run is
+		// still marked running, the worker died without writing a final state.
+		if st.PID > 0 && !workerPIDAlive(st.PID) {
+			fmt.Fprintf(stderr, "wait: worker for run-id %s is gone (no result written)\n", runID)
+			return exitInconclusive
+		}
+
+		st, err = runstate.Load(runID)
+		if err != nil {
+			fmt.Fprintf(stderr, "wait: reload state: %v\n", err)
+			return exitInconclusive
+		}
+	}
+
+	if st.Err != "" {
+		fmt.Fprintf(stderr, "wait: run %s failed: %s\n", runID, st.Err)
+		return exitInconclusive
+	}
+	if st.Report == nil {
+		fmt.Fprintf(stderr, "wait: run %s has no report\n", runID)
+		return exitInconclusive
+	}
+
+	text, code := runrender.Render(*st.Report)
+	fmt.Fprint(stdout, text)
+	return code
+}
+
+// statusRun implements `gsd-test status <run-id>` (ADR-0022 Decision 3, issue #70).
+// It reports in-flight vs done WITHOUT blocking. Exit is always 0 when the run-id
+// is found — status is a pure reporter and must not itself fail because the run
+// failed.
+func statusRun(args []string, stdout, stderr *os.File) int {
+	if len(args) == 0 {
+		fmt.Fprintln(stderr, "status: usage: gsd-test status <run-id>")
+		return exitInconclusive
+	}
+	runID := args[0]
+
+	st, err := runstate.Load(runID)
+	if err != nil {
+		if isErrNotFound(err) {
+			fmt.Fprintf(stderr, "status: unknown run-id %s\n", runID)
+			return exitInconclusive
+		}
+		fmt.Fprintf(stderr, "status: load state: %v\n", err)
+		return exitInconclusive
+	}
+
+	switch st.Status {
+	case runstate.StatusRunning:
+		fmt.Fprintf(stdout, "state=running run-id=%s pid=%d\n", runID, st.PID)
+	default: // done
+		outcome := "infra_error"
+		if st.Report != nil {
+			outcome = string(st.Report.Outcome)
+		}
+		fmt.Fprintf(stdout, "state=done run-id=%s exit=%d outcome=%s\n", runID, st.ExitCode, outcome)
+	}
+	return exitAllPass
+}
+
+// isErrNotFound reports whether err wraps runstate.ErrNotFound.
+func isErrNotFound(err error) bool {
+	// Use errors.Is for proper sentinel unwrapping.
+	return errors.Is(err, runstate.ErrNotFound)
 }
 
 // repoRoot returns the git toplevel of the current directory, falling back to
