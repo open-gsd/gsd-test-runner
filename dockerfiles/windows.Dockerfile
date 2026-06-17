@@ -31,4 +31,7 @@ COPY reporter/reporter.mjs C:/opt/gsd-test/reporter.mjs
 # container-level kill is the cross-platform backstop (ADR-0021 Decision 4).
 COPY reporter/watchdog.mjs C:/opt/gsd-test/watchdog.mjs
 
+# Run-and-die entry script (Windows). npm ci + build then the watchdog.
+COPY reporter/run-and-die.cmd C:/opt/gsd-test/run-and-die.cmd
+
 WORKDIR C:/work

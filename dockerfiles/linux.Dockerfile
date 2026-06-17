@@ -34,6 +34,11 @@ COPY reporter/reporter.mjs /opt/gsd-test/reporter.mjs
 # This path is contractual, like the reporter path above.
 COPY reporter/watchdog.mjs /opt/gsd-test/watchdog.mjs
 
+# Run-and-die entry script: runs npm ci + build (when a package.json is present)
+# then exec-s the watchdog, so the deadline times only the test phase (ADR-0021).
+COPY reporter/run-and-die.sh /opt/gsd-test/run-and-die.sh
+RUN chmod +x /opt/gsd-test/run-and-die.sh
+
 # Working directory matches Local Engine's CopyWorktree target (/work).
 # Container is started idle (sleep infinity per Pipeline.StartContainer);
 # legs docker exec into this WORKDIR.

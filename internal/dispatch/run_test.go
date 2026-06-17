@@ -57,8 +57,8 @@ func TestRun_ReapedEnvelopeMapsToReapedReport(t *testing.T) {
 	// The assembled command must run the watchdog with the effective deadline,
 	// wrapping the hardened node --test.
 	joined := strings.Join(got, " ")
-	if !strings.Contains(joined, "/opt/gsd-test/watchdog.mjs") {
-		t.Errorf("command did not invoke the watchdog: %v", got)
+	if !strings.Contains(joined, dispatch.EntryScriptLinux) {
+		t.Errorf("command did not invoke the entry script: %v", got)
 	}
 	if !strings.Contains(joined, "--deadline-ms 180000") {
 		t.Errorf("command missing effective deadline: %v", got)
@@ -106,5 +106,27 @@ func TestRun_NoneIsolationStampsGranularity(t *testing.T) {
 	}
 	if !strings.Contains(strings.Join(got, " "), "--granularity process") {
 		t.Errorf("isolation=none must pass --granularity process to the watchdog: %v", got)
+	}
+}
+
+func TestInContainerCommand_EntryScriptThenWatchdog(t *testing.T) {
+	got := dispatch.InContainerCommand(specFor("linux"), 180000)
+	if got[0] != dispatch.EntryScriptLinux {
+		t.Errorf("entry = %q, want %q (orchestrates npm ci/build then the watchdog)", got[0], dispatch.EntryScriptLinux)
+	}
+	joined := strings.Join(got, " ")
+	if !strings.Contains(joined, "--deadline-ms 180000") {
+		t.Errorf("missing watchdog deadline: %v", got)
+	}
+	// The test command appears after the watchdog's "--" separator.
+	if !strings.Contains(joined, "-- node --test") {
+		t.Errorf("test command not wrapped after --: %v", got)
+	}
+}
+
+func TestInContainerCommand_WindowsEntryScript(t *testing.T) {
+	got := dispatch.InContainerCommand(specFor("windows"), 60000)
+	if got[0] != dispatch.EntryScriptWindows {
+		t.Errorf("entry = %q, want %q", got[0], dispatch.EntryScriptWindows)
 	}
 }

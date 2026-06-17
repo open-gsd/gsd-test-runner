@@ -15,6 +15,24 @@ import (
 // watchdog to (see dockerfiles/*.Dockerfile).
 const WatchdogPath = "/opt/gsd-test/watchdog.mjs"
 
+// Entry scripts baked into the Tester Images. The entry script runs `npm ci`
+// and `npm run build` (when a package.json is present) BEFORE exec-ing the
+// watchdog, so the watchdog deadline times only the test phase (ADR-0021
+// Decision 1). It is liberal about missing package.json / build script but
+// aborts loudly if `npm ci` fails (Postel's robustness principle, applied
+// visibly).
+const (
+	EntryScriptLinux   = "/opt/gsd-test/run-and-die.sh"
+	EntryScriptWindows = "C:/opt/gsd-test/run-and-die.cmd"
+)
+
+func entryScript(target string) string {
+	if target == "windows" {
+		return EntryScriptWindows
+	}
+	return EntryScriptLinux
+}
+
 // envelope mirrors the JSON the watchdog (reporter/watchdog.mjs) prints. Field
 // names are the watchdog's camelCase, distinct from report's snake_case.
 type envelope struct {
@@ -45,7 +63,9 @@ type envelope struct {
 // isolation=none it passes --granularity process so the kill record marks
 // attribution best-effort (Decision 5).
 func InContainerCommand(spec runspec.Spec, effectiveDeadlineMs int64) []string {
-	cmd := []string{"node", WatchdogPath, "--deadline-ms", fmt.Sprint(effectiveDeadlineMs)}
+	// The entry script installs deps + builds, then exec-s the watchdog with
+	// these args (so the deadline covers only the test phase).
+	cmd := []string{entryScript(spec.Target), "--deadline-ms", fmt.Sprint(effectiveDeadlineMs)}
 	if spec.Isolation == runspec.IsolationNone {
 		cmd = append(cmd, "--granularity", "process")
 	}

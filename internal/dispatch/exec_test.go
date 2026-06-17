@@ -51,7 +51,7 @@ func TestExec_CopyInSequence(t *testing.T) {
 		t.Errorf("call 0 verb = %q, want create", r.calls[0][0])
 	}
 	if !strings.Contains(create, "--rm") || !strings.Contains(create, "img:v2") ||
-		!strings.Contains(create, "/opt/gsd-test/watchdog.mjs") {
+		!strings.Contains(create, dispatch.EntryScriptLinux) {
 		t.Errorf("create args incomplete: %v", r.calls[0])
 	}
 

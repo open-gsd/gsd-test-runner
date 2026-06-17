@@ -115,3 +115,45 @@ func TestE2E_CopyIn_WedgeReaped(t *testing.T) {
 		t.Errorf("Kill = %+v, want in_container reap", rep.Kill)
 	}
 }
+
+// TestE2E_CopyIn_NpmCiAndBuild proves the entry script runs `npm ci` and
+// `npm run build` before the tests (ADR-0021 Decision 1). The build writes a
+// file the test imports, so a green run can only happen if both ran first.
+func TestE2E_CopyIn_NpmCiAndBuild(t *testing.T) {
+	requireDocker(t)
+	image := buildTesterImage(t)
+
+	wt := t.TempDir()
+	writeFile := func(name, body string) {
+		if err := os.WriteFile(filepath.Join(wt, name), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeFile("package.json", `{
+  "name": "demo", "version": "1.0.0",
+  "scripts": { "build": "node -e \"require('fs').writeFileSync('built.txt','ok')\"" }
+}`)
+	writeFile("package-lock.json", `{
+  "name": "demo", "version": "1.0.0", "lockfileVersion": 3, "requires": true,
+  "packages": { "": { "name": "demo", "version": "1.0.0" } }
+}`)
+	// Passes only if `npm run build` created built.txt before the tests ran.
+	writeFile("build.test.mjs",
+		"import { test } from 'node:test';\nimport assert from 'node:assert';\nimport { existsSync } from 'node:fs';\n"+
+			"test('build output is present', () => { assert.ok(existsSync('built.txt')); });\n")
+
+	spec := runspec.Spec{
+		RunID: "e2e-ci", Repo: wt, Target: "linux",
+		TestCommand: []string{"node", "--test"},
+		Budget:      runspec.Budget{OverrunFactor: 1.5, HardCapMs: 3600000},
+		Isolation:   runspec.IsolationProcess,
+	}
+	rep, err := dispatch.RunCopyIn(context.Background(), localRunner, spec, image, wt,
+		time.Now().Add(time.Hour).UnixMilli(), 120000, time.Now())
+	if err != nil {
+		t.Fatalf("RunCopyIn: %v", err)
+	}
+	if rep.Outcome != report.OutcomePassed {
+		t.Fatalf("Outcome = %q, want passed (npm ci + build must run before tests)", rep.Outcome)
+	}
+}
