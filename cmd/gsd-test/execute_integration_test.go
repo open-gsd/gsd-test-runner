@@ -144,3 +144,67 @@ func TestE2E_SubmitExecute_SweepsStaleContainer(t *testing.T) {
 		t.Errorf("stale container %s survived; Tier-2 sweep did not run", staleID)
 	}
 }
+
+// hermeticGit runs git in dir with global/system config neutralized.
+func hermeticGit(t *testing.T, dir string, args ...string) {
+	t.Helper()
+	cmd := exec.Command("git", append([]string{"-C", dir}, args...)...)
+	cmd.Env = append(os.Environ(), "GIT_CONFIG_GLOBAL="+os.DevNull, "GIT_CONFIG_SYSTEM="+os.DevNull)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git %v: %v\n%s", args, err, out)
+	}
+}
+
+// TestE2E_SubmitExecute_PRMergedWorktree proves the {base, prBranch} form: the
+// Engine builds a PR-merged worktree from the source repo and runs it, so the
+// PR branch's added test executes (ADR-0021 §A).
+func TestE2E_SubmitExecute_PRMergedWorktree(t *testing.T) {
+	ensureTesterImage(t)
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	dir := t.TempDir()
+
+	src := filepath.Join(dir, "src")
+	if err := os.MkdirAll(src, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	write := func(name, body string) {
+		if err := os.WriteFile(filepath.Join(src, name), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// main: a base test.
+	hermeticGit(t, src, "init", "-b", "main")
+	hermeticGit(t, src, "config", "user.email", "t@example.com")
+	hermeticGit(t, src, "config", "user.name", "T")
+	hermeticGit(t, src, "config", "commit.gpgsign", "false")
+	write("base.test.mjs", "import { test } from 'node:test';\ntest('base ok', () => {});\n")
+	hermeticGit(t, src, "add", ".")
+	hermeticGit(t, src, "commit", "-m", "base")
+	// feat: adds a PR test.
+	hermeticGit(t, src, "checkout", "-b", "feat")
+	write("pr.test.mjs", "import { test } from 'node:test';\ntest('pr feature works', () => {});\n")
+	hermeticGit(t, src, "add", ".")
+	hermeticGit(t, src, "commit", "-m", "pr")
+	hermeticGit(t, src, "checkout", "main")
+
+	cfgPath := filepath.Join(dir, "config.toml")
+	if err := os.WriteFile(cfgPath, []byte("[defaults]\ntargets=[\"linux\"]\n\n[[benches]]\nname=\"local\"\nhost=\"local\"\nos=\"linux\"\n\n[versions]\nlinux=\"e2e\"\n\n[testing]\ncommand=\"node --test\"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	specPath := filepath.Join(dir, "spec.json")
+	if err := os.WriteFile(specPath, []byte(`{"repo":"`+src+`","target":"linux","base":"main","prBranch":"feat"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	rOut, wOut, _ := os.Pipe()
+	code := run([]string{"submit", "--execute", "--config", cfgPath, "--spec-file", specPath}, wOut, os.Stderr)
+	wOut.Close()
+	out := readPipe(rOut)
+	if code != 0 {
+		t.Fatalf("exit = %d, want 0; output:\n%s", code, out)
+	}
+	// The PR branch's test must have run in the merged worktree.
+	if !strings.Contains(out, "pr feature works") {
+		t.Errorf("PR test did not run in the merged worktree; per_test:\n%s", out)
+	}
+}

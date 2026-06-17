@@ -107,6 +107,14 @@ func (b Budget) EffectiveDeadlineMs(telemetryMedianMs int64) int64 {
 	return deadline
 }
 
+// Telemetry configures per-run telemetry sampling (ADR-0021 §A/§F). Zero values
+// disable sampling. SampleHandlesMs is the open-handle sampling interval;
+// CaptureStacks requests stack capture for leaked handles.
+type Telemetry struct {
+	SampleHandlesMs int64 `json:"sampleHandlesMs"`
+	CaptureStacks   bool  `json:"captureStacks"`
+}
+
 // Spec is a validated run spec.
 type Spec struct {
 	RunID            string            `json:"runId"`
@@ -118,6 +126,13 @@ type Spec struct {
 	Budget           Budget            `json:"budget"`
 	Isolation        Isolation         `json:"isolation"`
 	Concurrency      *int              `json:"concurrency"`
+	Telemetry        Telemetry         `json:"telemetry"`
+
+	// Base and PRBranch, when both set, ask the Engine to construct a PR-merged
+	// worktree from Repo (resolve Base + PRBranch, merge) and run that, instead
+	// of running Repo as-is. Both must be set together (ADR-0021 §A).
+	Base     string `json:"base"`
+	PRBranch string `json:"prBranch"`
 }
 
 // Parse unmarshals a JSON run spec, applies ADR-0021 defaults, and returns the
@@ -162,6 +177,12 @@ func (s *Spec) validate() error {
 	}
 	if s.Isolation != IsolationProcess && s.Isolation != IsolationNone {
 		return &InvalidSpecError{Field: "isolation", Reason: fmt.Sprintf("must be \"process\" or \"none\"; got %q", s.Isolation)}
+	}
+	if (s.Base == "") != (s.PRBranch == "") {
+		return &InvalidSpecError{Field: "prBranch", Reason: "base and prBranch must be set together to build a PR-merged worktree"}
+	}
+	if s.Telemetry.SampleHandlesMs < 0 {
+		return &InvalidSpecError{Field: "telemetry.sampleHandlesMs", Reason: fmt.Sprintf("must be >= 0; got %d", s.Telemetry.SampleHandlesMs)}
 	}
 	return nil
 }

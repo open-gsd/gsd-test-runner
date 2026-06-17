@@ -199,3 +199,44 @@ func TestBudget_EffectiveDeadline_Cases(t *testing.T) {
 		})
 	}
 }
+
+func TestParse_BaseAndPRBranch(t *testing.T) {
+	spec, err := Parse([]byte(`{"repo":"/src","target":"linux","base":"main","prBranch":"feat/x"}`))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if spec.Base != "main" || spec.PRBranch != "feat/x" {
+		t.Errorf("base/prBranch = %q/%q, want main/feat/x", spec.Base, spec.PRBranch)
+	}
+}
+
+func TestParse_OnlyOneOfBasePRBranchRejected(t *testing.T) {
+	for _, body := range []string{
+		`{"repo":"/src","target":"linux","base":"main"}`,
+		`{"repo":"/src","target":"linux","prBranch":"feat/x"}`,
+	} {
+		_, err := Parse([]byte(body))
+		var invalid *InvalidSpecError
+		if !errors.As(err, &invalid) {
+			t.Errorf("Parse(%s) err = %v, want *InvalidSpecError", body, err)
+		}
+	}
+}
+
+func TestParse_TelemetryField(t *testing.T) {
+	spec, err := Parse([]byte(`{"repo":"/w","target":"linux","telemetry":{"sampleHandlesMs":5000,"captureStacks":true}}`))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if spec.Telemetry.SampleHandlesMs != 5000 || !spec.Telemetry.CaptureStacks {
+		t.Errorf("Telemetry = %+v, want {5000 true}", spec.Telemetry)
+	}
+}
+
+func TestParse_NegativeSampleHandlesRejected(t *testing.T) {
+	_, err := Parse([]byte(`{"repo":"/w","target":"linux","telemetry":{"sampleHandlesMs":-1}}`))
+	var invalid *InvalidSpecError
+	if !errors.As(err, &invalid) || invalid.Field != "telemetry.sampleHandlesMs" {
+		t.Errorf("err = %v, want InvalidSpecError on telemetry.sampleHandlesMs", err)
+	}
+}

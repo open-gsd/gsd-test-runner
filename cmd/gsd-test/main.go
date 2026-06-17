@@ -396,11 +396,41 @@ func executeSpec(spec runspec.Spec, configPath string, stdout, stderr *os.File) 
 	history, _ := telemetry.Load(telemetryPath) // missing log is normal; best-effort
 	median := telemetry.MedianDurationMs(history, spec.Target)
 
+	// Worktree: run Repo as-is, unless base+prBranch ask for a PR-merged
+	// worktree built from Repo (ADR-0021 §A, reusing refs.Resolve + worktree).
+	worktreeDir := spec.Repo
+	if spec.Base != "" {
+		baseSHA, rerr := refs.Resolve(ctx, spec.Repo, spec.Base)
+		if rerr != nil {
+			fmt.Fprintf(stderr, "submit --execute: resolve base %q: %v\n", spec.Base, rerr)
+			return exitInconclusive
+		}
+		headSHA, rerr := refs.Resolve(ctx, spec.Repo, spec.PRBranch)
+		if rerr != nil {
+			fmt.Fprintf(stderr, "submit --execute: resolve prBranch %q: %v\n", spec.PRBranch, rerr)
+			return exitInconclusive
+		}
+		scratch, mkErr := os.MkdirTemp("", "gsd-submit-")
+		if mkErr != nil {
+			fmt.Fprintf(stderr, "submit --execute: scratch dir: %v\n", mkErr)
+			return exitInconclusive
+		}
+		wt, wErr := worktree.Construct(ctx, worktree.Options{
+			SourceRepo: spec.Repo, BaseSHA: baseSHA, PRSHA: headSHA, ScratchDir: scratch,
+		})
+		if wErr != nil {
+			fmt.Fprintf(stderr, "submit --execute: worktree.Construct: %v\n", wErr)
+			return exitInconclusive
+		}
+		defer wt.Close()
+		worktreeDir = wt.Path()
+	}
+
 	now := time.Now()
 	eff := spec.Budget.EffectiveDeadlineMs(median)
 	deadlineEpochMs := now.Add(time.Duration(eff) * time.Millisecond).UnixMilli()
 
-	rep, err := dispatch.RunCopyIn(ctx, runner, spec, string(imageID), spec.Repo, deadlineEpochMs, eff, now)
+	rep, err := dispatch.RunCopyIn(ctx, runner, spec, string(imageID), worktreeDir, deadlineEpochMs, eff, now)
 	if err != nil {
 		fmt.Fprintf(stderr, "submit --execute: run: %v\n", err)
 		return exitInconclusive
