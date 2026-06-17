@@ -216,7 +216,7 @@ cat > "$DEST_BIN/gsd-test" <<'__GSDTEST_END__'
 #   gsd-test                            # all tests, auto-pick host
 #   gsd-test --host plex2               # pin a host
 #   gsd-test tests/foo.test.cjs         # run specific test file(s)
-#   gsd-test --no-build                 # skip build:sdk
+#   gsd-test --no-build                 # skip build
 #   gsd-test --reset                    # wipe mirror + npm cache
 #   gsd-test --verbose                  # forward npm/build chatter to stderr
 #   gsd-test --quiet                    # suppress progress lines
@@ -228,7 +228,8 @@ CONFIG_DIR="$HOME/.config/gsd-test"
 HOSTS_FILE="$CONFIG_DIR/hosts"
 REPORTER="$HOME/.local/share/gsd-test/reporter.mjs"
 IMAGE="gsd-test:node22"
-MIRROR_DIR="gsd-mirror-get-shit-done"
+# MIRROR_DIR is derived per-project from $PROJECT_DIR below (issue #58) so
+# concurrent runs from different worktrees/projects never share a mirror tree.
 NPM_CACHE_VOLUME="gsd-npm-cache"
 
 PINNED_HOST=""
@@ -244,7 +245,7 @@ Usage:
   gsd-test                            run all tests, auto-pick a host
   gsd-test --host <name>              pin to a host from your hosts file
   gsd-test tests/foo.test.cjs ...     run specific test file(s)
-  gsd-test --no-build                 skip npm run build:sdk
+  gsd-test --no-build                 skip npm run build
   gsd-test --reset                    wipe remote mirror + npm cache
   gsd-test --verbose                  forward npm/build chatter to stderr
   gsd-test --quiet                    suppress progress messages
@@ -289,6 +290,13 @@ if [[ ! -f "$PROJECT_DIR/package.json" ]]; then
   echo "ERROR: no package.json at $PROJECT_DIR — run from inside a Node project." >&2
   exit 2
 fi
+
+# Per-project mirror dir (issue #58). A run rsyncs --delete then npm ci/builds
+# into this tree while reading it; a single host-wide constant meant two
+# concurrent runs (e.g. from different git worktrees) clobbered each other,
+# producing partial .cjs reads (`subcommands undefined`). Hashing $PROJECT_DIR
+# gives every working tree its own mirror; the npm cache volume stays shared.
+MIRROR_DIR="gsd-mirror-$(printf '%s' "$PROJECT_DIR" | { shasum -a 256 2>/dev/null || sha256sum; } | cut -c1-12)"
 
 pick_host() {
   if [[ -n "$PINNED_HOST" ]]; then
@@ -357,10 +365,10 @@ rsync -az --delete --force \
 if $VERBOSE; then NPM_FLAGS=""; else NPM_FLAGS="--silent"; fi
 
 if $SKIP_BUILD; then
-  BUILD_BLOCK="echo '» skipping build:sdk + lint:skill-deps (--no-build)' 1>&2"
+  BUILD_BLOCK="echo '» skipping build + lint:skill-deps (--no-build)' 1>&2"
 else
-  BUILD_BLOCK="echo '» build:sdk...' 1>&2
-npm run build:sdk --if-present $NPM_FLAGS 1>&2
+  BUILD_BLOCK="echo '» build...' 1>&2
+npm run build --if-present $NPM_FLAGS 1>&2
 echo '» lint:skill-deps...' 1>&2
 npm run lint:skill-deps --if-present $NPM_FLAGS 1>&2"
 fi
@@ -540,7 +548,7 @@ cat > "$DEST_BIN/gsd-test-windows" <<'__GSDWINDOWS_END__'
 #   gsd-test-windows                            # all tests
 #   gsd-test-windows --host winhost1            # pin a host
 #   gsd-test-windows tests/foo.test.cjs         # run specific test file(s)
-#   gsd-test-windows --no-build                 # skip build:sdk
+#   gsd-test-windows --no-build                 # skip build
 #   gsd-test-windows --reset                    # wipe mirror
 #   gsd-test-windows --verbose                  # forward npm/build chatter to stderr
 #   gsd-test-windows --quiet                    # suppress progress lines
@@ -551,7 +559,8 @@ set -euo pipefail
 CONFIG_DIR="$HOME/.config/gsd-test"
 WINDOWS_HOSTS_FILE="$CONFIG_DIR/windows-hosts"
 IMAGE="gsd-test:node22-win"
-MIRROR_DIR="gsd-mirror-get-shit-done"
+# MIRROR_DIR is derived per-project from $PROJECT_DIR below (issue #58) so
+# concurrent runs from different worktrees/projects never share a mirror tree.
 NPM_CACHE_VOLUME="gsd-npm-cache-win"
 
 PINNED_HOST=""
@@ -567,7 +576,7 @@ Usage:
   gsd-test-windows                        run all tests, auto-pick a host
   gsd-test-windows --host <name>          pin to a specific host
   gsd-test-windows tests/foo.test.cjs     run specific test file(s)
-  gsd-test-windows --no-build             skip npm run build:sdk
+  gsd-test-windows --no-build             skip npm run build
   gsd-test-windows --reset                wipe remote mirror
   gsd-test-windows --verbose              forward npm/build chatter to stderr
   gsd-test-windows --quiet                suppress progress messages
@@ -613,6 +622,13 @@ if [[ ! -f "$PROJECT_DIR/package.json" ]]; then
   echo "ERROR: no package.json at $PROJECT_DIR — run from inside a Node project." >&2
   exit 2
 fi
+
+# Per-project mirror dir (issue #58). A run rsyncs --delete then npm ci/builds
+# into this tree while reading it; a single host-wide constant meant two
+# concurrent runs (e.g. from different git worktrees) clobbered each other,
+# producing partial .cjs reads (`subcommands undefined`). Hashing $PROJECT_DIR
+# gives every working tree its own mirror; the npm cache volume stays shared.
+MIRROR_DIR="gsd-mirror-$(printf '%s' "$PROJECT_DIR" | { shasum -a 256 2>/dev/null || sha256sum; } | cut -c1-12)"
 
 pick_host() {
   if [[ -n "$PINNED_HOST" ]]; then
@@ -662,10 +678,10 @@ rsync -az --delete --force \
 if $VERBOSE; then NPM_FLAGS=""; else NPM_FLAGS="--silent"; fi
 
 if $SKIP_BUILD; then
-  BUILD_BLOCK='Write-Host "» skipping build:sdk + lint:skill-deps (--no-build)" -ForegroundColor Cyan'
+  BUILD_BLOCK='Write-Host "» skipping build + lint:skill-deps (--no-build)" -ForegroundColor Cyan'
 else
-  BUILD_BLOCK='Write-Host "» build:sdk..." -ForegroundColor Cyan
-npm run build:sdk --if-present '"$NPM_FLAGS"' 2>&1 | Out-Host
+  BUILD_BLOCK='Write-Host "» build..." -ForegroundColor Cyan
+npm run build --if-present '"$NPM_FLAGS"' 2>&1 | Out-Host
 Write-Host "» lint:skill-deps..." -ForegroundColor Cyan
 npm run lint:skill-deps --if-present '"$NPM_FLAGS"' 2>&1 | Out-Host'
 fi
@@ -849,7 +865,7 @@ cat > "$DEST_BIN/gsd-test-local" <<'__GSDLOCAL_END__'
 #!/usr/bin/env bash
 # gsd-test-local — run the GSD test suite on this Mac with JSON Lines output.
 #
-# Mirrors npm test's pretest chain (build:sdk + lint:skill-deps) so the
+# Mirrors npm test's pretest chain (build + lint:skill-deps) so the
 # tested code matches what `npm test` would test. Then runs node --test
 # with the shared JSON reporter, producing the same output format as
 # the dockerized runner so they can be diffed.
@@ -857,7 +873,7 @@ cat > "$DEST_BIN/gsd-test-local" <<'__GSDLOCAL_END__'
 # Usage:
 #   gsd-test-local                       all tests
 #   gsd-test-local tests/foo.test.cjs    specific file(s)
-#   gsd-test-local --no-build            skip build:sdk
+#   gsd-test-local --no-build            skip build
 #   gsd-test-local --verbose             forward npm/build chatter to stderr
 #   gsd-test-local --quiet               suppress progress messages
 #   gsd-test-local --help
@@ -910,8 +926,8 @@ if [[ ! -d node_modules ]]; then
 fi
 
 if ! $SKIP_BUILD; then
-  log "build:sdk..."
-  npm run build:sdk --if-present $NPM_FLAGS >&2
+  log "build..."
+  npm run build --if-present $NPM_FLAGS >&2
   log "lint:skill-deps..."
   npm run lint:skill-deps --if-present $NPM_FLAGS >&2
 fi
@@ -942,7 +958,7 @@ cat > "$DEST_BIN/gsd-test-both" <<'__GSDBOTH_END__'
 #
 # Usage:
 #   gsd-test-both                       run all platforms, summarize diff
-#   gsd-test-both --no-build            skip build:sdk on all platforms
+#   gsd-test-both --no-build            skip build on all platforms
 #   gsd-test-both tests/foo.test.cjs    specific file(s) on all platforms
 #
 # Output files (per-invocation PID suffix prevents interleaving when run from
@@ -1571,7 +1587,7 @@ From inside the get-shit-done project:
     gsd-test-windows                    # windows docker only
     gsd-test-local                      # mac only
     gsd-test tests/foo.test.cjs         # single test file on linux docker
-    gsd-test-both --no-build            # skip build:sdk for a faster iteration
+    gsd-test-both --no-build            # skip build for a faster iteration
 
 Output (default): JSON Lines on stdout, progress on stderr.
 With `gsd-test-both`: human diff summary on stdout, progress on stderr.
