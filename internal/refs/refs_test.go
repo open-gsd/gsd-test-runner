@@ -57,10 +57,25 @@ func initRepo(t *testing.T) (repoPath string, shas map[string]string) {
 	}
 }
 
+// hermeticGitEnv returns the process environment with global and system git
+// config neutralized (GIT_CONFIG_GLOBAL/SYSTEM -> os.DevNull). Without this the
+// developer's gitconfig leaks into the test: e.g. tag.gpgSign/forceSignAnnotated
+// promote the lightweight `git tag v0.1-lw` to a signed annotated tag, which
+// then fails with "fatal: no tag message?". Isolation also pins behavior that
+// global config can change (init.defaultBranch, commit.gpgsign), making these
+// tests deterministic on any machine.
+func hermeticGitEnv() []string {
+	return append(os.Environ(),
+		"GIT_CONFIG_GLOBAL="+os.DevNull,
+		"GIT_CONFIG_SYSTEM="+os.DevNull,
+	)
+}
+
 // revParse shells `git -C dir rev-parse <ref>^{commit}` and returns the SHA.
 func revParse(t *testing.T, dir, ref string) string {
 	t.Helper()
 	cmd := exec.Command("git", "-C", dir, "rev-parse", "--verify", ref+"^{commit}")
+	cmd.Env = hermeticGitEnv()
 	out, err := cmd.Output()
 	if err != nil {
 		t.Fatalf("revParse %q in %s: %v", ref, dir, err)
@@ -80,6 +95,7 @@ func writeFile(t *testing.T, dir, name, content string) {
 func gitRun(t *testing.T, dir string, args ...string) {
 	t.Helper()
 	cmd := exec.Command("git", append([]string{"-C", dir}, args...)...)
+	cmd.Env = hermeticGitEnv()
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("git %v: %v\n%s", args, err, out)
