@@ -1,13 +1,15 @@
-// Package report defines the per-OS Report shape (ADR-0013, schema_version=1).
+// Package report defines the per-OS Report shape (ADR-0013, schema_version=2).
 // The Report is produced by the Pipeline after a complete run and consumed by
 // the orchestrator's renderer and by the machine-readable JSONL export.
+// Schema_version 2 adds the reaped Outcome and Kill block (ADR-0021).
 package report
 
 import "time"
 
 // SchemaVersion is the fixed schema version for all Reports produced by this
-// package. Consumers must reject Reports with unknown schema versions.
-const SchemaVersion = 1
+// package. Consumers must reject Reports with unknown schema versions. Bumped
+// to 2 by ADR-0021 Decision 6, which adds the reaped Outcome and Kill block.
+const SchemaVersion = 2
 
 // Kind discriminates a per-OS run outcome.
 type Kind string
@@ -18,6 +20,73 @@ const (
 	// KindFail means at least one test failed (Failures is non-empty).
 	KindFail Kind = "fail"
 )
+
+// Outcome is the richer run result added in schema_version 2 (ADR-0021
+// Decision 6). Unlike Kind (pass/fail), it distinguishes a reaped run — a
+// runaway suite the watchdog or reaper killed — from an ordinary failure, and
+// reserves infra_error for pipeline-leg failures. Always set by Finalize or
+// MarkReaped, so it is never empty on a finalized Report.
+type Outcome string
+
+const (
+	OutcomePassed     Outcome = "passed"
+	OutcomeFailed     Outcome = "failed"
+	OutcomeReaped     Outcome = "reaped"
+	OutcomeInfraError Outcome = "infra_error"
+)
+
+// KillReason explains why a run was reaped (ADR-0021 Decision 1/2).
+type KillReason string
+
+const (
+	// KillReasonEstimateOverrun: elapsed exceeded estimate*overrunFactor.
+	KillReasonEstimateOverrun KillReason = "estimate_overrun"
+	// KillReasonHardCap: elapsed exceeded the absolute 1h ceiling.
+	KillReasonHardCap KillReason = "hard_cap"
+	// KillReasonExternalReaper: the external reaper killed the container,
+	// typically because the in-container watchdog itself wedged.
+	KillReasonExternalReaper KillReason = "external_reaper"
+)
+
+// ReapedBy records which tier performed the kill (ADR-0021 Decision 2/4).
+type ReapedBy string
+
+const (
+	// ReapedByInContainer: Tier 1, the in-container watchdog (precise).
+	ReapedByInContainer ReapedBy = "in_container"
+	// ReapedByExternal: Tier 2, the Local Engine reaping the container.
+	ReapedByExternal ReapedBy = "external"
+)
+
+// ActiveTest names the test that was running when the kill fired.
+type ActiveTest struct {
+	File string `json:"file"`
+	Name string `json:"name"`
+}
+
+// InFlightTest is a test still executing at kill time (process isolation can
+// have several in flight at once).
+type InFlightTest struct {
+	File         string `json:"file"`
+	Name         string `json:"name"`
+	StartedMsAgo int64  `json:"started_ms_ago"`
+}
+
+// KillRecord is the "where it died" evidence attached to a reaped Report
+// (ADR-0021 §C/D). Present only when Outcome == OutcomeReaped.
+type KillRecord struct {
+	Reason              KillReason     `json:"reason"`
+	EffectiveDeadlineMs int64          `json:"effective_deadline_ms"`
+	ElapsedMs           int64          `json:"elapsed_ms"`
+	LastActiveTest      *ActiveTest    `json:"last_active_test,omitempty"`
+	InFlightTests       []InFlightTest `json:"in_flight_tests,omitempty"`
+	ReapedBy            ReapedBy       `json:"reaped_by"`
+	SignalChain         []string       `json:"signal_chain,omitempty"`
+	// Granularity is "process" when the run used isolation=none, signaling that
+	// LastActiveTest/InFlightTests are best-effort, not per-test precise
+	// (ADR-0021 Decision 5). Empty under the default process isolation.
+	Granularity string `json:"granularity,omitempty"`
+}
 
 // ErrorClass classifies the nature of a test failure for machine consumers.
 // The six values below are exhaustive per ADR-0013 decision body.
@@ -86,7 +155,15 @@ type Report struct {
 	SchemaVersion int `json:"schema_version"`
 
 	// Kind is "pass" when Failures is empty, "fail" otherwise. Set by Finalize.
+	// Retained for backward compatibility; Outcome is the richer discriminator.
 	Kind Kind `json:"kind"`
+
+	// Outcome is the schema_version-2 result: passed | failed | reaped |
+	// infra_error (ADR-0021 Decision 6). Set by Finalize or MarkReaped.
+	Outcome Outcome `json:"outcome"`
+
+	// Kill is the kill record, present only when Outcome == OutcomeReaped.
+	Kill *KillRecord `json:"kill,omitempty"`
 
 	// OS is the Bench.OS value ("linux", "windows", "macos-container").
 	OS string `json:"os"`
@@ -128,7 +205,7 @@ type Report struct {
 	Failures []FailedTest `json:"failures"`
 }
 
-// New constructs a Report with SchemaVersion=1 and all run-context fields
+// New constructs a Report with SchemaVersion=2 and all run-context fields
 // populated. Kind is not set until Finalize is called. Caller may subsequently
 // fill Total/Passed/Failed/Failures (the Parse leg does this in slice 3).
 func New(os, bench, imageID, imageVersion string, startedAt time.Time) Report {
@@ -150,7 +227,21 @@ func (r *Report) Finalize(now time.Time) {
 	r.DurationMs = float64(now.Sub(r.StartedAt).Milliseconds())
 	if len(r.Failures) == 0 {
 		r.Kind = KindPass
+		r.Outcome = OutcomePassed
 	} else {
 		r.Kind = KindFail
+		r.Outcome = OutcomeFailed
 	}
+}
+
+// MarkReaped finalizes the Report as a reaped run (ADR-0021 Decision 6): it
+// sets DurationMs, Outcome=OutcomeReaped, and attaches the kill record. Kind is
+// set to KindFail so legacy consumers keyed on Kind still treat the run as
+// not-passing; the precise reaped-vs-failed distinction lives in Outcome. A
+// reap is a loud, structured result, never a silent hang.
+func (r *Report) MarkReaped(now time.Time, kill KillRecord) {
+	r.DurationMs = float64(now.Sub(r.StartedAt).Milliseconds())
+	r.Kind = KindFail
+	r.Outcome = OutcomeReaped
+	r.Kill = &kill
 }
