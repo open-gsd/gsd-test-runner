@@ -157,6 +157,52 @@ func TestRun_Version(t *testing.T) {
 	}
 }
 
+// ── gsd-test run (issue #67) ───────────────────────────────────────────────────
+
+// drain reads a pipe's read end to a string after the writer is closed.
+func drain(r *os.File) string {
+	var b strings.Builder
+	tmp := make([]byte, 4096)
+	for {
+		n, err := r.Read(tmp)
+		b.Write(tmp[:n])
+		if err != nil {
+			break
+		}
+	}
+	r.Close()
+	return b.String()
+}
+
+// TestRun_RunCommand_NotifiesAndExitsTwoWhenNoBench drives `gsd-test run`
+// against a config with no Bench for the target: it must print the handoff
+// banner (so the agent knows not to re-run locally) and exit 2 (inconclusive)
+// without spawning any local node. No Docker required — it fails at Bench
+// resolution, before the container path.
+func TestRun_RunCommand_NotifiesAndExitsTwoWhenNoBench(t *testing.T) {
+	cfgPath := strings.TrimSuffix(t.TempDir(), "/") + "/config.toml"
+	if err := os.WriteFile(cfgPath, []byte("[defaults]\ntargets = [\"linux\"]\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	outR, outW, _ := os.Pipe()
+	errR, errW, _ := os.Pipe()
+	code := run([]string{"run", "--config", cfgPath, "--target", "linux"}, outW, errW)
+	outW.Close()
+	errW.Close()
+	stdout, stderr := drain(outR), drain(errR)
+
+	if code != exitInconclusive {
+		t.Errorf("exit = %d, want %d (no Bench → inconclusive)", code, exitInconclusive)
+	}
+	if !strings.Contains(stderr, "handed off to Docker") || !strings.Contains(stderr, "run-id=") {
+		t.Errorf("handoff banner missing from stderr:\n%s", stderr)
+	}
+	if strings.Contains(stdout, "ℹ tests") {
+		t.Errorf("no verdict should be rendered when the run could not start; stdout:\n%s", stdout)
+	}
+}
+
 // ── commaSplit ────────────────────────────────────────────────────────────────
 
 func TestCommaSplit_Empty(t *testing.T) {

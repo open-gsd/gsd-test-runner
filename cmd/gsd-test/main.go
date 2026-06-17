@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"os/signal"
 	"strings"
 	"sync"
@@ -40,6 +41,7 @@ import (
 	"github.com/open-gsd/gsd-test-runner/internal/refs"
 	"github.com/open-gsd/gsd-test-runner/internal/renderer"
 	"github.com/open-gsd/gsd-test-runner/internal/report"
+	"github.com/open-gsd/gsd-test-runner/internal/runrender"
 	"github.com/open-gsd/gsd-test-runner/internal/runspec"
 	"github.com/open-gsd/gsd-test-runner/internal/telemetry"
 	"github.com/open-gsd/gsd-test-runner/internal/worktree"
@@ -114,6 +116,14 @@ func run(args []string, stdout, stderr *os.File) int {
 	// node locally.
 	if len(args) > 0 && args[0] == "submit" {
 		return runSubmit(args[1:], stdout, stderr)
+	}
+
+	// `run` is the explicit executor agents are routed to (issue #67, ADR-0022):
+	// it runs the project's tests in Docker via the front door and prints a
+	// node:test-style verdict instead of JSON, so the agent treats it like a
+	// normal `node --test` while never spawning a local node test process.
+	if len(args) > 0 && args[0] == "run" {
+		return runRun(args[1:], stdout, stderr)
 	}
 
 	flags, err := parseFlags(args)
@@ -325,31 +335,108 @@ func runSubmit(args []string, stdout, stderr *os.File) int {
 	return exitAllPass
 }
 
-// executeSpec dispatches a validated run spec to a Bench and emits the per-OS
-// Report. It resolves the Bench + Tester Image for spec.Target (reusing config,
+// runRun implements `gsd-test run`: the explicit wrapper agents call instead of
+// `node --test` (issue #67, ADR-0022). It builds a run spec from the current
+// repo + passed test patterns, dispatches it to a Bench via dispatchRun, and
+// renders the result as node:test-style output + exit code. Positional args are
+// treated as test path patterns; flags configure target, config, and estimate.
+func runRun(args []string, stdout, stderr *os.File) int {
+	fs := flag.NewFlagSet("gsd-test run", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	target := fs.String("target", "linux", "target OS: linux | windows | macos-container")
+	configPath := fs.String("config", "", "path to config.toml")
+	estimateMs := fs.Int64("estimate-ms", 0, "expected suite duration in ms (tightens the watchdog deadline)")
+	if err := fs.Parse(args); err != nil {
+		return exitInconclusive
+	}
+
+	repo, err := repoRoot()
+	if err != nil {
+		fmt.Fprintf(stderr, "run: %v\n", err)
+		return exitInconclusive
+	}
+
+	// Build a minimal spec and reuse runspec.Parse for defaults + validation
+	// (testCommand defaults to node --test; budget/isolation defaults applied),
+	// exactly like the submit front door.
+	specReq := map[string]any{"repo": repo, "target": *target}
+	if patterns := fs.Args(); len(patterns) > 0 {
+		specReq["testPathPatterns"] = patterns
+	}
+	if *estimateMs > 0 {
+		specReq["budget"] = map[string]any{"estimateMs": *estimateMs}
+	}
+	data, _ := json.Marshal(specReq)
+	spec, err := runspec.Parse(data)
+	if err != nil {
+		fmt.Fprintf(stderr, "run: build spec: %v\n", err)
+		return exitInconclusive
+	}
+	if spec.RunID == "" {
+		id, idErr := runspec.NewRunID()
+		if idErr != nil {
+			fmt.Fprintf(stderr, "run: assign run id: %v\n", idErr)
+			return exitInconclusive
+		}
+		spec.RunID = id
+	}
+
+	// Notify the caller the handoff is happening (ADR-0022 Decision 4) so it does
+	// not re-run locally or treat the wait as a hang.
+	fmt.Fprintf(stderr, "↪ gsd-test: handed off to Docker (run-id=%s, target=%s) — do not re-run locally\n", spec.RunID, spec.Target)
+
+	rep, ok := dispatchRun(*spec, *configPath, "run", stderr)
+	if !ok {
+		return exitInconclusive
+	}
+
+	text, code := runrender.Render(rep)
+	fmt.Fprint(stdout, text)
+	return code
+}
+
+// repoRoot returns the git toplevel of the current directory, falling back to
+// the working directory when not inside a git repo.
+func repoRoot() (string, error) {
+	if out, err := exec.Command("git", "rev-parse", "--show-toplevel").Output(); err == nil {
+		if dir := strings.TrimSpace(string(out)); dir != "" {
+			return dir, nil
+		}
+	}
+	wd, err := os.Getwd()
+	if err != nil {
+		return "", fmt.Errorf("determine repo root: %w", err)
+	}
+	return wd, nil
+}
+
+// dispatchRun resolves the Bench + Tester Image for spec.Target (reusing config,
 // the Bench selector, and images.EnsurePresent), then runs the copy-in
 // run-and-die path under the watchdog (dispatch.RunCopyIn) via a dockerexec
-// Runner. The reaped/failed container exit code is carried in the watchdog
-// envelope, which dockerexec.Run preserves on stdout — so reaps surface as a
-// loud OutcomeReaped Report, never a silent hang.
-func executeSpec(spec runspec.Spec, configPath string, stdout, stderr *os.File) int {
+// Runner, and records telemetry. It returns the resulting Report; ok is false
+// when an infrastructure/inconclusive error was already reported to stderr (the
+// caller returns exit 2). A reaped/failed container exit is carried in the
+// Report's Outcome, not signalled by ok — so reaps surface as a loud
+// OutcomeReaped Report, never a silent hang. label prefixes diagnostics so the
+// caller's command name (`submit --execute` / `run`) shows in errors.
+func dispatchRun(spec runspec.Spec, configPath, label string, stderr *os.File) (report.Report, bool) {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
 	cfg, err := config.Load(configPath, config.LoadOptions{})
 	if err != nil {
-		fmt.Fprintf(stderr, "submit --execute: config.Load: %v\n", err)
-		return exitInconclusive
+		fmt.Fprintf(stderr, "%s: config.Load: %v\n", label, err)
+		return report.Report{}, false
 	}
 	selector, err := bench.NewSelector(cfg.Registry, bench.Options{})
 	if err != nil {
-		fmt.Fprintf(stderr, "submit --execute: bench.NewSelector: %v\n", err)
-		return exitInconclusive
+		fmt.Fprintf(stderr, "%s: bench.NewSelector: %v\n", label, err)
+		return report.Report{}, false
 	}
 	b, err := selector.Pick(spec.Target)
 	if err != nil {
-		fmt.Fprintf(stderr, "submit --execute: no Bench for target %q: %v\n", spec.Target, err)
-		return exitInconclusive
+		fmt.Fprintf(stderr, "%s: no Bench for target %q: %v\n", label, spec.Target, err)
+		return report.Report{}, false
 	}
 
 	// ImageID matches the plan/pipeline convention (untagged ghcr path); the
@@ -361,8 +448,8 @@ func executeSpec(spec runspec.Spec, configPath string, stdout, stderr *os.File) 
 		FallbackDockerfile: "dockerfiles/" + spec.Target + ".Dockerfile",
 		FallbackContextDir: ".",
 	}); err != nil {
-		fmt.Fprintf(stderr, "submit --execute: EnsurePresent: %v\n", err)
-		return exitInconclusive
+		fmt.Fprintf(stderr, "%s: EnsurePresent: %v\n", label, err)
+		return report.Report{}, false
 	}
 
 	// dockerexec.Run preserves stdout on a non-zero container exit (the reaped
@@ -378,16 +465,16 @@ func executeSpec(spec runspec.Spec, configPath string, stdout, stderr *os.File) 
 	// e.g. one whose in-container watchdog wedged on a previous run. Best-effort;
 	// a sweep failure must not block this run.
 	if reaped, sweepErr := reaper.Sweep(ctx, runner, time.Now().UnixMilli()); sweepErr != nil {
-		fmt.Fprintf(stderr, "submit --execute: warning: reaper sweep: %v\n", sweepErr)
+		fmt.Fprintf(stderr, "%s: warning: reaper sweep: %v\n", label, sweepErr)
 	} else if len(reaped) > 0 {
-		fmt.Fprintf(stderr, "submit --execute: reaped %d stale container(s) before running\n", len(reaped))
+		fmt.Fprintf(stderr, "%s: reaped %d stale container(s) before running\n", label, len(reaped))
 	}
 
 	// Verify the Tester Image's version sentinel before running, so a stale
 	// image can't silently produce wrong results (ADR-0011, fail-loud).
 	if err := dispatch.VerifyImageVersion(ctx, runner, string(imageID), cfg.Versions[spec.Target]); err != nil {
-		fmt.Fprintf(stderr, "submit --execute: %v\n", err)
-		return exitInconclusive
+		fmt.Fprintf(stderr, "%s: %v\n", label, err)
+		return report.Report{}, false
 	}
 
 	// Estimate fallback: when the agent gave no estimateMs, base the deadline on
@@ -402,25 +489,25 @@ func executeSpec(spec runspec.Spec, configPath string, stdout, stderr *os.File) 
 	if spec.Base != "" {
 		baseSHA, rerr := refs.Resolve(ctx, spec.Repo, spec.Base)
 		if rerr != nil {
-			fmt.Fprintf(stderr, "submit --execute: resolve base %q: %v\n", spec.Base, rerr)
-			return exitInconclusive
+			fmt.Fprintf(stderr, "%s: resolve base %q: %v\n", label, spec.Base, rerr)
+			return report.Report{}, false
 		}
 		headSHA, rerr := refs.Resolve(ctx, spec.Repo, spec.PRBranch)
 		if rerr != nil {
-			fmt.Fprintf(stderr, "submit --execute: resolve prBranch %q: %v\n", spec.PRBranch, rerr)
-			return exitInconclusive
+			fmt.Fprintf(stderr, "%s: resolve prBranch %q: %v\n", label, spec.PRBranch, rerr)
+			return report.Report{}, false
 		}
 		scratch, mkErr := os.MkdirTemp("", "gsd-submit-")
 		if mkErr != nil {
-			fmt.Fprintf(stderr, "submit --execute: scratch dir: %v\n", mkErr)
-			return exitInconclusive
+			fmt.Fprintf(stderr, "%s: scratch dir: %v\n", label, mkErr)
+			return report.Report{}, false
 		}
 		wt, wErr := worktree.Construct(ctx, worktree.Options{
 			SourceRepo: spec.Repo, BaseSHA: baseSHA, PRSHA: headSHA, ScratchDir: scratch,
 		})
 		if wErr != nil {
-			fmt.Fprintf(stderr, "submit --execute: worktree.Construct: %v\n", wErr)
-			return exitInconclusive
+			fmt.Fprintf(stderr, "%s: worktree.Construct: %v\n", label, wErr)
+			return report.Report{}, false
 		}
 		defer wt.Close()
 		worktreeDir = wt.Path()
@@ -432,8 +519,8 @@ func executeSpec(spec runspec.Spec, configPath string, stdout, stderr *os.File) 
 
 	rep, err := dispatch.RunCopyIn(ctx, runner, spec, string(imageID), worktreeDir, deadlineEpochMs, eff, now)
 	if err != nil {
-		fmt.Fprintf(stderr, "submit --execute: run: %v\n", err)
-		return exitInconclusive
+		fmt.Fprintf(stderr, "%s: run: %v\n", label, err)
+		return report.Report{}, false
 	}
 
 	// Record the run so the median and runaway leaderboard accumulate (D3/§F).
@@ -451,7 +538,18 @@ func executeSpec(spec runspec.Spec, configPath string, stdout, stderr *os.File) 
 		})
 	}
 	if appendErr := telemetry.Append(telemetryPath, rec); appendErr != nil {
-		fmt.Fprintf(stderr, "submit --execute: warning: telemetry append: %v\n", appendErr)
+		fmt.Fprintf(stderr, "%s: warning: telemetry append: %v\n", label, appendErr)
+	}
+
+	return rep, true
+}
+
+// executeSpec dispatches a validated run spec to a Bench (via dispatchRun) and
+// emits the per-OS Report as JSON — the `submit --execute` front door.
+func executeSpec(spec runspec.Spec, configPath string, stdout, stderr *os.File) int {
+	rep, ok := dispatchRun(spec, configPath, "submit --execute", stderr)
+	if !ok {
+		return exitInconclusive
 	}
 
 	enc := json.NewEncoder(stdout)
