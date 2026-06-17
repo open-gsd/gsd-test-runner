@@ -25,6 +25,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"sync"
 	"syscall"
@@ -35,6 +36,7 @@ import (
 	"github.com/open-gsd/gsd-test-runner/internal/dispatch"
 	"github.com/open-gsd/gsd-test-runner/internal/dockerexec"
 	"github.com/open-gsd/gsd-test-runner/internal/images"
+	"github.com/open-gsd/gsd-test-runner/internal/installhooks"
 	"github.com/open-gsd/gsd-test-runner/internal/pipeline"
 	"github.com/open-gsd/gsd-test-runner/internal/plan"
 	"github.com/open-gsd/gsd-test-runner/internal/reaper"
@@ -124,6 +126,13 @@ func run(args []string, stdout, stderr *os.File) int {
 	// normal `node --test` while never spawning a local node test process.
 	if len(args) > 0 && args[0] == "run" {
 		return runRun(args[1:], stdout, stderr)
+	}
+
+	// `install-agent-hooks` wires the integration (Claude hook + skill, Codex
+	// shim) onto this workstation in one idempotent, reversible step (issue #71,
+	// ADR-0022 Decision 5).
+	if len(args) > 0 && args[0] == "install-agent-hooks" {
+		return runInstallHooks(args[1:], stdout, stderr)
 	}
 
 	flags, err := parseFlags(args)
@@ -408,6 +417,75 @@ func repoRoot() (string, error) {
 		return "", fmt.Errorf("determine repo root: %w", err)
 	}
 	return wd, nil
+}
+
+// runInstallHooks implements `gsd-test install-agent-hooks` (issue #71,
+// ADR-0022 D5): a one-command, idempotent, reversible installer for the agent
+// integration. Defaults to both runtimes and project scope.
+func runInstallHooks(args []string, stdout, stderr *os.File) int {
+	fs := flag.NewFlagSet("gsd-test install-agent-hooks", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	claude := fs.Bool("claude", false, "install the Claude Code hook + skill (default: both runtimes)")
+	codex := fs.Bool("codex", false, "install the Codex shim (default: both runtimes)")
+	global := fs.Bool("global", false, "install into $HOME instead of the current project")
+	uninstall := fs.Bool("uninstall", false, "reverse a previous install")
+	if err := fs.Parse(args); err != nil {
+		return exitInconclusive
+	}
+
+	root := "."
+	if *global {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			fmt.Fprintf(stderr, "install-agent-hooks: home dir: %v\n", err)
+			return exitInconclusive
+		}
+		root = home
+	} else {
+		r, err := repoRoot()
+		if err != nil {
+			fmt.Fprintf(stderr, "install-agent-hooks: %v\n", err)
+			return exitInconclusive
+		}
+		root = r
+	}
+
+	if *uninstall {
+		if err := installhooks.Uninstall(installhooks.ManifestPath(root)); err != nil {
+			fmt.Fprintf(stderr, "install-agent-hooks: %v\n", err)
+			return exitInconclusive
+		}
+		fmt.Fprintf(stdout, "gsd-test: agent integration uninstalled from %s\n", root)
+		return exitAllPass
+	}
+
+	// Default to both runtimes when neither flag is given.
+	wantClaude, wantCodex := *claude, *codex
+	if !wantClaude && !wantCodex {
+		wantClaude, wantCodex = true, true
+	}
+
+	man, err := installhooks.Install(installhooks.Options{Root: root, Claude: wantClaude, Codex: wantCodex})
+	if err != nil {
+		fmt.Fprintf(stderr, "install-agent-hooks: %v\n", err)
+		return exitInconclusive
+	}
+
+	fmt.Fprintf(stdout, "gsd-test: agent integration installed into %s\n", root)
+	for _, f := range man.Files {
+		fmt.Fprintf(stdout, "  + %s\n", f)
+	}
+	if man.SettingsPath != "" {
+		fmt.Fprintf(stdout, "  ~ %s (PreToolUse Bash guard → gsd-test run)\n", man.SettingsPath)
+	}
+	if wantCodex {
+		fmt.Fprintf(stdout, "\nCodex: the shim is a command wrapper at\n  %s\n"+
+			"Configure Codex to run shell commands through it — it rewrites `node --test` /\n"+
+			"`npm test` to `gsd-test run` and passes everything else through unchanged.\n"+
+			"See agent-integration/README.md for wiring.\n", filepath.Join(root, ".gsd-test", "codex-shim.sh"))
+	}
+	fmt.Fprintf(stdout, "\nReverse with `gsd-test install-agent-hooks --uninstall`.\n")
+	return exitAllPass
 }
 
 // dispatchRun resolves the Bench + Tester Image for spec.Target (reusing config,
