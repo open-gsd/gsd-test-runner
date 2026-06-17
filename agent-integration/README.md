@@ -52,13 +52,25 @@ teaches the agent how to use `gsd-test run` and read a reaped result.
 
 ## Using the Codex shim
 
-Place `codex-shim.sh` on `PATH` before the real `node`/`npm` binaries (e.g.
-symlink it from `~/bin/node`). When Codex runs a `node --test` / `npm test`
-command the shim **redirects it to `gsd-test run`** (issue #69, ADR-0022) —
-printing a handoff banner on stderr and exec-ing the Docker-backed run, which
-returns a `node --test`-style verdict. Test-file path patterns are forwarded;
-`node --test` flags are dropped (the watchdog supplies its own). Any other
-command is exec'd unchanged.
+`gsd-test install-agent-hooks --codex` writes `codex-shim.sh` plus a `codex-bin/`
+directory holding `node` and `npm` PATH shims. Point Codex's exec PATH at
+`codex-bin` **first** so its `node`/`npm` route through the shim — in
+`~/.codex/config.toml`:
+
+```toml
+[shell_environment_policy.set]
+PATH = "/abs/path/.gsd-test/codex-bin:${PATH}"
+```
+
+When Codex runs `node --test` / `npm test` the shim **redirects it to
+`gsd-test run`** (issue #69/#78, ADR-0022) — printing a handoff banner on stderr
+and exec-ing the Docker-backed run, which returns a `node --test`-style verdict.
+Test-file path patterns are forwarded; `node --test` flags are dropped (the
+watchdog supplies its own). Every other command (e.g. `node app.js`,
+`npm run lint`) is passed through to the **real** binary — the shims resolve it
+by skipping their own directory (canonicalised, so symlinks can't cause
+recursion), so this shadows `node`/`npm` only inside Codex, never your
+interactive shell.
 
 ## Run-spec contract
 

@@ -25,7 +25,6 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
-	"path/filepath"
 	"strings"
 	"sync"
 	"syscall"
@@ -479,10 +478,12 @@ func runInstallHooks(args []string, stdout, stderr *os.File) int {
 		fmt.Fprintf(stdout, "  ~ %s (PreToolUse Bash guard → gsd-test run)\n", man.SettingsPath)
 	}
 	if wantCodex {
-		fmt.Fprintf(stdout, "\nCodex: the shim is a command wrapper at\n  %s\n"+
-			"Configure Codex to run shell commands through it — it rewrites `node --test` /\n"+
-			"`npm test` to `gsd-test run` and passes everything else through unchanged.\n"+
-			"See agent-integration/README.md for wiring.\n", filepath.Join(root, ".gsd-test", "codex-shim.sh"))
+		fmt.Fprintf(stdout, "\nCodex: put the shim dir FIRST on Codex's exec PATH so its node/npm route\n"+
+			"through gsd-test (rewrites `node --test`/`npm test` to `gsd-test run`; passes\n"+
+			"everything else to the real binary). In ~/.codex/config.toml:\n"+
+			"  [shell_environment_policy.set]\n  PATH = \"%s:${PATH}\"\n"+
+			"This shadows node/npm only inside Codex — your interactive shell is untouched.\n",
+			installhooks.CodexBinDir(root))
 	}
 	fmt.Fprintf(stdout, "\nReverse with `gsd-test install-agent-hooks --uninstall`.\n")
 	return exitAllPass

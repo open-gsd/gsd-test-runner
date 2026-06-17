@@ -6,11 +6,13 @@ package codexshim
 // binaries on PATH so we observe what the shim actually invokes.
 
 import (
+	"context"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // runShim runs codex-shim.sh <args...> with a PATH containing stub `gsd-test`,
@@ -78,5 +80,53 @@ func TestCodexShim_PassesThroughNonTestCommands(t *testing.T) {
 	}
 	if strings.Contains(log, "gsd-test:") {
 		t.Errorf("non-test command must not be redirected; calls:\n%s", log)
+	}
+}
+
+// TestCodexShim_PathShimPassthroughNoRecursion installs the shim as a `node`
+// PATH-shim (the codex-bin layout) and verifies a non-test command resolves the
+// REAL node instead of recursing into the shim — the issue #78 bug. A context
+// timeout fails the test rather than hanging if recursion regresses.
+func TestCodexShim_PathShimPassthroughNoRecursion(t *testing.T) {
+	dir := t.TempDir()
+	codexBin := filepath.Join(dir, "codex-bin")
+	realDir := filepath.Join(dir, "real")
+	for _, d := range []string{codexBin, realDir} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	shim, _ := filepath.Abs(filepath.Join("..", "..", "agent-integration", "codex-shim.sh"))
+	// codex-bin/node wrapper: export GSD_SHIM_DIR, exec the shim in wrapper mode.
+	wrapper := "#!/bin/sh\nGSD_SHIM_DIR=" + codexBin + " exec sh " + shim + " node \"$@\"\n"
+	if err := os.WriteFile(filepath.Join(codexBin, "node"), []byte(wrapper), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// A real node + gsd-test the shim should resolve.
+	if err := os.WriteFile(filepath.Join(realDir, "node"), []byte("#!/bin/sh\necho REAL:$*\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(realDir, "gsd-test"), []byte("#!/bin/sh\necho GSD:$*\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	pathEnv := codexBin + string(os.PathListSeparator) + realDir + string(os.PathListSeparator) + "/usr/bin" + string(os.PathListSeparator) + "/bin"
+	run := func(args ...string) (string, error) {
+		ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+		defer cancel()
+		cmd := exec.CommandContext(ctx, filepath.Join(codexBin, "node"), args...)
+		cmd.Env = append(os.Environ(), "PATH="+pathEnv)
+		out, err := cmd.CombinedOutput()
+		if ctx.Err() == context.DeadlineExceeded {
+			t.Fatalf("shim hung (recursion regression): %s", out)
+		}
+		return string(out), err
+	}
+
+	if out, err := run("app.js"); err != nil || !strings.Contains(out, "REAL:app.js") {
+		t.Errorf("passthrough should reach real node: out=%q err=%v", out, err)
+	}
+	if out, _ := run("--test", "x.test.mjs"); !strings.Contains(out, "GSD:run x.test.mjs") {
+		t.Errorf("test invocation should redirect to gsd-test run: out=%q", out)
 	}
 }
