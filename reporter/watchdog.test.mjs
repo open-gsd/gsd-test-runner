@@ -100,15 +100,17 @@ test('reaped kill record carries the last active test', async () => {
 // Real-spawn integration: a genuinely hanging node process must be reaped and
 // actually leave the process table (orphan guarantee, ADR-0021 Decision 4).
 test('reaps a real hanging node child', async () => {
-  // deadlineMs is generous so node is fully started and its SIGTERM handler is
-  // installed before the deadline fires — otherwise a too-tight deadline races
-  // node startup and the default SIGTERM action ends the child before our
-  // escalation, making the test flaky.
+  // deadlineMs must comfortably exceed node *interpreter startup* so the child
+  // has installed its SIGTERM handler before the deadline fires — otherwise the
+  // watchdog's SIGTERM lands during boot, the default action ends the child
+  // before our SIGKILL escalation, and the test flakes. 700ms was too tight
+  // under load (node boot spiked past it on a saturated machine); 2500ms gives
+  // a wide margin while keeping the test sub-3s.
   const res = await runWithWatchdog({
     command: process.execPath,
     args: ['-e', 'process.on("SIGTERM", () => {}); setInterval(() => {}, 1000);'],
-    deadlineMs: 700,
-    graceMs: 200,
+    deadlineMs: 2500,
+    graceMs: 300,
   });
   assert.equal(res.outcome, 'reaped');
   assert.ok(res.kill.signalChain.some((s) => s.startsWith('SIGKILL')),
