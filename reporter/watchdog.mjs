@@ -107,6 +107,9 @@ export function mergeLeaks(perTest, leakDir) {
   }
   const leaked = new Set();
   for (const f of files) {
+    // Leak reports are single-object `.json`; the periodic sampler writes
+    // `.samples.jsonl` sidecars into the same dir — skip those here.
+    if (!f.endsWith('.json')) continue;
     try {
       const rec = JSON.parse(fs.readFileSync(path.join(leakDir, f), 'utf8'));
       if (rec && rec.file) leaked.add(normFile(rec.file));
@@ -118,6 +121,49 @@ export function mergeLeaks(perTest, leakDir) {
   return perTest.map((t) =>
     t.status !== 'killed' && leaked.has(t.file) ? { ...t, exitedClean: false } : t,
   );
+}
+
+/**
+ * collectSamples folds the periodic handle-sample sidecars (leak-probe.mjs
+ * writes one `<file>.samples.jsonl` per test file into leakDir) into the run
+ * envelope, grouped by test file. Reading them here — before the disposable
+ * container is torn down — is what lets the in-flight samples survive a reaped
+ * run (ADR-0021 telemetry knobs). Best-effort: a missing dir or malformed line
+ * yields no/partial samples rather than an error.
+ */
+export function collectSamples(leakDir) {
+  if (!leakDir) return [];
+  let files;
+  try {
+    files = fs.readdirSync(leakDir);
+  } catch {
+    return [];
+  }
+  const out = [];
+  for (const f of files) {
+    if (!f.endsWith('.samples.jsonl')) continue;
+    let text;
+    try {
+      text = fs.readFileSync(path.join(leakDir, f), 'utf8');
+    } catch {
+      continue;
+    }
+    let file = '';
+    const samples = [];
+    for (const line of text.split('\n')) {
+      if (!line.trim()) continue;
+      try {
+        const rec = JSON.parse(line);
+        if (rec.file) file = normFile(rec.file);
+        const { file: _omit, ...sample } = rec;
+        samples.push(sample);
+      } catch {
+        /* skip malformed sample line */
+      }
+    }
+    if (samples.length > 0) out.push({ file, samples });
+  }
+  return out;
 }
 
 /**
@@ -225,12 +271,17 @@ export function runWithWatchdog(opts) {
     child.on('exit', (code) => {
       clearTimeout(deadlineTimer);
       clearTimeout(killTimer);
-      const perTest = mergeLeaks(tracker.perTest(Date.now(), !!kill), process.env.GSD_LEAK_DIR);
+      const leakDir = process.env.GSD_LEAK_DIR;
+      const perTest = mergeLeaks(tracker.perTest(Date.now(), !!kill), leakDir);
+      // Read periodic in-flight samples before the container is torn down, so a
+      // reaped run still surfaces how its handles accumulated (ADR-0021 §A).
+      const handleSamples = collectSamples(leakDir);
+      const tail = handleSamples.length > 0 ? { perTest, handleSamples } : { perTest };
       if (kill) {
         kill.elapsedMs = elapsed();
-        resolve({ outcome: 'reaped', exitCode: code, kill, perTest });
+        resolve({ outcome: 'reaped', exitCode: code, kill, ...tail });
       } else {
-        resolve({ outcome: 'completed', exitCode: code ?? 0, perTest });
+        resolve({ outcome: 'completed', exitCode: code ?? 0, ...tail });
       }
     });
   });

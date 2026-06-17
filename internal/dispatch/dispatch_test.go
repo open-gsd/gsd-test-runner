@@ -6,6 +6,7 @@ package dispatch_test
 
 import (
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/open-gsd/gsd-test-runner/internal/dispatch"
@@ -254,6 +255,72 @@ func TestDockerRunArgs_NoEnvArgs_WhenEnvEmpty(t *testing.T) {
 			break
 		}
 	}
+}
+
+// TestDockerRunArgs_TelemetrySamplingEnv verifies that the run-spec telemetry
+// knobs are forwarded to the container as env so the in-child leak-probe can do
+// periodic in-flight handle sampling (ADR-0021 §A).
+func TestDockerRunArgs_TelemetrySamplingEnv(t *testing.T) {
+	collectEnv := func(args []string) []string {
+		var env []string
+		for i := 0; i+1 < len(args); i++ {
+			if args[i] == "-e" {
+				env = append(env, args[i+1])
+				i++
+			}
+		}
+		return env
+	}
+
+	t.Run("no telemetry → no sampling env", func(t *testing.T) {
+		got := dispatch.DockerRunArgs(baseSpec(), "img:latest", 0, "")
+		for _, e := range collectEnv(got) {
+			if strings.HasPrefix(e, "GSD_SAMPLE_HANDLES_MS") || strings.HasPrefix(e, "GSD_CAPTURE_STACKS") {
+				t.Errorf("unexpected sampling env when telemetry unset: %q", e)
+			}
+		}
+	})
+
+	t.Run("interval only", func(t *testing.T) {
+		spec := baseSpec()
+		spec.Telemetry.SampleHandlesMs = 5000
+		env := collectEnv(dispatch.DockerRunArgs(spec, "img:latest", 0, ""))
+		if !slicesContains(env, "GSD_SAMPLE_HANDLES_MS=5000") {
+			t.Errorf("env = %v, want GSD_SAMPLE_HANDLES_MS=5000", env)
+		}
+		if slicesContains(env, "GSD_CAPTURE_STACKS=1") {
+			t.Errorf("env = %v, did not want GSD_CAPTURE_STACKS when captureStacks false", env)
+		}
+	})
+
+	t.Run("interval + captureStacks", func(t *testing.T) {
+		spec := baseSpec()
+		spec.Telemetry.SampleHandlesMs = 250
+		spec.Telemetry.CaptureStacks = true
+		env := collectEnv(dispatch.DockerRunArgs(spec, "img:latest", 0, ""))
+		if !slicesContains(env, "GSD_SAMPLE_HANDLES_MS=250") || !slicesContains(env, "GSD_CAPTURE_STACKS=1") {
+			t.Errorf("env = %v, want both sampling vars", env)
+		}
+	})
+
+	t.Run("captureStacks without an interval is inert", func(t *testing.T) {
+		spec := baseSpec()
+		spec.Telemetry.CaptureStacks = true // sampling disabled (interval 0)
+		for _, e := range collectEnv(dispatch.DockerRunArgs(spec, "img:latest", 0, "")) {
+			if strings.HasPrefix(e, "GSD_SAMPLE_HANDLES_MS") || strings.HasPrefix(e, "GSD_CAPTURE_STACKS") {
+				t.Errorf("unexpected sampling env with no interval: %q", e)
+			}
+		}
+	})
+}
+
+func slicesContains(s []string, want string) bool {
+	for _, v := range s {
+		if v == want {
+			return true
+		}
+	}
+	return false
 }
 
 func TestDockerRunArgs_FullOrder(t *testing.T) {

@@ -148,3 +148,37 @@ func TestRun_MapsPerTestTelemetry(t *testing.T) {
 		t.Errorf("PerTest[1] = %+v, want killed/exitedClean=false", rep.PerTest[1])
 	}
 }
+
+// TestRun_MapsHandleSamples verifies periodic in-flight handle samples in the
+// watchdog envelope surface on the typed Report (ADR-0021 §A). These survive a
+// reaped run because the watchdog reads them before container teardown.
+func TestRun_MapsHandleSamples(t *testing.T) {
+	env := `{"outcome":"reaped","exitCode":null,` +
+		`"kill":{"reason":"estimate_overrun","reapedBy":"in_container","effectiveDeadlineMs":2000,"elapsedMs":2100,"signalChain":["SIGKILL@2010"]},` +
+		`"handleSamples":[{"file":"hang.test.mjs","samples":[` +
+		`{"atMs":1000,"open":2,"leaked":[]},` +
+		`{"atMs":2000,"open":4,"leaked":["Timeout","Timeout"],"stacks":{"Timeout":["at hang"]}}]}]}`
+	var got []string
+	rep, err := dispatch.Run(context.Background(), captureRunner(env, &got),
+		specFor("linux"), "img:v2", 1_000_000, 2000, startedAt)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if len(rep.HandleSamples) != 1 {
+		t.Fatalf("HandleSamples len = %d, want 1: %+v", len(rep.HandleSamples), rep.HandleSamples)
+	}
+	hs := rep.HandleSamples[0]
+	if hs.File != "hang.test.mjs" || len(hs.Samples) != 2 {
+		t.Fatalf("HandleSamples[0] = %+v, want file hang.test.mjs with 2 samples", hs)
+	}
+	last := hs.Samples[1]
+	if last.AtMs != 2000 || last.Open != 4 {
+		t.Errorf("last sample = %+v, want atMs=2000 open=4", last)
+	}
+	if len(last.Leaked) != 2 || last.Leaked[0] != "Timeout" {
+		t.Errorf("last sample leaked = %v, want two Timeouts", last.Leaked)
+	}
+	if got := last.Stacks["Timeout"]; len(got) != 1 || got[0] != "at hang" {
+		t.Errorf("last sample stacks = %v, want Timeout->[at hang]", last.Stacks)
+	}
+}

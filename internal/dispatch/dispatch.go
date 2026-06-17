@@ -116,6 +116,18 @@ func DockerRunArgs(spec runspec.Spec, imageID string, deadlineEpochMs int64, wor
 		result = append(result, "-e", fmt.Sprintf("%s=%s", k, spec.Env[k]))
 	}
 
+	// Forward the periodic-sampling telemetry knobs to the container so the
+	// in-child leak-probe samples open handles during the run (ADR-0021 §A).
+	// Appended after the sorted user env in a fixed order so output stays
+	// deterministic. captureStacks is inert without an interval, so it is only
+	// emitted when sampling is actually on.
+	if spec.Telemetry.SampleHandlesMs > 0 {
+		result = append(result, "-e", fmt.Sprintf("GSD_SAMPLE_HANDLES_MS=%d", spec.Telemetry.SampleHandlesMs))
+		if spec.Telemetry.CaptureStacks {
+			result = append(result, "-e", "GSD_CAPTURE_STACKS=1")
+		}
+	}
+
 	result = append(result, imageID)
 	return result
 }

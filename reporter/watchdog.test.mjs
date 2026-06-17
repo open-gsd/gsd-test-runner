@@ -164,3 +164,46 @@ test('mergeLeaks is a no-op without a leak dir or reports', () => {
   assert.deepEqual(mergeLeaks(perTest, undefined), perTest);
   assert.deepEqual(mergeLeaks(perTest, '/no/such/dir'), perTest);
 });
+
+test('mergeLeaks ignores periodic-sample files sharing the leak dir', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'gsd-leak-'));
+  // A periodic-sample sidecar (JSONL, no top-level .file) must not be parsed as
+  // a leak report — it would otherwise throw or be misread.
+  writeFileSync(join(dir, 'a.test.js.samples.jsonl'),
+    JSON.stringify({ file: 'a.test.js', atMs: 100, open: 3, leaked: ['Timeout'] }) + '\n');
+  const perTest = [{ file: 'a.test.js', name: 'x', status: 'passed', exitedClean: true }];
+  assert.deepEqual(mergeLeaks(perTest, dir), perTest, 'sample sidecar must not mark a leak');
+});
+
+// ── collectSamples — folds periodic handle samples into the run envelope ──────
+
+import { collectSamples } from './watchdog.mjs';
+
+test('collectSamples groups periodic samples by test file and survives teardown', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'gsd-samples-'));
+  writeFileSync(join(dir, 'hang.test.mjs.samples.jsonl'),
+    JSON.stringify({ file: 'hang.test.mjs', atMs: 1000, open: 2, leaked: [] }) + '\n' +
+    JSON.stringify({ file: 'hang.test.mjs', atMs: 2000, open: 4, leaked: ['Timeout', 'Timeout'] }) + '\n');
+  // A leak report (.json) in the same dir is NOT a sample file and is skipped.
+  writeFileSync(join(dir, 'hang.test.mjs.json'),
+    JSON.stringify({ file: 'hang.test.mjs', leaked: ['Timeout'] }));
+
+  const got = collectSamples(dir);
+  assert.equal(got.length, 1);
+  assert.equal(got[0].file, 'hang.test.mjs');
+  assert.equal(got[0].samples.length, 2);
+  assert.equal(got[0].samples[1].open, 4);
+  assert.deepEqual(got[0].samples[1].leaked, ['Timeout', 'Timeout']);
+});
+
+test('collectSamples is empty without a dir, and skips malformed lines', () => {
+  assert.deepEqual(collectSamples(undefined), []);
+  assert.deepEqual(collectSamples('/no/such/dir'), []);
+
+  const dir = mkdtempSync(join(tmpdir(), 'gsd-samples-'));
+  writeFileSync(join(dir, 'x.test.js.samples.jsonl'),
+    'not json\n' + JSON.stringify({ file: 'x.test.js', atMs: 5, open: 1, leaked: [] }) + '\n');
+  const got = collectSamples(dir);
+  assert.equal(got.length, 1);
+  assert.equal(got[0].samples.length, 1, 'malformed line skipped, good line kept');
+});

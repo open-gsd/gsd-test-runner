@@ -45,6 +45,15 @@ type envelope struct {
 		Status      string  `json:"status"`
 		ExitedClean bool    `json:"exitedClean"`
 	} `json:"perTest"`
+	HandleSamples []struct {
+		File    string `json:"file"`
+		Samples []struct {
+			AtMs   int64               `json:"atMs"`
+			Open   int                 `json:"open"`
+			Leaked []string            `json:"leaked"`
+			Stacks map[string][]string `json:"stacks"`
+		} `json:"samples"`
+	} `json:"handleSamples"`
 	Kill *struct {
 		Reason              string `json:"reason"`
 		ReapedBy            string `json:"reapedBy"`
@@ -120,6 +129,15 @@ func reportFromEnvelope(out []byte, spec runspec.Spec, imageID string, startedAt
 			File: ts.File, Name: ts.Name, DurationMs: ts.DurationMs,
 			Status: ts.Status, ExitedClean: ts.ExitedClean,
 		})
+	}
+	for _, hs := range env.HandleSamples {
+		samples := make([]report.HandleSample, 0, len(hs.Samples))
+		for _, s := range hs.Samples {
+			samples = append(samples, report.HandleSample{
+				AtMs: s.AtMs, Open: s.Open, Leaked: s.Leaked, Stacks: s.Stacks,
+			})
+		}
+		rep.HandleSamples = append(rep.HandleSamples, report.HandleSamples{File: hs.File, Samples: samples})
 	}
 
 	switch env.Outcome {

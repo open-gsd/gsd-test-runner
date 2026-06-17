@@ -46,6 +46,24 @@ type TestStat struct {
 	ExitedClean bool    `json:"exited_clean"`
 }
 
+// HandleSamples is the periodic in-flight open-handle timeline for one test
+// file (ADR-0021 §A). Populated only when the spec requests periodic sampling.
+type HandleSamples struct {
+	File    string         `json:"file"`
+	Samples []HandleSample `json:"samples"`
+}
+
+// HandleSample is one periodic snapshot: the elapsed time into the run, the
+// total open handle count, the resource types open beyond the load-time
+// baseline, and — when telemetry.captureStacks is set — creation stacks grouped
+// by async resource type.
+type HandleSample struct {
+	AtMs   int64               `json:"at_ms"`
+	Open   int                 `json:"open"`
+	Leaked []string            `json:"leaked,omitempty"`
+	Stacks map[string][]string `json:"stacks,omitempty"`
+}
+
 // KillReason explains why a run was reaped (ADR-0021 Decision 1/2).
 type KillReason string
 
@@ -179,6 +197,13 @@ type Report struct {
 	// PerTest is per-test telemetry derived from the reporter events the
 	// watchdog observed (ADR-0021 §F). Empty for non-run-and-die reports.
 	PerTest []TestStat `json:"per_test,omitempty"`
+
+	// HandleSamples is periodic in-flight open-handle telemetry, one entry per
+	// test file, captured during the run when the spec requests it
+	// (telemetry.sampleHandlesMs, ADR-0021 §A). Unlike the exit-time leak
+	// signal it survives a reaped run, so a hung test still leaves a trail of
+	// how its handles accumulated. Empty unless sampling was enabled.
+	HandleSamples []HandleSamples `json:"handle_samples,omitempty"`
 
 	// OS is the Bench.OS value ("linux", "windows", "macos-container").
 	OS string `json:"os"`

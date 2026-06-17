@@ -100,7 +100,7 @@ Gap-closure round (TDD + live Docker):
 Deferred-set round:
 
 - **PR-merged worktree** — done. The run spec accepts `base`+`prBranch` (both required together); `submit --execute` builds the PR-merged worktree via `refs.Resolve` + `worktree.Construct`. Proven end-to-end (a PR branch's test runs in the merged tree).
-- **Run-spec `telemetry` field** — added (`sampleHandlesMs`/`captureStacks`, §A) and validated; it is the accepted, documented surface. The sampling *behaviour* is still unimplemented.
+- **Run-spec `telemetry` field** — added (`sampleHandlesMs`/`captureStacks`, §A), validated, and **wired end-to-end**: dispatch forwards the knobs as container env, the in-child leak-probe samples open handles on the interval (with optional `async_hooks` stack capture), and the watchdog folds the sidecars into the envelope as `handle_samples`. See the periodic-sampling note below.
 - **Agent skill** — shipped at `agent-integration/skills/run-and-die/SKILL.md`.
 
 - **Independent leak signal for the leaderboard** — done. A leak probe
@@ -112,7 +112,18 @@ Deferred-set round:
   (Goodhart). Proven end-to-end (a passing-but-leaky test is flagged). File-level
   and best-effort; no-op under `isolation:"none"`.
 
+Deferred-set round (cont.):
+
+- **Periodic handle sampling** — done. When `telemetry.sampleHandlesMs > 0`, the
+  leak-probe samples open handles every N ms during the run and writes per-file
+  `.samples.jsonl` sidecars (synchronously flushed, so a `SIGKILL` cannot lose
+  them); `captureStacks` adds `async_hooks` creation-stack capture. The watchdog
+  reads the sidecars before container teardown and surfaces them as
+  `handle_samples` on the envelope/report — so a *reaped* test still leaves a
+  trail of how its handles accumulated, where exit-time detection (which never
+  runs on a killed process) cannot. File-level and best-effort; no-op under
+  `isolation:"none"`. The sampler's own interval is masked from the leak count.
+
 Still deferred:
 
-- **Windows orphaned-`node.exe` gate** (Decision 4) — `taskkill /T` path + gated test exist; needs a Windows-container Bench.
-- **Periodic handle sampling** — the run-spec `telemetry.sampleHandlesMs` / `captureStacks` knobs (periodic, in-flight sampling with stacks) remain reserved; exit-time leak detection above covers the common case.
+- **Windows orphaned-`node.exe` gate** (Decision 4) — `taskkill /T` path + gated test exist; needs a Windows-container Bench. Tracked in issue #62.
