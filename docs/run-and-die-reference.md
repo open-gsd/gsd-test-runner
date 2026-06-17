@@ -27,7 +27,9 @@ A single JSON object. Unknown fields are ignored; invalid values are rejected wi
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `runId` | string | assigned | Engine-assigned UUID when omitted. |
-| `repo` | string | — (required) | Absolute path to the run payload (the worktree copied into the container). |
+| `repo` | string | — (required) | Absolute path to the source repo / run payload. Run as-is unless `base`+`prBranch` are given. |
+| `base` | string | — | Base git ref. With `prBranch`, the Engine builds a PR-merged worktree from `repo` and runs that. Must be set together with `prBranch`. |
+| `prBranch` | string | — | PR git ref merged onto `base`. Must be set together with `base`. |
 | `target` | string | — (required) | `linux`, `windows`, or `macos-container`. Selects the Bench and Tester Image. |
 | `testCommand` | string[] | `["node","--test"]` | The test command (argv form). The `node --test` path is hardened (see [hardening](#test-command-hardening)); other commands run unchanged under the watchdog. |
 | `testPathPatterns` | string[] | — | Test file globs appended to the command. |
@@ -36,7 +38,9 @@ A single JSON object. Unknown fields are ignored; invalid values are rejected wi
 | `budget.overrunFactor` | number | `1.5` | Multiplier on the estimate. Must be `>= 1.0`. |
 | `budget.hardCapMs` | integer | `3600000` | Absolute ceiling (one hour). |
 | `isolation` | string | `process` | `process` (one child per test file) or `none` (one shared runner process). |
-| `concurrency` | integer \| null | `null` | Pins `--test-concurrency` when set; `null` uses the runner default. |
+| `concurrency` | integer \| null | `null` | Pins `--test-concurrency` when set; `null` pins to the CPU cap. |
+| `telemetry.sampleHandlesMs` | integer | `0` | Open-handle sampling interval. Accepted and validated (`>= 0`); the sampling behaviour is **not yet implemented** (reserved surface). |
+| `telemetry.captureStacks` | boolean | `false` | Request stack capture for leaked handles. Reserved surface, as above. |
 
 ### Effective deadline
 

@@ -97,9 +97,13 @@ Gap-closure round (TDD + live Docker):
 - The Tier-2 reaper is wired: `submit --execute` sweeps stale containers on contact (proven by reaping a planted container).
 - Per-test telemetry is captured via the JSON reporter (`--test-reporter`), the watchdog aligned to the reporter's real event schema; `report.PerTest`/`RunRecord.PerTest` populate, so the leaderboard has data.
 
-Remaining / honestly deferred:
+Deferred-set round:
+
+- **PR-merged worktree** — done. The run spec accepts `base`+`prBranch` (both required together); `submit --execute` builds the PR-merged worktree via `refs.Resolve` + `worktree.Construct`. Proven end-to-end (a PR branch's test runs in the merged tree).
+- **Run-spec `telemetry` field** — added (`sampleHandlesMs`/`captureStacks`, §A) and validated; it is the accepted, documented surface. The sampling *behaviour* is still unimplemented.
+- **Agent skill** — shipped at `agent-integration/skills/run-and-die/SKILL.md`.
+
+Still deferred:
 
 - **Windows orphaned-`node.exe` gate** (Decision 4) — `taskkill /T` path + gated test exist; needs a Windows-container Bench.
-- **Independent leak signal for the leaderboard** — `last_active_test` and the leaderboard are best-effort: a synchronous CPU wedge blocks the reporter, so attribution can be empty, and the leaderboard's single signal (reaper trips) is gameable by raising the estimate (Goodhart). The fix is per-test handle sampling, which travels with the run-spec `telemetry` field (`sampleHandlesMs`/`captureStacks`, §A) — not yet implemented.
-- **PR-merged worktree** — `submit` accepts a `repo` path only; the `{base, prBranch}` form (§A) and worktree construction are not wired (the main `run()` path does PR-merge).
-- **Agent skill artifact** — the routing hook + Codex shim + README exist; a formal skill is not yet shipped.
+- **Independent leak signal for the leaderboard** — `last_active_test` and the leaderboard remain best-effort: a synchronous CPU wedge blocks the reporter (attribution empty), and the single signal (reaper trips) is gameable by raising the estimate (Goodhart). A genuine fix needs per-test, in-*test-process* handle sampling; under process isolation the reporter runs in the parent, not the test's child, so it cannot observe the test's handles — hence the deferral. The `telemetry` field is the surface for it when implemented.

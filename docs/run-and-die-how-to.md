@@ -33,7 +33,18 @@ agent-integration/codex-shim.sh <command...>
 
 It blocks node test commands with a routing message and `exec`s everything else unchanged.
 
-See [`agent-integration/README.md`](../agent-integration/README.md) for the full wiring.
+See [`agent-integration/README.md`](../agent-integration/README.md) for the full wiring, and install the bundled Claude Code skill at `agent-integration/skills/run-and-die/` so the agent knows the run-spec contract and how to read a reaped result.
+
+## How to test a PR-merged tree
+
+To run the suite against a branch merged onto its base — without checking out and merging yourself — give `base` and `prBranch` instead of pointing `repo` at a pre-merged checkout:
+
+```bash
+echo '{"repo":"'"$PWD"'","target":"linux","base":"main","prBranch":"feat/x"}' \
+  | gsd-test submit --execute --spec-file -
+```
+
+The Engine resolves both refs in `repo`, constructs a PR-merged worktree (a real `git merge`; conflicts surface as a failure before any container starts), and runs that. Set both fields or neither — supplying only one is rejected.
 
 ## How to submit a run from your own tooling
 

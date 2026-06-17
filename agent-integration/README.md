@@ -63,3 +63,11 @@ echo '{"repo":"my-repo","suite":"unit","estimateMs":30000}' \
 ```
 
 See ADR-0021 for the full run-spec schema and the two-tier reaping contract.
+
+## Claude Code skill
+
+A ready-to-install skill lives at [`skills/run-and-die/SKILL.md`](skills/run-and-die/SKILL.md).
+Copy that directory into your project's `.claude/skills/` so the agent knows the
+run-spec contract and how to read a reaped result. It pairs with the PreToolUse
+hook above: the hook blocks local `node --test`, the skill teaches the agent
+what to do instead.
