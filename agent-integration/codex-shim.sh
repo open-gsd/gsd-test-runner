@@ -1,20 +1,19 @@
 #!/bin/sh
-# codex-shim.sh — POSIX sh exec-path shim for Codex agents.
-#
-# Mirrors the Claude Code PreToolUse hook in route-tests.mjs (ADR-0021 §G,
-# issue #60). Place on PATH before the real node/npm so Codex picks it up.
+# codex-shim.sh — POSIX sh exec-path shim for Codex agents (ADR-0022, issue
+# #60/#65). Place on PATH before the real node/npm so Codex picks it up.
 #
 # Usage: codex-shim.sh <cmd> [args...]
-#   If <cmd> looks like a node test invocation, print a routing message on
-#   stderr and exit non-zero so Codex knows the command was blocked.
-#   Otherwise, exec the original command unchanged.
+#   If <cmd> is a `node --test` / `npm test` invocation, REDIRECT it to
+#   `gsd-test run` — which runs the suite in a disposable Docker container under
+#   the run-and-die watchdog and returns a node:test verdict — and exec that, so
+#   no orphan-prone local node test process is ever spawned. Otherwise exec the
+#   original command unchanged.
 #
 # POSIX-portable: no bashisms, no arrays, no [[ ]].
 
 CMD="$*"
 
-# Match node --test (with any leading env vars stripped heuristically).
-# We strip "KEY=value " prefixes before testing.
+# Match the test invocation (strip leading "KEY=value " env prefixes first).
 BARE=$(printf '%s\n' "$CMD" | sed 's/^[A-Z_][A-Z0-9_]*=[^ ]* //g')
 
 is_node_test() {
@@ -34,13 +33,22 @@ is_npm_test() {
 }
 
 if is_node_test || is_npm_test; then
-  printf >&2 '[gsd-test codex-shim] BLOCKED: "%s"\n' "$CMD"
-  printf >&2 'Local node --test / npm test is intercepted (ADR-0021 §G, issue #60).\n'
-  printf >&2 'Orphaned node processes risk wedging the Dev Workstation.\n'
-  printf >&2 'Route via the gsd-test front door instead:\n'
-  printf >&2 '  gsd-test submit --spec-file -\n'
-  printf >&2 'Pipe a JSON run spec on stdin (see agent-integration/README.md).\n'
-  exit 1
+  # Notify (ADR-0022 Decision 4) so the agent knows the run moved to Docker and
+  # does not re-run it locally or treat the wait as a hang.
+  printf >&2 '↪ gsd-test: handing off "%s" to Docker via `gsd-test run` (ADR-0022) — do not re-run locally\n' "$CMD"
+
+  # Forward only test-file path patterns; node --test flags (--test-timeout,
+  # --test-force-exit, …) do not apply to `gsd-test run` — the watchdog supplies
+  # its own hardening. npm test carries no paths, so the whole suite runs.
+  PATTERNS=""
+  for a in "$@"; do
+    case "$a" in
+      *.test.mjs|*.test.cjs|*.test.js) PATTERNS="$PATTERNS $a" ;;
+    esac
+  done
+
+  # shellcheck disable=SC2086  # intentional word-splitting of collected patterns
+  exec gsd-test run $PATTERNS
 fi
 
 exec "$@"

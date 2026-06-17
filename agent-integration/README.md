@@ -49,9 +49,12 @@ and the tool call proceeds normally.
 ## Using the Codex shim
 
 Place `codex-shim.sh` on `PATH` before the real `node`/`npm` binaries (e.g.
-symlink it from `~/bin/node-test-guard`). When Codex executes a node test
-command the shim prints a routing message on stderr and exits non-zero;
-other commands are exec'd unchanged.
+symlink it from `~/bin/node`). When Codex runs a `node --test` / `npm test`
+command the shim **redirects it to `gsd-test run`** (issue #69, ADR-0022) —
+printing a handoff banner on stderr and exec-ing the Docker-backed run, which
+returns a `node --test`-style verdict. Test-file path patterns are forwarded;
+`node --test` flags are dropped (the watchdog supplies its own). Any other
+command is exec'd unchanged.
 
 ## Run-spec contract
 
