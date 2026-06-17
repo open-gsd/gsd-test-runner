@@ -41,6 +41,10 @@ func ensureTesterImage(t *testing.T) {
 func TestE2E_SubmitExecute_PassingRun(t *testing.T) {
 	ensureTesterImage(t)
 
+	// Isolate the persistent telemetry log so the run's append (median/leaderboard
+	// accumulation) writes under a temp dir, not the real ~/.local/state.
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+
 	dir := t.TempDir()
 
 	worktree := filepath.Join(dir, "worktree")

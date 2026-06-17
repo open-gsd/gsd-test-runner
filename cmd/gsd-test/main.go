@@ -40,6 +40,7 @@ import (
 	"github.com/open-gsd/gsd-test-runner/internal/renderer"
 	"github.com/open-gsd/gsd-test-runner/internal/report"
 	"github.com/open-gsd/gsd-test-runner/internal/runspec"
+	"github.com/open-gsd/gsd-test-runner/internal/telemetry"
 	"github.com/open-gsd/gsd-test-runner/internal/worktree"
 )
 
@@ -371,14 +372,39 @@ func executeSpec(spec runspec.Spec, configPath string, stdout, stderr *os.File) 
 		return []byte(out), runErr
 	}
 
+	// Verify the Tester Image's version sentinel before running, so a stale
+	// image can't silently produce wrong results (ADR-0011, fail-loud).
+	if err := dispatch.VerifyImageVersion(ctx, runner, string(imageID), cfg.Versions[spec.Target]); err != nil {
+		fmt.Fprintf(stderr, "submit --execute: %v\n", err)
+		return exitInconclusive
+	}
+
+	// Estimate fallback: when the agent gave no estimateMs, base the deadline on
+	// the median of recent passing runs for this target (ADR-0021 Decision 1).
+	telemetryPath := telemetry.RepoLogPath(spec.Repo)
+	history, _ := telemetry.Load(telemetryPath) // missing log is normal; best-effort
+	median := telemetry.MedianDurationMs(history, spec.Target)
+
 	now := time.Now()
-	eff := spec.Budget.EffectiveDeadlineMs(0) // telemetry median wiring is a follow-up
+	eff := spec.Budget.EffectiveDeadlineMs(median)
 	deadlineEpochMs := now.Add(time.Duration(eff) * time.Millisecond).UnixMilli()
 
 	rep, err := dispatch.RunCopyIn(ctx, runner, spec, string(imageID), spec.Repo, deadlineEpochMs, eff, now)
 	if err != nil {
 		fmt.Fprintf(stderr, "submit --execute: run: %v\n", err)
 		return exitInconclusive
+	}
+
+	// Record the run so the median and runaway leaderboard accumulate (D3/§F).
+	rec := telemetry.RunRecord{
+		RunID: spec.RunID, Target: spec.Target, Outcome: string(rep.Outcome),
+		DurationMs: int64(rep.DurationMs), Reaped: rep.Outcome == report.OutcomeReaped,
+	}
+	if rep.Kill != nil {
+		rec.ReapReason = string(rep.Kill.Reason)
+	}
+	if appendErr := telemetry.Append(telemetryPath, rec); appendErr != nil {
+		fmt.Fprintf(stderr, "submit --execute: warning: telemetry append: %v\n", appendErr)
 	}
 
 	enc := json.NewEncoder(stdout)

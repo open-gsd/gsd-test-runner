@@ -88,4 +88,6 @@ Landed (TDD, verified — Go suite + `node --test` + live Docker where noted):
 - `internal/telemetry` — per-repo JSONL log + runaway leaderboard (Decision 3 / §F).
 - Dockerfiles bake `watchdog.mjs`; `agent-integration/` routes `node --test`/`npm test` to the front door (§G).
 
-Remaining integration (own follow-up): wire `gsd-test submit` through worktree copy-in + Bench selection into `dispatch.Run` (folds into the pipeline's RunTests leg), and the Windows orphaned-`node.exe` Bench gate (Decision 4) which needs a Windows Bench.
+Also landed: `gsd-test submit --execute` wires the front door through Bench selection + `images.EnsurePresent` + copy-in (`dispatch.Exec`) into the watchdog run (proven end-to-end against the real Linux Tester Image); the OCI image-version sentinel check on this path (`dispatch.VerifyImageVersion`, ADR-0011); and the telemetry-median estimate fallback with per-run append to the persistent Workstation log (`telemetry.MedianDurationMs` / `RepoLogPath` under `$XDG_STATE_HOME`).
+
+Remaining: the Windows orphaned-`node.exe` Bench gate (Decision 4) — the `taskkill /T` path and a gated integration test (`TestE2E_Windows_WatchdogReapsViaTaskkill`) exist, but verification requires a Windows-container Bench (skips on Linux/macOS daemons).
