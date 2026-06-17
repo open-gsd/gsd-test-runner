@@ -20,6 +20,12 @@ const (
 	DefaultCPUs      = "2"
 )
 
+// ReporterPath is the in-image path of the JSON Lines reporter. The run-and-die
+// node --test command emits structured events through it to stdout so the
+// watchdog can track in-flight tests (kill.last_active_test) and per-test
+// telemetry, rather than parsing TAP.
+const ReporterPath = "/opt/gsd-test/reporter.mjs"
+
 // isNodeTestPath reports whether spec.TestCommand follows the node --test
 // convention that warrants hardening flags. The check requires at least two
 // elements, element[0] == "node", and the slice must contain "--test".
@@ -69,6 +75,11 @@ func TestRunnerArgs(spec runspec.Spec, effectiveDeadlineMs int64) []string {
 	} else {
 		result = append(result, "--test-concurrency="+DefaultCPUs)
 	}
+
+	// Emit structured events through the JSON reporter to stdout so the watchdog
+	// can track in-flight tests and per-test telemetry (ADR-0021 §C/§F).
+	result = append(result, "--test-reporter="+ReporterPath)
+	result = append(result, "--test-reporter-destination=stdout")
 
 	result = append(result, spec.TestPathPatterns...)
 	return result

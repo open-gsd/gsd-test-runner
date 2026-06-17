@@ -77,6 +77,10 @@ func TestE2E_CopyIn_PassingRun(t *testing.T) {
 	if rep.Outcome != report.OutcomePassed {
 		t.Errorf("Outcome = %q, want passed", rep.Outcome)
 	}
+	// Per-test telemetry is captured via the JSON reporter.
+	if len(rep.PerTest) == 0 || rep.PerTest[0].Status != "passed" {
+		t.Errorf("per-test telemetry not captured: %+v", rep.PerTest)
+	}
 }
 
 // TestE2E_CopyIn_WedgeReaped proves the watchdog backstop. Under isolation=none
@@ -114,6 +118,13 @@ func TestE2E_CopyIn_WedgeReaped(t *testing.T) {
 	if rep.Kill == nil || rep.Kill.ReapedBy != report.ReapedByInContainer {
 		t.Errorf("Kill = %+v, want in_container reap", rep.Kill)
 	}
+	// NOTE: a *synchronous* busy loop blocks the runner's event loop, so the
+	// reporter cannot emit test:start before the wedge — kill.last_active_test
+	// is legitimately unavailable for a CPU-blocked runner (the reporter is
+	// blocked too). The container-teardown guarantee still holds; attribution is
+	// best-effort. Per-test attribution is exercised by TestE2E_CopyIn_PassingRun
+	// (events flow for tests that yield to the event loop) and the watchdog/
+	// dispatch unit tests.
 }
 
 // TestE2E_CopyIn_NpmCiAndBuild proves the entry script runs `npm ci` and

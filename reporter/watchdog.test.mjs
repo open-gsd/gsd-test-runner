@@ -8,26 +8,42 @@ import { ActiveTracker, runWithWatchdog } from './watchdog.mjs';
 
 test('ActiveTracker tracks the in-flight test and clears it on completion', () => {
   const tr = new ActiveTracker(() => 1000);
-  tr.observe({ type: 'test:start', file: 'a.test.js', name: 'alpha' });
+  tr.observe({ type: 'test:start', data: { file: '/work/a.test.js', name: 'alpha' } });
   let snap = tr.snapshot(1000);
   assert.equal(snap.lastActiveTest.name, 'alpha');
+  assert.equal(snap.lastActiveTest.file, 'a.test.js'); // /work/ stripped
   assert.equal(snap.inFlightTests.length, 1);
 
-  tr.observe({ type: 'test:pass', file: 'a.test.js', name: 'alpha' });
+  tr.observe({ type: 'test_event', kind: 'pass', file: 'a.test.js', name: 'suite > alpha', duration_ms: 12 });
   snap = tr.snapshot(1000);
   assert.equal(snap.inFlightTests.length, 0);
+
+  const stats = tr.perTest(1000, false);
+  assert.equal(stats.length, 1);
+  assert.equal(stats[0].status, 'passed');
+  assert.equal(stats[0].durationMs, 12);
+  assert.equal(stats[0].exitedClean, true);
 });
 
 test('ActiveTracker lastActiveTest is the most recently started in-flight test', () => {
   const tr = new ActiveTracker(() => 0);
-  tr.observe({ type: 'test:start', file: 'a.test.js', name: 'alpha' });
-  tr.observe({ type: 'test:start', file: 'b.test.js', name: 'beta' });
+  tr.observe({ type: 'test:start', data: { file: 'a.test.js', name: 'alpha' } });
+  tr.observe({ type: 'test:start', data: { file: 'b.test.js', name: 'beta' } });
   const snap = tr.snapshot(5000);
   assert.equal(snap.lastActiveTest.name, 'beta');
   assert.equal(snap.inFlightTests.length, 2);
-  // startedMsAgo is computed from the snapshot clock.
   const beta = snap.inFlightTests.find((t) => t.name === 'beta');
   assert.equal(beta.startedMsAgo, 5000);
+});
+
+test('ActiveTracker perTest marks in-flight tests killed when reaped', () => {
+  const tr = new ActiveTracker(() => 0);
+  tr.observe({ type: 'test:start', data: { file: 'hang.test.js', name: 'wedges' } });
+  const stats = tr.perTest(2000, true);
+  assert.equal(stats.length, 1);
+  assert.equal(stats[0].status, 'killed');
+  assert.equal(stats[0].exitedClean, false);
+  assert.equal(stats[0].durationMs, 2000);
 });
 
 // ── runWithWatchdog — deadline + escalating SIGTERM→SIGKILL (ADR-0021 D4) ──
@@ -73,10 +89,12 @@ test('reaped kill record carries the last active test', async () => {
   const p = runWithWatchdog({ child, deadlineMs: 40, graceMs: 20 });
   // Emit after the watchdog has attached its stdout handler.
   child.stdout.emit('data',
-    Buffer.from(JSON.stringify({ type: 'test:start', file: 'db.test.js', name: 'reconnects' }) + '\n'));
+    Buffer.from(JSON.stringify({ type: 'test:start', data: { file: 'db.test.js', name: 'reconnects' } }) + '\n'));
   const res = await p;
   assert.equal(res.outcome, 'reaped');
   assert.equal(res.kill.lastActiveTest.name, 'reconnects');
+  // The reaped envelope carries per-test telemetry: the in-flight test is killed.
+  assert.ok(res.perTest.some((t) => t.name === 'reconnects' && t.status === 'killed'));
 });
 
 // Real-spawn integration: a genuinely hanging node process must be reaped and

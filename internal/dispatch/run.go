@@ -38,7 +38,14 @@ func entryScript(target string) string {
 type envelope struct {
 	Outcome  string `json:"outcome"` // "completed" | "reaped"
 	ExitCode *int   `json:"exitCode"`
-	Kill     *struct {
+	PerTest  []struct {
+		File        string  `json:"file"`
+		Name        string  `json:"name"`
+		DurationMs  float64 `json:"durationMs"`
+		Status      string  `json:"status"`
+		ExitedClean bool    `json:"exitedClean"`
+	} `json:"perTest"`
+	Kill *struct {
 		Reason              string `json:"reason"`
 		ReapedBy            string `json:"reapedBy"`
 		EffectiveDeadlineMs int64  `json:"effectiveDeadlineMs"`
@@ -108,6 +115,12 @@ func reportFromEnvelope(out []byte, spec runspec.Spec, imageID string, startedAt
 	}
 
 	rep := report.New(spec.Target, "", imageID, "", startedAt)
+	for _, ts := range env.PerTest {
+		rep.PerTest = append(rep.PerTest, report.TestStat{
+			File: ts.File, Name: ts.Name, DurationMs: ts.DurationMs,
+			Status: ts.Status, ExitedClean: ts.ExitedClean,
+		})
+	}
 
 	switch env.Outcome {
 	case "reaped":

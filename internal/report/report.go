@@ -35,6 +35,17 @@ const (
 	OutcomeInfraError Outcome = "infra_error"
 )
 
+// TestStat is per-test telemetry for the result envelope (ADR-0021 §F). Status
+// is "passed", "failed", or "killed"; ExitedClean is false for a test that was
+// still in flight when the run was reaped.
+type TestStat struct {
+	File        string  `json:"file"`
+	Name        string  `json:"name"`
+	DurationMs  float64 `json:"duration_ms"`
+	Status      string  `json:"status"`
+	ExitedClean bool    `json:"exited_clean"`
+}
+
 // KillReason explains why a run was reaped (ADR-0021 Decision 1/2).
 type KillReason string
 
@@ -164,6 +175,10 @@ type Report struct {
 
 	// Kill is the kill record, present only when Outcome == OutcomeReaped.
 	Kill *KillRecord `json:"kill,omitempty"`
+
+	// PerTest is per-test telemetry derived from the reporter events the
+	// watchdog observed (ADR-0021 §F). Empty for non-run-and-die reports.
+	PerTest []TestStat `json:"per_test,omitempty"`
 
 	// OS is the Bench.OS value ("linux", "windows", "macos-container").
 	OS string `json:"os"`

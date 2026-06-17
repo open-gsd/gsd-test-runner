@@ -39,6 +39,8 @@ func TestRunnerArgs_NodePath_AllHardeningFlagsInOrder(t *testing.T) {
 		"--test-timeout=180000",
 		"--experimental-test-isolation=process",
 		"--test-concurrency=2",
+		"--test-reporter=/opt/gsd-test/reporter.mjs",
+		"--test-reporter-destination=stdout",
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("TestRunnerArgs =\n  %v\nwant\n  %v", got, want)
@@ -55,6 +57,8 @@ func TestRunnerArgs_NodePath_WithPatterns(t *testing.T) {
 		"--test-timeout=60000",
 		"--experimental-test-isolation=process",
 		"--test-concurrency=2",
+		"--test-reporter=/opt/gsd-test/reporter.mjs",
+		"--test-reporter-destination=stdout",
 		"test/**/*.test.js",
 		"src/**/*.test.js",
 	}
@@ -73,6 +77,8 @@ func TestRunnerArgs_NodePath_IsolationNone(t *testing.T) {
 		"--test-timeout=90000",
 		"--experimental-test-isolation=none",
 		"--test-concurrency=2",
+		"--test-reporter=/opt/gsd-test/reporter.mjs",
+		"--test-reporter-destination=stdout",
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("TestRunnerArgs =\n  %v\nwant\n  %v", got, want)
@@ -89,6 +95,8 @@ func TestRunnerArgs_NodePath_ConcurrencyPinWhenSet(t *testing.T) {
 		"--test-timeout=120000",
 		"--experimental-test-isolation=process",
 		"--test-concurrency=4",
+		"--test-reporter=/opt/gsd-test/reporter.mjs",
+		"--test-reporter-destination=stdout",
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("TestRunnerArgs =\n  %v\nwant\n  %v", got, want)
@@ -122,6 +130,8 @@ func TestRunnerArgs_NodePath_ConcurrencyAndPatterns(t *testing.T) {
 		"--test-timeout=45000",
 		"--experimental-test-isolation=process",
 		"--test-concurrency=2",
+		"--test-reporter=/opt/gsd-test/reporter.mjs",
+		"--test-reporter-destination=stdout",
 		"tests/unit",
 	}
 	if !reflect.DeepEqual(got, want) {

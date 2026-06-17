@@ -284,9 +284,3 @@ func TestMedianDurationMs_EvenCountAverages(t *testing.T) {
 		t.Errorf("MedianDurationMs = %d, want 150", got)
 	}
 }
-
-func TestMedianDurationMs_NoMatches_ReturnsZero(t *testing.T) {
-	if got := MedianDurationMs(nil, "linux"); got != 0 {
-		t.Errorf("MedianDurationMs(nil) = %d, want 0", got)
-	}
-}

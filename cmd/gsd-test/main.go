@@ -414,6 +414,12 @@ func executeSpec(spec runspec.Spec, configPath string, stdout, stderr *os.File) 
 	if rep.Kill != nil {
 		rec.ReapReason = string(rep.Kill.Reason)
 	}
+	for _, ts := range rep.PerTest {
+		rec.PerTest = append(rec.PerTest, telemetry.TestStat{
+			File: ts.File, Name: ts.Name, DurationMs: int64(ts.DurationMs),
+			Status: ts.Status, ExitedClean: ts.ExitedClean,
+		})
+	}
 	if appendErr := telemetry.Append(telemetryPath, rec); appendErr != nil {
 		fmt.Fprintf(stderr, "submit --execute: warning: telemetry append: %v\n", appendErr)
 	}

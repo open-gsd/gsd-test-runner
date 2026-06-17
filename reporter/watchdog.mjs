@@ -16,29 +16,45 @@ import { pathToFileURL } from 'node:url';
 // failure (1) so the Local Engine can tell "killed" from "failed".
 export const EXIT_REAPED = 75;
 
-const TEST_START = 'test:start';
-const TEST_DONE = new Set(['test:pass', 'test:fail', 'test:complete']);
+// normFile strips the contractual /work/ prefix so test:start file paths
+// (raw, absolute) match the reporter's repo-relative paths.
+function normFile(f) {
+  if (typeof f !== 'string') return '';
+  return f.startsWith('/work/') ? f.slice('/work/'.length) : f;
+}
 
 /**
- * ActiveTracker observes reporter JSONL events and reports which tests were
- * in flight at a given instant. Feeds kill.lastActiveTest / kill.inFlightTests
- * (ADR-0021 §C). Under process isolation these are precise; under isolation
- * "none" the caller marks them best-effort (Decision 5).
+ * ActiveTracker consumes the reporter's JSONL events (reporter/reporter.mjs):
+ *   - test:start  -> { type:'test:start', data:{ name, file } }   (passthrough)
+ *   - completion  -> { type:'test_event', kind:'pass'|'fail', file, name, duration_ms }
+ * It reports which tests were in flight at a given instant (kill.lastActiveTest
+ * / inFlightTests, ADR-0021 §C) and accumulates per-test telemetry (§F). Under
+ * process isolation attribution is precise; under isolation "none" the caller
+ * marks it best-effort (Decision 5). In-flight matching is FIFO by file.
  */
 export class ActiveTracker {
   constructor(now = Date.now) {
     this._now = now;
-    this._inFlight = []; // { file, name, startedAt }, insertion-ordered
+    this._inFlight = [];  // { file, name, startedAt }, insertion-ordered
+    this._completed = []; // { file, name, durationMs, status, exitedClean }
   }
 
   observe(event) {
     if (!event || typeof event.type !== 'string') return;
-    if (event.type === TEST_START) {
-      this._inFlight.push({ file: event.file, name: event.name, startedAt: this._now() });
-    } else if (TEST_DONE.has(event.type)) {
-      this._inFlight = this._inFlight.filter(
-        (t) => !(t.name === event.name && t.file === event.file),
-      );
+    if (event.type === 'test:start') {
+      const d = event.data || {};
+      this._inFlight.push({ file: normFile(d.file), name: d.name || '', startedAt: this._now() });
+    } else if (event.type === 'test_event') {
+      const file = normFile(event.file);
+      const idx = this._inFlight.findIndex((t) => t.file === file);
+      if (idx >= 0) this._inFlight.splice(idx, 1);
+      this._completed.push({
+        file,
+        name: event.name || '',
+        durationMs: typeof event.duration_ms === 'number' ? event.duration_ms : 0,
+        status: event.kind === 'fail' ? 'failed' : 'passed',
+        exitedClean: true,
+      });
     }
   }
 
@@ -53,6 +69,22 @@ export class ActiveTracker {
       lastActiveTest: last ? { file: last.file, name: last.name } : null,
       inFlightTests,
     };
+  }
+
+  /**
+   * perTest returns per-test telemetry. Completed tests carry their duration
+   * and pass/fail status; when the run was killed, tests still in flight are
+   * recorded as status 'killed' with exitedClean:false — a leading indicator
+   * for the runaway leaderboard that raising the estimate cannot hide.
+   */
+  perTest(nowMs, killed) {
+    const out = this._completed.map((t) => ({ ...t }));
+    if (killed) {
+      for (const t of this._inFlight) {
+        out.push({ file: t.file, name: t.name, durationMs: nowMs - t.startedAt, status: 'killed', exitedClean: false });
+      }
+    }
+    return out;
   }
 }
 
@@ -161,11 +193,12 @@ export function runWithWatchdog(opts) {
     child.on('exit', (code) => {
       clearTimeout(deadlineTimer);
       clearTimeout(killTimer);
+      const perTest = tracker.perTest(Date.now(), !!kill);
       if (kill) {
         kill.elapsedMs = elapsed();
-        resolve({ outcome: 'reaped', exitCode: code, kill });
+        resolve({ outcome: 'reaped', exitCode: code, kill, perTest });
       } else {
-        resolve({ outcome: 'completed', exitCode: code ?? 0 });
+        resolve({ outcome: 'completed', exitCode: code ?? 0, perTest });
       }
     });
   });

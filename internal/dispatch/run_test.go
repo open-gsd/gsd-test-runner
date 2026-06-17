@@ -130,3 +130,21 @@ func TestInContainerCommand_WindowsEntryScript(t *testing.T) {
 		t.Errorf("entry = %q, want %q", got[0], dispatch.EntryScriptWindows)
 	}
 }
+
+func TestRun_MapsPerTestTelemetry(t *testing.T) {
+	env := `{"outcome":"completed","exitCode":0,"perTest":[` +
+		`{"file":"a.test.js","name":"alpha","durationMs":12,"status":"passed","exitedClean":true},` +
+		`{"file":"b.test.js","name":"beta","durationMs":2000,"status":"killed","exitedClean":false}]}`
+	var got []string
+	rep, err := dispatch.Run(context.Background(), captureRunner(env, &got),
+		specFor("linux"), "img:v2", 1_000_000, 60000, startedAt)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if len(rep.PerTest) != 2 {
+		t.Fatalf("PerTest len = %d, want 2: %+v", len(rep.PerTest), rep.PerTest)
+	}
+	if rep.PerTest[1].Status != "killed" || rep.PerTest[1].ExitedClean {
+		t.Errorf("PerTest[1] = %+v, want killed/exitedClean=false", rep.PerTest[1])
+	}
+}
