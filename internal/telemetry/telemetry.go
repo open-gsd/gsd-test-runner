@@ -55,9 +55,19 @@ func (e *MalformedLineError) Error() string {
 
 func (e *MalformedLineError) Unwrap() error { return e.Err }
 
-// RepoLogPath returns the canonical JSONL telemetry path for a repo root.
+// RepoLogPath returns the persistent, Workstation-side telemetry log path for a
+// repo (ADR-0021 Decision 3): $XDG_STATE_HOME/gsd-test/<repo-base>/telemetry.jsonl,
+// falling back to ~/.local/state. It is deliberately NOT inside the repo or
+// worktree — the run-and-die worktree is ephemeral (copied into containers and
+// then cleaned up), so telemetry kept there would be lost between runs.
 func RepoLogPath(repo string) string {
-	return filepath.Join(repo, ".gsd-test", "telemetry.jsonl")
+	stateDir := os.Getenv("XDG_STATE_HOME")
+	if stateDir == "" {
+		if home, err := os.UserHomeDir(); err == nil {
+			stateDir = filepath.Join(home, ".local", "state")
+		}
+	}
+	return filepath.Join(stateDir, "gsd-test", filepath.Base(repo), "telemetry.jsonl")
 }
 
 // Append encodes rec as a compact JSON object and appends it (with a
@@ -171,4 +181,27 @@ func Leaderboard(records []RunRecord) []SuspectTest {
 	})
 
 	return suspects
+}
+
+// MedianDurationMs returns the median DurationMs across passing runs of the
+// given target — the basis for the reaper's estimate when an agent supplies no
+// estimateMs (ADR-0021 Decision 1). Returns 0 when there is no passing history,
+// in which case the caller falls back to the hard cap. Only "passed" runs count;
+// reaped/failed durations are not representative of a healthy run.
+func MedianDurationMs(records []RunRecord, target string) int64 {
+	var ds []int64
+	for _, r := range records {
+		if r.Target == target && r.Outcome == "passed" {
+			ds = append(ds, r.DurationMs)
+		}
+	}
+	if len(ds) == 0 {
+		return 0
+	}
+	sort.Slice(ds, func(i, j int) bool { return ds[i] < ds[j] })
+	n := len(ds)
+	if n%2 == 1 {
+		return ds[n/2]
+	}
+	return (ds[n/2-1] + ds[n/2]) / 2
 }

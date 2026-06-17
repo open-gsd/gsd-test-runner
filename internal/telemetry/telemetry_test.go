@@ -9,11 +9,16 @@ import (
 
 // --- RepoLogPath ---
 
-func TestRepoLogPath_ReturnsJSONLPath(t *testing.T) {
-	got := RepoLogPath("/home/user/myrepo")
-	want := "/home/user/myrepo/.gsd-test/telemetry.jsonl"
+func TestRepoLogPath_PersistentWorkstationPath(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", "/state")
+	got := RepoLogPath("/tmp/scratch/myrepo")
+	want := "/state/gsd-test/myrepo/telemetry.jsonl"
 	if got != want {
 		t.Errorf("RepoLogPath = %q, want %q", got, want)
+	}
+	// Must not live inside the (ephemeral) repo/worktree.
+	if filepath.Dir(filepath.Dir(got)) == "/tmp/scratch/myrepo" {
+		t.Error("telemetry must not be stored inside the worktree")
 	}
 }
 
@@ -254,5 +259,34 @@ func TestLeaderboard_RunCountIsCorrect(t *testing.T) {
 	}
 	if got[0].ReaperTrips != 2 {
 		t.Errorf("ReaperTrips = %d, want 2", got[0].ReaperTrips)
+	}
+}
+
+func TestMedianDurationMs_PassingRunsForTarget(t *testing.T) {
+	recs := []RunRecord{
+		{Target: "linux", Outcome: "passed", DurationMs: 100},
+		{Target: "linux", Outcome: "passed", DurationMs: 300},
+		{Target: "linux", Outcome: "passed", DurationMs: 200},
+		{Target: "linux", Outcome: "reaped", DurationMs: 999999}, // excluded
+		{Target: "windows", Outcome: "passed", DurationMs: 50},   // other target
+	}
+	if got := MedianDurationMs(recs, "linux"); got != 200 {
+		t.Errorf("MedianDurationMs(linux) = %d, want 200", got)
+	}
+}
+
+func TestMedianDurationMs_EvenCountAverages(t *testing.T) {
+	recs := []RunRecord{
+		{Target: "linux", Outcome: "passed", DurationMs: 100},
+		{Target: "linux", Outcome: "passed", DurationMs: 200},
+	}
+	if got := MedianDurationMs(recs, "linux"); got != 150 {
+		t.Errorf("MedianDurationMs = %d, want 150", got)
+	}
+}
+
+func TestMedianDurationMs_NoMatches_ReturnsZero(t *testing.T) {
+	if got := MedianDurationMs(nil, "linux"); got != 0 {
+		t.Errorf("MedianDurationMs(nil) = %d, want 0", got)
 	}
 }
