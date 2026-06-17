@@ -1,0 +1,124 @@
+package dispatch
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"time"
+
+	"github.com/open-gsd/gsd-test-runner/internal/reaper"
+	"github.com/open-gsd/gsd-test-runner/internal/report"
+	"github.com/open-gsd/gsd-test-runner/internal/runspec"
+)
+
+// WatchdogPath is the contractual in-image path the Dockerfiles bake the
+// watchdog to (see dockerfiles/*.Dockerfile).
+const WatchdogPath = "/opt/gsd-test/watchdog.mjs"
+
+// envelope mirrors the JSON the watchdog (reporter/watchdog.mjs) prints. Field
+// names are the watchdog's camelCase, distinct from report's snake_case.
+type envelope struct {
+	Outcome  string `json:"outcome"` // "completed" | "reaped"
+	ExitCode *int   `json:"exitCode"`
+	Kill     *struct {
+		Reason              string `json:"reason"`
+		ReapedBy            string `json:"reapedBy"`
+		EffectiveDeadlineMs int64  `json:"effectiveDeadlineMs"`
+		ElapsedMs           int64  `json:"elapsedMs"`
+		LastActiveTest      *struct {
+			File string `json:"file"`
+			Name string `json:"name"`
+		} `json:"lastActiveTest"`
+		InFlightTests []struct {
+			File         string `json:"file"`
+			Name         string `json:"name"`
+			StartedMsAgo int64  `json:"startedMsAgo"`
+		} `json:"inFlightTests"`
+		SignalChain []string `json:"signalChain"`
+		Granularity string   `json:"granularity"`
+	} `json:"kill"`
+}
+
+// InContainerCommand builds the watchdog-wrapped test command appended after
+// the image in the docker argv: the watchdog enforces the effective deadline
+// and wraps the hardened node --test invocation (ADR-0021 §B/E). Under
+// isolation=none it passes --granularity process so the kill record marks
+// attribution best-effort (Decision 5).
+func InContainerCommand(spec runspec.Spec, effectiveDeadlineMs int64) []string {
+	cmd := []string{"node", WatchdogPath, "--deadline-ms", fmt.Sprint(effectiveDeadlineMs)}
+	if spec.Isolation == runspec.IsolationNone {
+		cmd = append(cmd, "--granularity", "process")
+	}
+	cmd = append(cmd, "--")
+	cmd = append(cmd, TestRunnerArgs(spec, effectiveDeadlineMs)...)
+	return cmd
+}
+
+// Run executes the spec's tests in a disposable, resource-capped container via
+// runner (docker over SSH in prod; local docker in tests), parses the watchdog
+// envelope, and returns the per-OS Report. A reaped run becomes a loud
+// OutcomeReaped report with the kill record attached (ADR-0021 Decision 6).
+func Run(ctx context.Context, runner reaper.Runner, spec runspec.Spec, imageID string, deadlineEpochMs, effectiveDeadlineMs int64, startedAt time.Time) (report.Report, error) {
+	args := DockerRunArgs(spec, imageID, deadlineEpochMs, "")
+	args = append(args, InContainerCommand(spec, effectiveDeadlineMs)...)
+
+	out, err := runner(ctx, args...)
+	if err != nil {
+		return report.Report{}, fmt.Errorf("dispatch: run container: %w", err)
+	}
+
+	var env envelope
+	if jerr := json.Unmarshal(out, &env); jerr != nil {
+		return report.Report{}, fmt.Errorf("dispatch: parse watchdog envelope: %w", jerr)
+	}
+
+	rep := report.New(spec.Target, "", imageID, "", startedAt)
+
+	switch env.Outcome {
+	case "reaped":
+		rep.MarkReaped(endTime(startedAt, env), mapKill(env))
+	case "completed":
+		if env.ExitCode != nil && *env.ExitCode != 0 {
+			rep.Kind = report.KindFail
+			rep.Outcome = report.OutcomeFailed
+			rep.DurationMs = float64(endTime(startedAt, env).Sub(startedAt).Milliseconds())
+		} else {
+			rep.Finalize(endTime(startedAt, env))
+		}
+	default:
+		return report.Report{}, fmt.Errorf("dispatch: unknown watchdog outcome %q", env.Outcome)
+	}
+	return rep, nil
+}
+
+// endTime derives the run end from the watchdog's elapsed measurement when
+// available, falling back to the start instant.
+func endTime(startedAt time.Time, env envelope) time.Time {
+	if env.Kill != nil && env.Kill.ElapsedMs > 0 {
+		return startedAt.Add(time.Duration(env.Kill.ElapsedMs) * time.Millisecond)
+	}
+	return startedAt
+}
+
+// mapKill translates the watchdog's camelCase kill record into report's typed
+// KillRecord.
+func mapKill(env envelope) report.KillRecord {
+	k := env.Kill
+	kr := report.KillRecord{
+		Reason:              report.KillReason(k.Reason),
+		ReapedBy:            report.ReapedBy(k.ReapedBy),
+		EffectiveDeadlineMs: k.EffectiveDeadlineMs,
+		ElapsedMs:           k.ElapsedMs,
+		SignalChain:         k.SignalChain,
+		Granularity:         k.Granularity,
+	}
+	if k.LastActiveTest != nil {
+		kr.LastActiveTest = &report.ActiveTest{File: k.LastActiveTest.File, Name: k.LastActiveTest.Name}
+	}
+	for _, f := range k.InFlightTests {
+		kr.InFlightTests = append(kr.InFlightTests, report.InFlightTest{
+			File: f.File, Name: f.Name, StartedMsAgo: f.StartedMsAgo,
+		})
+	}
+	return kr
+}
