@@ -4,9 +4,13 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
+	"time"
+
+	"github.com/open-gsd/gsd-test-runner/internal/reaper"
 )
 
 var execImageOnce sync.Once
@@ -82,5 +86,61 @@ func TestE2E_SubmitExecute_PassingRun(t *testing.T) {
 	}
 	if !strings.Contains(out, `"outcome": "passed"`) {
 		t.Errorf("report did not show passed outcome:\n%s", out)
+	}
+}
+
+// TestE2E_SubmitExecute_SweepsStaleContainer proves the Tier-2 reaper runs on
+// contact: a labelled container whose deadline has already passed is killed
+// when `submit --execute` starts (ADR-0021 Decision 2).
+func TestE2E_SubmitExecute_SweepsStaleContainer(t *testing.T) {
+	ensureTesterImage(t)
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	dir := t.TempDir()
+
+	worktree := filepath.Join(dir, "worktree")
+	if err := os.MkdirAll(worktree, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(worktree, "ok.test.mjs"),
+		[]byte("import { test } from 'node:test';\ntest('ok', () => {});\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfgPath := filepath.Join(dir, "config.toml")
+	cfg := "[defaults]\ntargets = [\"linux\"]\n\n" +
+		"[[benches]]\nname = \"local-linux\"\nhost = \"local\"\nos = \"linux\"\n\n" +
+		"[versions]\nlinux = \"e2e\"\n\n[testing]\ncommand = \"node --test\"\n"
+	if err := os.WriteFile(cfgPath, []byte(cfg), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	specPath := filepath.Join(dir, "spec.json")
+	if err := os.WriteFile(specPath, []byte(`{"repo":"`+worktree+`","target":"linux"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Plant a stale run container with a deadline in the past.
+	past := time.Now().Add(-time.Hour).UnixMilli()
+	idOut, err := exec.Command("docker", "run", "-d", "--rm",
+		"--label", reaper.LabelRunID+"=stale-sweep-it",
+		"--label", reaper.LabelDeadline+"="+strconv.FormatInt(past, 10),
+		"alpine:3", "sleep", "300").Output()
+	if err != nil {
+		t.Fatalf("plant stale container: %v", err)
+	}
+	staleID := strings.TrimSpace(string(idOut))
+	t.Cleanup(func() { _ = exec.Command("docker", "rm", "-f", staleID).Run() })
+
+	rOut, wOut, _ := os.Pipe()
+	code := run([]string{"submit", "--execute", "--config", cfgPath, "--spec-file", specPath}, wOut, os.Stderr)
+	wOut.Close()
+	_ = readPipe(rOut)
+	if code != 0 {
+		t.Fatalf("submit --execute exit = %d, want 0", code)
+	}
+
+	// The stale container must have been swept.
+	psOut, _ := exec.Command("docker", "ps", "-q", "--no-trunc", "--filter", "id="+staleID).Output()
+	if strings.TrimSpace(string(psOut)) != "" {
+		t.Errorf("stale container %s survived; Tier-2 sweep did not run", staleID)
 	}
 }

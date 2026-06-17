@@ -36,6 +36,7 @@ import (
 	"github.com/open-gsd/gsd-test-runner/internal/images"
 	"github.com/open-gsd/gsd-test-runner/internal/pipeline"
 	"github.com/open-gsd/gsd-test-runner/internal/plan"
+	"github.com/open-gsd/gsd-test-runner/internal/reaper"
 	"github.com/open-gsd/gsd-test-runner/internal/refs"
 	"github.com/open-gsd/gsd-test-runner/internal/renderer"
 	"github.com/open-gsd/gsd-test-runner/internal/report"
@@ -370,6 +371,16 @@ func executeSpec(spec runspec.Spec, configPath string, stdout, stderr *os.File) 
 	runner := func(ctx context.Context, args ...string) ([]byte, error) {
 		out, runErr := dockerexec.Run(ctx, b, args)
 		return []byte(out), runErr
+	}
+
+	// Tier-2 reaper, "reap on next contact" (ADR-0021 Decision 2): before
+	// starting, kill any run container on this Bench whose deadline has passed —
+	// e.g. one whose in-container watchdog wedged on a previous run. Best-effort;
+	// a sweep failure must not block this run.
+	if reaped, sweepErr := reaper.Sweep(ctx, runner, time.Now().UnixMilli()); sweepErr != nil {
+		fmt.Fprintf(stderr, "submit --execute: warning: reaper sweep: %v\n", sweepErr)
+	} else if len(reaped) > 0 {
+		fmt.Fprintf(stderr, "submit --execute: reaped %d stale container(s) before running\n", len(reaped))
 	}
 
 	// Verify the Tester Image's version sentinel before running, so a stale
