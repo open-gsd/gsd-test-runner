@@ -66,7 +66,22 @@ func Run(ctx context.Context, runner reaper.Runner, spec runspec.Spec, imageID s
 	if err != nil {
 		return report.Report{}, fmt.Errorf("dispatch: run container: %w", err)
 	}
+	return reportFromEnvelope(out, spec, imageID, startedAt)
+}
 
+// RunCopyIn is the production run-and-die path: it copies the PR-merged
+// worktree into a disposable container (dispatch.Exec, ADR-0002/D7), runs the
+// watchdog-wrapped suite, and maps the envelope to a Report.
+func RunCopyIn(ctx context.Context, runner reaper.Runner, spec runspec.Spec, imageID, worktreeDir string, deadlineEpochMs, effectiveDeadlineMs int64, startedAt time.Time) (report.Report, error) {
+	out, err := Exec(ctx, runner, spec, imageID, worktreeDir, deadlineEpochMs, effectiveDeadlineMs)
+	if err != nil {
+		return report.Report{}, err
+	}
+	return reportFromEnvelope(out, spec, imageID, startedAt)
+}
+
+// reportFromEnvelope parses a watchdog JSON envelope and maps it to a Report.
+func reportFromEnvelope(out []byte, spec runspec.Spec, imageID string, startedAt time.Time) (report.Report, error) {
 	var env envelope
 	if jerr := json.Unmarshal(out, &env); jerr != nil {
 		return report.Report{}, fmt.Errorf("dispatch: parse watchdog envelope: %w", jerr)
