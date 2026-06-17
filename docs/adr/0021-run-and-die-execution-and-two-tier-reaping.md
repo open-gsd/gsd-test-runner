@@ -74,3 +74,18 @@ Every mechanism above reuses existing machinery: `dockerexec` + `context` cancel
 - **Storing telemetry on the Bench.** The Bench sees all runs, but it serves multiple repos and workstations and is meant to hold nothing; co-locating with the consuming agent on the Workstation is cleaner (Decision 3).
 - **Relying on in-container signal trees for the kill guarantee.** Works on Linux, unreliable on Windows where there are no POSIX process groups. Container teardown is uniform across OSes and becomes the guarantee instead (Decision 4).
 - **Inventing a tight default `estimateMs` when none is supplied.** Would false-positive-kill legitimately long suites and erode trust in the reaped outcome. Falling back to telemetry median (then the 1h hard cap) avoids punishing the no-estimate case (Decision 1).
+
+## Implementation status
+
+Landed (TDD, verified — Go suite + `node --test` + live Docker where noted):
+
+- `internal/runspec` — run-spec parse/validate, `Budget.EffectiveDeadlineMs` (Decision 1).
+- `gsd-test submit` — the run-spec front door (accept/normalize/assign RunID).
+- `internal/report` — `Outcome` + `KillRecord`, `schema_version` 2 (Decision 6).
+- `internal/reaper` — `Overdue` + Docker-backed `Sweep` (Decision 2); reaped against a live container.
+- `reporter/watchdog.mjs` — Tier-1 watchdog + CLI entrypoint (Decision 4); a real hanging `node --test` is reaped in a `node:22-alpine` container end-to-end.
+- `internal/dispatch` — hardened `node --test` / `docker run` arg builders (§E/§B) and `dispatch.Run` (execution core: assemble → run → envelope → report).
+- `internal/telemetry` — per-repo JSONL log + runaway leaderboard (Decision 3 / §F).
+- Dockerfiles bake `watchdog.mjs`; `agent-integration/` routes `node --test`/`npm test` to the front door (§G).
+
+Remaining integration (own follow-up): wire `gsd-test submit` through worktree copy-in + Bench selection into `dispatch.Run` (folds into the pipeline's RunTests leg), and the Windows orphaned-`node.exe` Bench gate (Decision 4) which needs a Windows Bench.
