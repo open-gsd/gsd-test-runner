@@ -1,7 +1,6 @@
 package main
 
 import (
-	"errors"
 	"os"
 	"strings"
 	"testing"
@@ -342,6 +341,3 @@ func TestRunAsync_DefaultRunIsUnchanged(t *testing.T) {
 		t.Errorf("blocking handoff banner missing; stderr:\n%s", stderr)
 	}
 }
-
-// Ensure the errors package is used (suppress unused import if tests above use it indirectly).
-var _ = errors.Is
