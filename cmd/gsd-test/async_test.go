@@ -1,7 +1,9 @@
 package main
 
 import (
+	"fmt"
 	"os"
+	"os/exec"
 	"strings"
 	"testing"
 	"time"
@@ -312,7 +314,288 @@ func TestStatus_UnknownRunID(t *testing.T) {
 	}
 }
 
-// TestRunAsync_DefaultRunIsUnchanged verifies the existing blocking behaviour
+// seedRunningStateWithOpts creates a running runstate with caller-controlled PID
+// and StartedAt so regression tests can inject dead PIDs and stale timestamps.
+func seedRunningStateWithOpts(t *testing.T, runID string, pid int, startedAt time.Time) {
+	t.Helper()
+	data := []byte(`{"repo":"/work","target":"linux"}`)
+	sp, err := runspec.Parse(data)
+	if err != nil {
+		t.Fatalf("seedRunningStateWithOpts: parse spec: %v", err)
+	}
+	sp.RunID = runID
+	st := runstate.State{
+		RunID:     runID,
+		Target:    sp.Target,
+		Repo:      sp.Repo,
+		Status:    runstate.StatusRunning,
+		PID:       pid,
+		StartedAt: startedAt,
+		UpdatedAt: time.Now().UTC(),
+		Spec:      *sp,
+	}
+	if err := runstate.Save(st); err != nil {
+		t.Fatalf("seedRunningStateWithOpts: save: %v", err)
+	}
+}
+
+// deadPID returns a PID that is guaranteed not to be alive. It spawns a trivial
+// process, waits for it to exit, then returns its (now-dead) PID.
+func deadPID(t *testing.T) int {
+	t.Helper()
+	cmd := exec.Command("true")
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("deadPID: start process: %v", err)
+	}
+	pid := cmd.Process.Pid
+	if err := cmd.Wait(); err != nil {
+		t.Fatalf("deadPID: wait for process: %v", err)
+	}
+	return pid
+}
+
+// ── Regression tests for fixes 1-3 ──────────────────────────────────────────
+
+// TestWait_DoneStateWithDeadPIDWinsOverLivenessGuard is a regression test for
+// Fix 1. The bug: waitRun checked workerPIDAlive on the STALE pre-sleep st
+// BEFORE reloading. If the worker wrote done and exited during the sleep, the
+// next iteration saw a dead PID on the old running struct and returned
+// exitInconclusive — discarding the real result.
+//
+// Scenario: seed running (dead PID). A goroutine overwrites the state with done
+// at ~50ms (before the 200ms sleep expires). waitRun wakes, checks PID on the
+// STALE running st (bug path), returns inconclusive. After the fix: reload
+// first, observe done, break out of the loop, render the real verdict.
+func TestWait_DoneStateWithDeadPIDWinsOverLivenessGuard(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("XDG_STATE_HOME", tmp)
+
+	const runID = "fix1-done-dead-pid-001"
+
+	// Use a real dead PID: spawn + wait a trivial process.
+	dpid := deadPID(t)
+
+	// Build the spec shared by both the running and done states.
+	data := []byte(`{"repo":"/work","target":"linux"}`)
+	sp, err := runspec.Parse(data)
+	if err != nil {
+		t.Fatalf("parse spec: %v", err)
+	}
+	sp.RunID = runID
+
+	// Seed a RUNNING state with the dead PID — this is what waitRun loads first.
+	runSt := runstate.State{
+		RunID:     runID,
+		Target:    sp.Target,
+		Repo:      sp.Repo,
+		Status:    runstate.StatusRunning,
+		PID:       dpid, // dead already — simulates worker-exited-after-writing-done
+		StartedAt: time.Now().UTC(),
+		UpdatedAt: time.Now().UTC(),
+		Spec:      *sp,
+	}
+	if err := runstate.Save(runSt); err != nil {
+		t.Fatalf("save running state: %v", err)
+	}
+
+	rep := &report.Report{
+		Outcome: report.OutcomePassed,
+		Total:   3,
+		Passed:  3,
+		PerTest: []report.TestStat{
+			{File: "x.test.js", Name: "ok", DurationMs: 5, Status: "passed", ExitedClean: true},
+			{File: "y.test.js", Name: "ok2", DurationMs: 6, Status: "passed", ExitedClean: true},
+			{File: "z.test.js", Name: "ok3", DurationMs: 7, Status: "passed", ExitedClean: true},
+		},
+	}
+	wantText, wantCode := runrender.Render(*rep)
+
+	// Overwrite the state with done at ~50ms — well before waitRun's 200ms sleep
+	// expires. This simulates the worker writing its final state mid-sleep.
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		doneSt := runstate.State{
+			RunID:     runID,
+			Target:    sp.Target,
+			Repo:      sp.Repo,
+			Status:    runstate.StatusDone,
+			PID:       dpid,
+			StartedAt: runSt.StartedAt,
+			UpdatedAt: time.Now().UTC(),
+			Spec:      *sp,
+			Report:    rep,
+			ExitCode:  wantCode,
+		}
+		_ = runstate.Save(doneSt)
+	}()
+
+	outR, outW, _ := os.Pipe()
+	errR, errW, _ := os.Pipe()
+	code := run([]string{"wait", runID}, outW, errW)
+	outW.Close()
+	errW.Close()
+	stdout := drain(outR)
+	stderr := drain(errR)
+
+	// The done state must win: real exit code + rendered verdict — NOT inconclusive.
+	if code != wantCode {
+		t.Errorf("exit code: got %d, want %d (done state with dead pid must win over liveness guard); stderr:\n%s",
+			code, wantCode, stderr)
+	}
+	if stdout != wantText {
+		t.Errorf("stdout mismatch:\ngot:\n%s\nwant:\n%s", stdout, wantText)
+	}
+	if strings.Contains(stderr, "worker") && strings.Contains(stderr, "gone") {
+		t.Errorf("stderr must NOT say 'worker gone' for a completed run; got:\n%s", stderr)
+	}
+}
+
+// TestWait_RunningWithDeadPIDReturnsInconclusive verifies that the liveness
+// guard still fires correctly when the state is genuinely still running but
+// the worker PID is dead (worker crashed before writing a final state).
+func TestWait_RunningWithDeadPIDReturnsInconclusive(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("XDG_STATE_HOME", tmp)
+
+	const runID = "fix1-running-dead-pid-002"
+	dpid := deadPID(t)
+
+	// Seed a RUNNING state with a dead PID. The worker never wrote a done state.
+	seedRunningStateWithOpts(t, runID, dpid, time.Now().UTC())
+
+	outR, outW, _ := os.Pipe()
+	errR, errW, _ := os.Pipe()
+	code := run([]string{"wait", runID}, outW, errW)
+	outW.Close()
+	errW.Close()
+	_ = drain(outR)
+	stderr := drain(errR)
+
+	if code != exitInconclusive {
+		t.Errorf("exit code: got %d, want %d (running + dead pid → liveness guard)", code, exitInconclusive)
+	}
+	if !strings.Contains(strings.ToLower(stderr), "gone") {
+		t.Errorf("stderr must mention worker gone; got:\n%s", stderr)
+	}
+}
+
+// TestRunWorker_DispatchFailSavesAndWaitReturnsInconclusive is a portable
+// integration test for Fix 2 and the worker path (Fix 4.3). It exercises
+// runWorker → dispatchRun(fail) → Save(done, Err) → wait(exitInconclusive)
+// without Docker by pointing at a config with no Bench.
+func TestRunWorker_DispatchFailSavesAndWaitReturnsInconclusive(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("XDG_STATE_HOME", tmp)
+
+	const runID = "fix2-worker-dispatch-fail-001"
+
+	// Config with no Bench — dispatchRun will return ok=false.
+	cfgPath := tmp + "/config.toml"
+	if err := os.WriteFile(cfgPath, []byte("[defaults]\ntargets = [\"linux\"]\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Seed a running state with the spec the worker will load.
+	data := []byte(`{"repo":"/work","target":"linux"}`)
+	sp, err := runspec.Parse(data)
+	if err != nil {
+		t.Fatalf("parse spec: %v", err)
+	}
+	sp.RunID = runID
+	st := runstate.State{
+		RunID:     runID,
+		Target:    sp.Target,
+		Repo:      sp.Repo,
+		Status:    runstate.StatusRunning,
+		PID:       0,
+		StartedAt: time.Now().UTC(),
+		UpdatedAt: time.Now().UTC(),
+		Spec:      *sp,
+	}
+	if err := runstate.Save(st); err != nil {
+		t.Fatalf("save running state: %v", err)
+	}
+
+	// Drive the worker directly via run(["__run-worker", ...]). This exercises
+	// the real worker code path without any Docker.
+	outR, outW, _ := os.Pipe()
+	errR, errW, _ := os.Pipe()
+	workerCode := run([]string{"__run-worker", "--run-id", runID, "--config", cfgPath}, outW, errW)
+	outW.Close()
+	errW.Close()
+	_ = drain(outR)
+	_ = drain(errR)
+
+	// Worker should return inconclusive (dispatch failed).
+	if workerCode != exitInconclusive {
+		t.Errorf("worker exit code: got %d, want %d (no bench → dispatch fail)", workerCode, exitInconclusive)
+	}
+
+	// The persisted state must now be done with a non-empty Err.
+	saved, err := runstate.Load(runID)
+	if err != nil {
+		t.Fatalf("load state after worker: %v", err)
+	}
+	if saved.Status != runstate.StatusDone {
+		t.Errorf("state after worker: Status=%q, want %q", saved.Status, runstate.StatusDone)
+	}
+	if saved.Err == "" {
+		t.Errorf("state after worker: Err is empty, want non-empty dispatch-fail error")
+	}
+	// Worker must have claimed the PID (its own pid > 0) in the state.
+	if saved.PID <= 0 {
+		t.Errorf("state after worker: PID=%d, want >0 (worker must write its own pid)", saved.PID)
+	}
+
+	// Now call wait — it must return inconclusive (not hang).
+	outR2, outW2, _ := os.Pipe()
+	errR2, errW2, _ := os.Pipe()
+	waitCode := run([]string{"wait", runID}, outW2, errW2)
+	outW2.Close()
+	errW2.Close()
+	_ = drain(outR2)
+	stderr2 := drain(errR2)
+
+	if waitCode != exitInconclusive {
+		t.Errorf("wait exit code: got %d, want %d (dispatch-failed run → inconclusive)", waitCode, exitInconclusive)
+	}
+	_ = fmt.Sprintf("stderr from wait: %s", stderr2) // consume without asserting content
+}
+
+// TestWait_BackstopFiresWhenStartedAtIsStale is a regression test for Fix 3.
+// A running state with StartedAt set far in the past (2h ago) and pid 0 must
+// cause waitRun to return exitInconclusive promptly with a "did not complete
+// within" message — never spinning forever.
+func TestWait_BackstopFiresWhenStartedAtIsStale(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("XDG_STATE_HOME", tmp)
+
+	const runID = "fix3-backstop-stale-001"
+
+	// StartedAt 2h ago — well beyond asyncWaitCeiling (90 min).
+	staleStart := time.Now().Add(-2 * time.Hour).UTC()
+	// PID 0 means workerPIDAlive returns false immediately (pid<=0 guard in
+	// workerPIDAlive). We set it 0 so the liveness check would also fire —
+	// but the backstop should trip first on the very first loop iteration.
+	seedRunningStateWithOpts(t, runID, 0, staleStart)
+
+	outR, outW, _ := os.Pipe()
+	errR, errW, _ := os.Pipe()
+	code := run([]string{"wait", runID}, outW, errW)
+	outW.Close()
+	errW.Close()
+	_ = drain(outR)
+	stderr := drain(errR)
+
+	if code != exitInconclusive {
+		t.Errorf("exit code: got %d, want %d (backstop must fire)", code, exitInconclusive)
+	}
+	if !strings.Contains(stderr, "did not complete within") {
+		t.Errorf("stderr must contain 'did not complete within'; got:\n%s", stderr)
+	}
+}
+
+// ── TestRunAsync_DefaultRunIsUnchanged verifies the existing blocking behaviour
 // is preserved when --async is not passed (mirrors the existing
 // TestRun_RunCommand_NotifiesAndExitsTwoWhenNoBench test but is explicit about
 // the no-async contract).

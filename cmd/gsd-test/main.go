@@ -480,11 +480,13 @@ func runAsync(spec runspec.Spec, configPath string, stdout, stderr *os.File, spa
 		return exitInconclusive
 	}
 
-	// Record the worker PID (best-effort; a subsequent Load will use it for
-	// liveness checks in waitRun).
-	st.PID = pid
-	st.UpdatedAt = time.Now().UTC()
-	_ = runstate.Save(st) // best-effort: if this fails the pid is just 0
+	// Fix 2 (issue #70): the parent must NOT write a second save after spawn.
+	// Previously it saved st.PID=pid here, which could overwrite a done state
+	// the worker had already written (lost update). The worker now claims its own
+	// PID via a save immediately on startup (see runWorker), so the parent only
+	// writes the initial running state above. The pid value from spawn is still
+	// checked below solely to detect spawn errors.
+	_ = pid // pid used only for spawn-error detection above; worker owns state from here
 
 	fmt.Fprintf(stdout, "dispatched run-id=%s  (use `gsd-test wait %s` to collect the result, `gsd-test status %s` to check progress)\n",
 		spec.RunID, spec.RunID, spec.RunID)
@@ -512,6 +514,18 @@ func runWorker(args []string, stdout, stderr *os.File) int {
 	if err != nil {
 		fmt.Fprintf(stderr, "__run-worker: load state for %s: %v\n", *runID, err)
 		return exitInconclusive
+	}
+
+	// Fix 2 (issue #70): claim the worker's own PID in the state immediately,
+	// before dispatch, so the liveness guard in waitRun can observe it. The
+	// parent no longer writes a second save after spawn (see runAsync), so this
+	// is the only write that sets PID. Status stays running; only PID+UpdatedAt
+	// change here.
+	st.PID = os.Getpid()
+	st.UpdatedAt = time.Now().UTC()
+	if saveErr := runstate.Save(st); saveErr != nil {
+		// Non-fatal: the liveness guard will see pid 0 but won't misbehave.
+		fmt.Fprintf(stderr, "__run-worker: save pid claim: %v\n", saveErr)
 	}
 
 	rep, ok := dispatchRun(st.Spec, *configPath, "run --async", stderr)
@@ -552,20 +566,51 @@ func waitRun(args []string, stdout, stderr *os.File) int {
 		return exitInconclusive
 	}
 
+	// asyncWaitCeiling is the absolute wall-clock backstop for the wait loop.
+	// It is set safely beyond the run-and-die hard cap of 1h (ADR-0021), so
+	// a legitimately long run is never cut short (Fix 3, issue #70).
+	const asyncWaitCeiling = 90 * time.Minute
+
+	// Compute deadline from st.StartedAt. Guard against a zero StartedAt (e.g.
+	// state written by an older client) by falling back to the local loop start.
+	loopStart := time.Now()
+	backstopBase := st.StartedAt
+	if backstopBase.IsZero() {
+		backstopBase = loopStart
+	}
+	deadline := backstopBase.Add(asyncWaitCeiling)
+
 	// Poll until done.
 	for st.Status == runstate.StatusRunning {
-		time.Sleep(200 * time.Millisecond)
-
-		// Liveness guard: if the worker PID is no longer alive and the run is
-		// still marked running, the worker died without writing a final state.
-		if st.PID > 0 && !workerPIDAlive(st.PID) {
-			fmt.Fprintf(stderr, "wait: worker for run-id %s is gone (no result written)\n", runID)
+		// Fix 3 (issue #70): absolute wall-clock backstop. If the run has been
+		// in the running state for longer than asyncWaitCeiling, the worker
+		// almost certainly died silently (pid reuse, kernel crash, etc.). Fail
+		// loud and return inconclusive rather than hanging forever.
+		if time.Now().After(deadline) {
+			dir, _ := runstate.Dir()
+			fmt.Fprintf(stderr,
+				"wait: run %s did not complete within %s — the worker likely died; check %s/%s.worker.log\n",
+				runID, asyncWaitCeiling, dir, runID)
 			return exitInconclusive
 		}
 
+		time.Sleep(200 * time.Millisecond)
+
+		// Fix 1 (issue #70): reload FIRST, then re-evaluate the loop condition.
+		// The liveness guard must only fire when the freshly-reloaded state is
+		// STILL running — if the worker wrote done and exited during the sleep,
+		// the done state must always win over the liveness guard.
 		st, err = runstate.Load(runID)
 		if err != nil {
 			fmt.Fprintf(stderr, "wait: reload state: %v\n", err)
+			return exitInconclusive
+		}
+
+		// Liveness guard: only applies when the fresh state is still running.
+		// If the worker PID is no longer alive at this point, the worker died
+		// without writing a final state.
+		if st.Status == runstate.StatusRunning && st.PID > 0 && !workerPIDAlive(st.PID) {
+			fmt.Fprintf(stderr, "wait: worker for run-id %s is gone (no result written)\n", runID)
 			return exitInconclusive
 		}
 	}
