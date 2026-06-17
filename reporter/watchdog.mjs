@@ -85,9 +85,23 @@ export function runWithWatchdog(opts) {
   // guarantee. Falls back to a direct child.kill (injected test doubles, or if
   // the group is already gone).
   const sendSignal = (sig) => {
+    // Windows has no POSIX process groups; signalling the parent does not reap
+    // node --test's children. Use taskkill /T (whole tree), adding /F for the
+    // hard kill (ADR-0021 Decision 4). Proven by the Windows Bench orphan gate,
+    // not the local suite. The container-level reaper is the backstop.
+    if (process.platform === 'win32' && typeof child.pid === 'number') {
+      const args = ['/PID', String(child.pid), '/T'];
+      if (sig === 'SIGKILL') args.push('/F');
+      try {
+        spawn('taskkill', args);
+        return;
+      } catch {
+        /* fall through to direct kill */
+      }
+    }
     if (spawnedDetached && typeof child.pid === 'number') {
       try {
-        process.kill(-child.pid, sig);
+        process.kill(-child.pid, sig); // negative pid → whole process group
         return;
       } catch {
         /* group already gone; fall through */

@@ -25,4 +25,10 @@ RUN $url = 'https://github.com/git-for-windows/git/releases/download/v2.43.0.win
 
 COPY reporter/reporter.mjs C:/opt/gsd-test/reporter.mjs
 
+# Tier-1 watchdog baked alongside the reporter (issue #60, ADR-0021). Run as:
+#   node C:/opt/gsd-test/watchdog.mjs --deadline-ms N -- node --test ...
+# On Windows the watchdog escalates via taskkill /T /F (whole tree); the
+# container-level kill is the cross-platform backstop (ADR-0021 Decision 4).
+COPY reporter/watchdog.mjs C:/opt/gsd-test/watchdog.mjs
+
 WORKDIR C:/work

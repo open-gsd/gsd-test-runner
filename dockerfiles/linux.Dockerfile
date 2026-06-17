@@ -28,6 +28,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # This path is contractual; do not change without updating the leg.
 COPY reporter/reporter.mjs /opt/gsd-test/reporter.mjs
 
+# Tier-1 watchdog baked alongside the reporter (issue #60, ADR-0021). The
+# run-and-die path invokes it as the container entrypoint:
+#   node /opt/gsd-test/watchdog.mjs --deadline-ms N -- node --test ...
+# This path is contractual, like the reporter path above.
+COPY reporter/watchdog.mjs /opt/gsd-test/watchdog.mjs
+
 # Working directory matches Local Engine's CopyWorktree target (/work).
 # Container is started idle (sleep infinity per Pipeline.StartContainer);
 # legs docker exec into this WORKDIR.
