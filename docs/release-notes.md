@@ -7,6 +7,23 @@ This page summarizes the recent `v1.3.x` releases so you can quickly decide what
 - `v1.3.0`: configurable test command in the `run_tests` leg
 - `v1.3.1`: shell-aware parsing for string commands + explicit argv command arrays
 - `v1.3.2`: per-bench container platform pinning (`linux/amd64`, `linux/arm64`, etc.)
+- _Unreleased_: run-and-die — `gsd-test submit` for coding agents, with an estimate-aware watchdog and two-tier reaping
+
+## Unreleased
+
+### Added
+
+- `gsd-test submit` — a run-spec front door so coding agents run tests in a disposable container instead of spawning a local `node --test` that can leak orphaned processes (issue #60, ADR-0021).
+- An estimate-aware in-container watchdog and an external reaper that kill runaway suites and report exactly which test ran away (`outcome: "reaped"`, result `schema_version: 2`).
+- Per-repo telemetry with a runaway leaderboard, and Claude Code / Codex integration that routes `node --test` to the front door.
+
+### Why it matters
+
+A hanging test run by an agent no longer risks taking down the workstation: execution moves into a container that dies when the run ends, and a reaped run is a loud, structured result pointing at the bugged test — not a silent hang.
+
+### Learn more
+
+Start with [Run-and-die Execution](run-and-die.md) and the [tutorial](run-and-die-tutorial.md).
 
 ## v1.3.2
 
