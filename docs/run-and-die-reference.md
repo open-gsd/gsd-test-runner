@@ -2,6 +2,94 @@
 
 Field-by-field reference for the run-and-die interfaces. For tasks see the [how-to guides](run-and-die-how-to.md); for concepts see [Run-and-die Execution](run-and-die.md).
 
+## `gsd-test run`
+
+The explicit executor agents call instead of `node --test`. Builds a run spec from the current repository and any positional test path patterns, dispatches the run to a Bench via the front door, and renders a `node --test`-style verdict to stdout. Never spawns a local `node` process.
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--target` | `linux` | Target OS: `linux` \| `windows` \| `macos-container`. |
+| `--config <path>` | (standard config search) | `config.toml` path, used to resolve Benches and image versions. |
+| `--estimate-ms <int>` | `0` | Expected suite duration in milliseconds. Tightens the watchdog deadline; `0` falls back to telemetry median then `hardCapMs`. |
+| `--async` | off | Submit and return immediately (POSIX only). Prints a dispatched-notice to stdout and exits `0`; the run continues in a detached worker. See [`gsd-test wait` and `gsd-test status`](#gsd-test-run---async-wait-and-status). |
+
+Positional arguments after flags are treated as test path patterns appended to the run spec's `testPathPatterns`.
+
+On every invocation (blocking or async) a structured banner is printed to stderr immediately after the run-id is assigned — see [Handoff banner and run-id](#handoff-banner-and-run-id).
+
+### Exit codes
+
+| Code | Meaning |
+|------|---------|
+| `0` | All tests passed. |
+| `1` | One or more tests failed, or the run was reaped. |
+| `2` | The run could not be started (infra/inconclusive error). With `--async`, also returned on non-POSIX hosts. |
+
+## `gsd-test run --async`, `wait`, and `status`
+
+### `gsd-test run --async`
+
+Submits the run, prints one line to stdout, and returns immediately with exit `0`. The run continues in a detached worker process.
+
+Dispatched-notice format:
+
+```text
+dispatched run-id=<id>  (use `gsd-test wait <id>` to collect the result, `gsd-test status <id>` to check progress)
+```
+
+Unix-only (POSIX process groups). On non-POSIX hosts (Windows) it exits `2` with an error. Blocking `gsd-test run` remains the default so correctness never depends on the agent remembering to call `wait`.
+
+### `gsd-test wait <run-id>`
+
+Blocks until the async run completes, then renders the same `node --test`-style verdict and exits with the same codes (`0` / `1` / `2`) a blocking `run` would produce. Never renders a partial result. There is a 90-minute absolute backstop; if the worker died without writing a result the command exits `2` (fail-loud, never a silent hang).
+
+Takes no flags — only the positional run-id.
+
+### Exit codes — `wait`
+
+| Code | Meaning |
+|------|---------|
+| `0` | All tests passed. |
+| `1` | One or more tests failed, or the run was reaped. |
+| `2` | Unknown run-id, worker died without a result, or the 90-minute backstop fired. |
+
+### `gsd-test status <run-id>`
+
+Reports the run state without blocking. Prints one greppable line to stdout:
+
+```text
+state=running run-id=<id> pid=<pid>
+```
+
+or, when complete:
+
+```text
+state=done run-id=<id> exit=<code> outcome=<outcome>
+```
+
+A pure reporter — exits `0` when the run-id is found regardless of whether the run itself succeeded. Unknown run-id exits `2`.
+
+Takes no flags — only the positional run-id.
+
+Run state is persisted to `$XDG_STATE_HOME/gsd-test/runs/<run-id>.json` (falls back to `~/.local/state/gsd-test/runs/`).
+
+### Exit codes — `status`
+
+| Code | Meaning |
+|------|---------|
+| `0` | Run-id found (run may still be in progress or may have failed). |
+| `2` | Unknown run-id. |
+
+## Handoff banner and run-id
+
+Every `gsd-test run` invocation (blocking or async) emits one structured banner to **stderr** immediately after the run-id is assigned:
+
+```text
+↪ gsd-test: handed off to Docker (run-id=<id>, target=<os>) — do not re-run locally
+```
+
+The banner names the action explicitly so the agent does not re-run or treat the wait as a hang. Blocking mode means the command does not return until the verdict exists, making a retry unnecessary. The run-id is stable across the banner, the async dispatched-notice, `wait`, `status`, the container label `sh.gsd-test.run-id`, and the telemetry record's `run_id` field.
+
 ## `gsd-test submit`
 
 Reads a JSON [run spec](#run-spec), validates it, and assigns a `runId` if absent. Without `--execute` it prints the normalised spec; with `--execute` it dispatches the run and prints the [result envelope](#result-envelope).
@@ -19,6 +107,37 @@ Reads a JSON [run spec](#run-spec), validates it, and assigns a `runId` if absen
 | `0` | Accepted (validate-only) or the run passed. |
 | `1` | The run failed or was reaped. |
 | `2` | The spec could not be read or validated, or the run could not be started (inconclusive). |
+
+## `gsd-test install-agent-hooks`
+
+One-command, idempotent, reversible installer for the agent integration. Default (no runtime flag) installs both Claude Code and Codex into the current project.
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--claude` | off | Install only the Claude Code `PreToolUse` hook and `run-and-die` skill. |
+| `--codex` | off | Install only the Codex shim and `codex-bin/` `node`/`npm` PATH shims. |
+| `--global` | off | Install into `$HOME` instead of the current project. |
+| `--uninstall` | off | Reverse a previous install using the stored manifest. |
+
+When neither `--claude` nor `--codex` is given, both runtimes are installed.
+
+On install the command prints each file it added (`+`) and any settings file it modified (`~`), then for Codex prints the PATH line to add to `~/.codex/config.toml`:
+
+```toml
+[shell_environment_policy.set]
+PATH = "<abs>/.gsd-test/codex-bin:${PATH}"
+```
+
+The `codex-bin/` directory must come **first** so Codex's `node`/`npm` invocations route through the shim. The shim rewrites `node --test` / `npm test` to `gsd-test run` and passes every other command through to the real binary (located by skipping its own directory, canonicalised so symlinks cannot cause recursion). This shadows `node`/`npm` only inside Codex; the human's interactive shell is untouched.
+
+Reverse the install with `gsd-test install-agent-hooks --uninstall`. The manifest tracks exactly what was added, so uninstall is precise and does not remove changes made outside the installer. (ADR-0022 Decision 5)
+
+### Exit codes
+
+| Code | Meaning |
+|------|---------|
+| `0` | Install or uninstall completed successfully. |
+| `2` | Could not determine the home directory (`--global`), find the repo root, or apply the install/uninstall. |
 
 ## Run spec
 

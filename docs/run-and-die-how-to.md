@@ -4,36 +4,76 @@ Task-focused recipes for working with run-and-die. Each assumes you already know
 
 ## How to stop an agent from running tests locally
 
-The whole point is that an agent never spawns a local `node --test`. Wire the interception once per agent.
-
-**Claude Code.** Add a `PreToolUse` hook on the `Bash` tool to `.claude/settings.json`:
-
-```json
-{
-  "hooks": {
-    "PreToolUse": [
-      {
-        "matcher": "Bash",
-        "hooks": [
-          { "type": "command", "command": "node agent-integration/route-tests.mjs" }
-        ]
-      }
-    ]
-  }
-}
-```
-
-The hook denies any `node --test` / `npm test` command and tells the agent to submit a run spec instead. Unrelated commands pass through untouched.
-
-**Codex.** Route Codex's shell path through the shim:
+The whole point is that an agent never spawns a local `node --test`. Run the installer once per project:
 
 ```bash
-agent-integration/codex-shim.sh <command...>
+gsd-test install-agent-hooks
 ```
 
-It blocks node test commands with a routing message and `exec`s everything else unchanged.
+This installs both the Claude Code hook and the Codex shim in one step. It is idempotent — re-running converges without duplicating anything.
 
-See [`agent-integration/README.md`](../agent-integration/README.md) for the full wiring, and install the bundled Claude Code skill at `agent-integration/skills/run-and-die/` so the agent knows the run-spec contract and how to read a reaped result.
+**Claude Code.** The installer merges a `PreToolUse` Bash guard into `.claude/settings.json` and installs the `run-and-die` skill into `.claude/skills/`. The hook denies any `node --test` / `npm test` command and routes the agent to `gsd-test run`. The skill teaches the agent what `gsd-test run` returns and how to read a reaped result. Unrelated commands pass through untouched.
+
+**Codex.** The installer writes a `codex-bin/` directory with `node` and `npm` PATH shims. Put that directory first on Codex's exec PATH in `~/.codex/config.toml`:
+
+```toml
+[shell_environment_policy.set]
+PATH = "<abs>/.gsd-test/codex-bin:${PATH}"
+```
+
+(The exact path is printed by the installer.) When Codex runs `node --test` or `npm test`, the shim redirects it to `gsd-test run`. Every other command is passed through to the real binary. Your interactive shell is unaffected.
+
+To install only one runtime use `--claude` or `--codex`. To install globally (into `$HOME`) add `--global`.
+
+See [`agent-integration/README.md`](../agent-integration/README.md) and the [reference](run-and-die-reference.md#gsd-test-install-agent-hooks) for full flag details.
+
+## How to verify the agent handoff is installed
+
+The fastest check is to run `gsd-test run` directly from the project root:
+
+```bash
+gsd-test run
+```
+
+The stderr banner `↪ gsd-test: handed off to Docker (run-id=..., target=linux) — do not re-run locally` confirms the handoff is active and the run has been dispatched.
+
+For Claude Code specifically, trigger any `node --test` command during an agent session. The hook should deny it with a message naming `gsd-test run` — the agent will then call `gsd-test run` instead.
+
+For Codex, check that `codex-bin/` appears first in the PATH Codex sees, then trigger a test run — the shim should redirect it transparently and the banner will appear on stderr.
+
+To reverse the install at any time:
+
+```bash
+gsd-test install-agent-hooks --uninstall
+```
+
+See the [reference](run-and-die-reference.md#gsd-test-install-agent-hooks) for all flags.
+
+## How to dispatch tests without blocking
+
+Use `--async` when the agent can continue working while the suite runs and only needs the verdict later:
+
+```bash
+gsd-test run --async
+```
+
+The command prints a dispatched-notice with the run-id and returns immediately. The run continues in a detached worker.
+
+To check progress without waiting:
+
+```bash
+gsd-test status <run-id>
+```
+
+To block until the run completes and collect the full verdict:
+
+```bash
+gsd-test wait <run-id>
+```
+
+`wait` exits with the same codes as blocking `run` (`0` passed, `1` failed or reaped, `2` infra error). It never returns a partial result. The 90-minute absolute backstop means it cannot hang indefinitely.
+
+`--async` is unix-only. Blocking `gsd-test run` (the default) works everywhere and is the right choice when the agent needs the verdict before continuing. See the [reference](run-and-die-reference.md#gsd-test-run---async-wait-and-status) for flag details.
 
 ## How to test a PR-merged tree
 
