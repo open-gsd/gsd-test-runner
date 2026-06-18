@@ -1,29 +1,46 @@
 # Release Notes
 
-This page summarizes the recent `v1.3.x` releases so you can quickly decide what to adopt.
+This page summarizes the recent releases so you can quickly decide what to adopt.
 
 ## At a glance
 
 - `v1.3.0`: configurable test command in the `run_tests` leg
 - `v1.3.1`: shell-aware parsing for string commands + explicit argv command arrays
 - `v1.3.2`: per-bench container platform pinning (`linux/amd64`, `linux/arm64`, etc.)
-- _Unreleased_: run-and-die — `gsd-test submit` for coding agents, with an estimate-aware watchdog and two-tier reaping
+- `v1.4.0`: run-and-die for coding agents — the `gsd-test run` handoff, a one-command installer, and non-blocking `--async`/`wait`/`status`
 
-## Unreleased
+## v1.4.0
 
 ### Added
 
-- `gsd-test submit` — a run-spec front door so coding agents run tests in a disposable container instead of spawning a local `node --test` that can leak orphaned processes (issue #60, ADR-0021).
-- An estimate-aware in-container watchdog and an external reaper that kill runaway suites and report exactly which test ran away (`outcome: "reaped"`, result `schema_version: 2`).
-- Per-repo telemetry with a runaway leaderboard, and Claude Code / Codex integration that routes `node --test` to the front door.
+- `gsd-test run` — the executor coding agents call instead of `node --test`: it runs the suite in a disposable container and returns a `node --test`-style verdict and exit code, so the agent treats it like a normal test run (issue #67, ADR-0022).
+- `gsd-test run --async`, with `gsd-test wait <run-id>` and `gsd-test status <run-id>` — non-blocking dispatch. `--async` returns a run-id immediately so the agent can keep working; `wait` blocks for the complete verdict, `status` reports progress without blocking. Blocking `gsd-test run` stays the default (issue #70, ADR-0022 Decision 3).
+- `gsd-test install-agent-hooks` — a one-command, idempotent, reversible installer that wires the Claude Code `PreToolUse` hook plus skill and the Codex shim. Flags: `--claude`, `--codex`, `--global`, `--uninstall` (issue #71, ADR-0022 Decision 5).
+- `gsd-test submit` — the run-spec front door with an estimate-aware in-container watchdog and a two-tier external reaper that kill runaway suites and name the test that ran away (`outcome: "reaped"`, result `schema_version: 2`) (issue #60, ADR-0021).
+- Claude Code and Codex integration that intercepts `node --test` / `npm test` and routes it to `gsd-test run` (issues #68, #69, #78).
+- Per-repo telemetry with a runaway leaderboard.
 
 ### Why it matters
 
-A hanging test run by an agent no longer risks taking down the workstation: execution moves into a container that dies when the run ends, and a reaped run is a loud, structured result pointing at the bugged test — not a silent hang.
+A coding agent can no longer wedge the workstation with an orphaned `node --test`: execution moves into a container that dies when the run ends, the result is a recognisable verdict — a reaped run is a loud, attributed failure rather than a silent hang — and wiring it onto a workstation is a single `gsd-test install-agent-hooks`.
+
+### Example
+
+```bash
+# one-time setup on the dev workstation
+gsd-test install-agent-hooks
+
+# the agent runs this instead of `node --test`
+gsd-test run
+
+# or dispatch without blocking and collect the verdict later
+gsd-test run --async
+gsd-test wait <run-id>
+```
 
 ### Learn more
 
-Start with [Run-and-die Execution](run-and-die.md) and the [tutorial](run-and-die-tutorial.md).
+Start with [Run-and-die Execution](run-and-die.md), the [how-to guides](run-and-die-how-to.md), and the [reference](run-and-die-reference.md).
 
 ## v1.3.2
 

@@ -53,10 +53,10 @@ host   = "lab-rig-1.local"   # SSH host alias from ~/.ssh/config
 os     = "linux"
 
 [versions]
-linux = "v1.3.2"   # Tester Image version to expect on the Bench
+linux = "v1.4.0"   # Tester Image version to expect on the Bench
 ```
 
-Replace `lab-rig-1.local` with your Bench's SSH alias. Replace `v1.3.2` with the current release version.
+Replace `lab-rig-1.local` with your Bench's SSH alias. Replace `v1.4.0` with the current release version.
 
 The `[versions]` table tells `gsd-test` which Tester Image version to expect on each Bench. If the Bench has a different version, `gsd-test` fails loud before running any tests — this prevents silent drift (see [Troubleshooting: image-version mismatch](troubleshooting.md#image-version-mismatch)).
 
@@ -163,8 +163,8 @@ host   = "win-rig-1.local"
 os     = "windows"
 
 [versions]
-linux   = "v1.3.2"
-windows = "v1.3.2"
+linux   = "v1.4.0"
+windows = "v1.4.0"
 ```
 
 Both pipelines run in parallel. The final summary prints one line per OS. See [Setting up Benches](benches.md) for Windows-specific Bench setup.
