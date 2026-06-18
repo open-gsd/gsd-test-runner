@@ -57,8 +57,8 @@ Run-and-die (containerised `node --test` for coding agents):
 
 - **[Run-and-die Execution](docs/run-and-die.md)** — Why it exists and how two-tier reaping works
 - **[Tutorial: Your First Run-and-die Run](docs/run-and-die-tutorial.md)** — Submit a run and watch a runaway test get reaped
-- **[Run-and-die How-to Guides](docs/run-and-die-how-to.md)** — Route an agent's tests, tune the budget, find the bugged test
-- **[Run-and-die Reference](docs/run-and-die-reference.md)** — Run spec, result envelope, `submit` flags, labels, telemetry
+- **[Run-and-die How-to Guides](docs/run-and-die-how-to.md)** — Install the agent hooks, verify the handoff, dispatch tests with `gsd-test run` (blocking or async), tune the budget, find the bugged test
+- **[Run-and-die Reference](docs/run-and-die-reference.md)** — `gsd-test run`, `--async`/`wait`/`status`, `install-agent-hooks`, run spec, result envelope, labels, telemetry
 
 ## How it Works (30-second version)
 

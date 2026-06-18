@@ -1,15 +1,18 @@
 # agent-integration
 
 Hooks that prevent coding agents (Claude Code, Codex) from spawning local
-`node --test` / `npm test` processes. Instead, agents are routed to
-`gsd-test submit` — the run-spec front door described in ADR-0021 §G and
-[issue #60](https://github.com/open-gsd/gsd-test-runner/issues/60).
+`node --test` / `npm test` processes and route them to `gsd-test run` instead —
+the explicit executor that runs the suite in Docker and returns a
+`node --test`-style verdict. Designed for issue #65 (ADR-0022).
 
 ## Why
 
 Running `node --test` directly on the Dev Workstation creates orphaned `node`
 children that outlive the agent turn. ADR-0021 Decision 2 makes the Bench
 (not the Workstation) the execution site; the hook enforces that contract.
+ADR-0022 adds the `gsd-test run` wrapper so agents get a recognisable
+test result — not just a denial — and `install-agent-hooks` so wiring is a
+single command rather than hand-editing config files.
 
 ## Files
 
@@ -18,10 +21,37 @@ children that outlive the agent turn. ADR-0021 Decision 2 makes the Bench
 | `route-tests.mjs` | Node ESM module — pure logic + Claude Code PreToolUse hook entrypoint |
 | `route-tests.test.mjs` | `node --test` unit tests for the pure functions |
 | `codex-shim.sh` | POSIX sh exec-path shim for Codex's exec path |
+| `skills/run-and-die/` | Claude Code skill — teaches the agent to call `gsd-test run` |
 
-## Wiring the Claude Code hook
+## Installing the agent integration
 
-Add a `PreToolUse` hook to `.claude/settings.json`:
+Run the installer from the project root:
+
+```bash
+gsd-test install-agent-hooks
+```
+
+This is the **primary path**. It installs both Claude Code and Codex in one
+idempotent, reversible step — no manual editing required. See
+[docs/run-and-die-how-to.md](../docs/run-and-die-how-to.md) for the
+step-by-step recipe and verification guide.
+
+To install only one runtime: `--claude` or `--codex`. To install globally
+(into `$HOME`): `--global`. To reverse: `--uninstall`.
+
+See the [reference](../docs/run-and-die-reference.md#gsd-test-install-agent-hooks)
+for all flags and exit codes.
+
+## What the installer does (manual fallback)
+
+The details below describe what `install-agent-hooks` configures. They are
+provided for understanding or for environments where you need to apply the
+wiring by hand. The installer is the recommended path; these steps are the
+fallback.
+
+### Claude Code hook
+
+The installer merges a `PreToolUse` guard into `.claude/settings.json`:
 
 ```json
 {
@@ -42,51 +72,53 @@ Add a `PreToolUse` hook to `.claude/settings.json`:
 ```
 
 The hook reads the Claude Code payload from stdin. If the Bash command is a
-node test invocation, it writes a `deny` decision to stdout and Claude Code
-blocks the tool call. The deny reason routes the agent to **`gsd-test run`**
-(issue #67, ADR-0022) — the executor that runs the suite in Docker and returns a
-`node --test`-style verdict, so the agent simply swaps `node --test` →
-`gsd-test run`. If the command is unrelated, the hook exits 0 silently and the
-tool call proceeds normally. The [`run-and-die` skill](skills/run-and-die/SKILL.md)
-teaches the agent how to use `gsd-test run` and read a reaped result.
+`node --test` / `npm test` invocation, it writes a `deny` decision to stdout
+with a reason naming `gsd-test run`. The agent then calls `gsd-test run`
+directly — which executes the suite in Docker and returns a
+`node --test`-style verdict (ADR-0022 Decision 1). Unrelated commands pass
+through untouched.
 
-## Using the Codex shim
+### Claude Code skill
 
-`gsd-test install-agent-hooks --codex` writes `codex-shim.sh` plus a `codex-bin/`
-directory holding `node` and `npm` PATH shims. Point Codex's exec PATH at
-`codex-bin` **first** so its `node`/`npm` route through the shim — in
-`~/.codex/config.toml`:
+The installer copies `skills/run-and-die/` into `.claude/skills/`. This
+teaches the agent to call `gsd-test run`, interpret the handoff banner, and
+read a reaped result. It pairs with the hook: the hook routes, the skill
+instructs.
+
+To install the skill manually, copy the directory:
+
+```bash
+cp -r agent-integration/skills/run-and-die .claude/skills/
+```
+
+### Codex shim
+
+The installer writes a `codex-bin/` directory containing `node` and `npm`
+PATH shims. Add it **first** on Codex's exec PATH in `~/.codex/config.toml`:
 
 ```toml
 [shell_environment_policy.set]
 PATH = "/abs/path/.gsd-test/codex-bin:${PATH}"
 ```
 
-When Codex runs `node --test` / `npm test` the shim **redirects it to
-`gsd-test run`** (issue #69/#78, ADR-0022) — printing a handoff banner on stderr
-and exec-ing the Docker-backed run, which returns a `node --test`-style verdict.
-Test-file path patterns are forwarded; `node --test` flags are dropped (the
-watchdog supplies its own). Every other command (e.g. `node app.js`,
-`npm run lint`) is passed through to the **real** binary — the shims resolve it
-by skipping their own directory (canonicalised, so symlinks can't cause
-recursion), so this shadows `node`/`npm` only inside Codex, never your
-interactive shell.
+(The exact path is printed by the installer.)
 
-## Run-spec contract
+When Codex runs `node --test` / `npm test`, the shim **redirects it to
+`gsd-test run`** — printing the handoff banner on stderr and exec-ing the
+Docker-backed run, which returns a `node --test`-style verdict (ADR-0022
+Decisions 1 and 2). Test-file path patterns are forwarded; `node --test`
+flags are dropped (the watchdog supplies its own). Every other command (e.g.
+`node app.js`, `npm run lint`) is passed through to the real binary — the
+shims resolve it by skipping their own directory (canonicalised, so symlinks
+cannot cause recursion), so this shadows `node`/`npm` only inside Codex,
+never your interactive shell.
 
-Submit a run spec to the front door:
+## Behaviour change from issue #60
 
-```sh
-echo '{"repo":"my-repo","suite":"unit","estimateMs":30000}' \
-  | gsd-test submit --spec-file -
-```
-
-See ADR-0021 for the full run-spec schema and the two-tier reaping contract.
-
-## Claude Code skill
-
-A ready-to-install skill lives at [`skills/run-and-die/SKILL.md`](skills/run-and-die/SKILL.md).
-Copy that directory into your project's `.claude/skills/` so the agent knows the
-run-spec contract and how to read a reaped result. It pairs with the PreToolUse
-hook above: the hook blocks local `node --test`, the skill teaches the agent
-what to do instead.
+Earlier adopters (ADR-0021, issue #60) wired a deny-and-instruct hook: `node
+--test` was blocked and the agent had to hand-craft a run spec for
+`gsd-test submit`. ADR-0022 (issue #65) replaces that model: the hook's deny
+reason now names `gsd-test run` (a working executor), and Codex's shim shifts
+from block to redirect-and-execute. `gsd-test run` returns a normal
+`node --test`-style verdict — the agent no longer needs to know about run
+specs. The run-spec contract and the two-tier reaping guarantee are unchanged.
