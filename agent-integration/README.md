@@ -31,8 +31,8 @@ Run the installer from the project root:
 gsd-test install-agent-hooks
 ```
 
-This is the **primary path**. It installs both Claude Code and Codex in one
-idempotent, reversible step — no manual editing required. See
+This installs both Claude Code and Codex in one idempotent, reversible step —
+no manual editing required. See
 [docs/run-and-die-how-to.md](../docs/run-and-die-how-to.md) for the
 step-by-step recipe and verification guide.
 
