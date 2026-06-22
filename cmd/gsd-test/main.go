@@ -26,6 +26,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"sync"
 	"syscall"
@@ -85,6 +86,8 @@ type cliFlags struct {
 	pin          string
 	exclude      string
 	jsonEvents   bool
+	verbose      bool
+	quiet        bool
 	base         string
 	head         string
 	source       string
@@ -104,6 +107,8 @@ func parseFlags(args []string) (cliFlags, error) {
 	fs.StringVar(&f.pin, "bench", "", "pin to a specific Bench by name (default: from config defaults.pin)")
 	fs.StringVar(&f.exclude, "exclude", "", "comma-separated Bench names to exclude (default: from config defaults.exclude)")
 	fs.BoolVar(&f.jsonEvents, "json-events", false, "emit events as JSON Lines instead of human-readable TTY output")
+	fs.BoolVar(&f.verbose, "verbose", false, "show the full child-output firehose + per-test pass lines (also GSD_TEST_VERBOSE=1)")
+	fs.BoolVar(&f.quiet, "quiet", false, "suppress the progress heartbeat; show only leg events and failures")
 	fs.StringVar(&f.base, "base", "main", "base git ref to fetch + checkout (per ADR-0010)")
 	fs.StringVar(&f.head, "head", "HEAD", "PR git ref to merge into base")
 	fs.StringVar(&f.source, "source", ".", "source git repo path (default: current directory)")
@@ -264,11 +269,22 @@ func run(args []string, stdout, stderr *os.File) int {
 		mode = renderer.ModeJSONEvents
 	}
 	r := renderer.New(stdout, mode)
+	// Quiet-by-default live stream (Option B): a compact heartbeat + failures.
+	// --verbose / GSD_TEST_VERBOSE=1 restores the full firehose; --quiet drops
+	// even the heartbeat. (ModeJSONEvents ignores verbosity — always full.)
+	verbosity := renderer.VerbosityNormal
+	if flags.verbose || os.Getenv("GSD_TEST_VERBOSE") == "1" {
+		verbosity = renderer.VerbosityFull
+	} else if flags.quiet {
+		verbosity = renderer.VerbosityQuiet
+	}
+	r.SetVerbosity(verbosity)
 
 	type pipelineResult struct {
-		os  string
-		rep report.Report
-		err error
+		os      string
+		rep     report.Report
+		err     error
+		drained string // local JSONL capture path (Option B persistence)
 	}
 	results := make(chan pipelineResult, len(p.Runs))
 	var pwg sync.WaitGroup
@@ -284,7 +300,7 @@ func run(args []string, stdout, stderr *os.File) int {
 			rep, err := pl.RunAll(ctx)
 			// The pipeline's pump goroutine owns closing events (it flushes the
 			// unbounded queue first), so we must NOT close it here (#84).
-			results <- pipelineResult{os: run.OS, rep: rep, err: err}
+			results <- pipelineResult{os: run.OS, rep: rep, err: err, drained: pl.DrainedPath()}
 		}()
 	}
 	pwg.Wait()
@@ -293,8 +309,10 @@ func run(args []string, stdout, stderr *os.File) int {
 	// ── Phase 5: Aggregate + Render ────────────────────────────────────────────
 	var sawLegError, sawFail bool
 	reps := make([]report.Report, 0, len(p.Runs))
+	osJSONL := make(map[string]string, len(p.Runs))
 	for res := range results {
 		r.AddResult(res.os, res.rep, res.err)
+		osJSONL[res.os] = res.drained
 		if res.err != nil {
 			sawLegError = true
 			// A leg error means the suite did not run as designed; record it as
@@ -316,7 +334,7 @@ func run(args []string, stdout, stderr *os.File) int {
 	// Failure-first artifacts + loud last-line verdict (epic #84, ADR-0023).
 	// Best-effort: a write error never changes the exit code or suppresses the
 	// verdict (the verdict's outcome is the source of truth).
-	emitRunArtifacts(reps, stdout, stderr)
+	emitRunArtifacts(reps, osJSONL, stdout, stderr)
 
 	// Inconclusive if any Pipeline failed OR any Plan.Skipped entry exists.
 	if sawLegError || len(p.Skipped) > 0 {
@@ -357,13 +375,50 @@ func writeVerdict(reps []report.Report, paths digest.Paths, stdout, stderr io.Wr
 }
 
 // emitRunArtifacts is the standard multi-OS path: it mints a run-id, writes the
-// digest, and prints the verdict as the final stdout line in every outcome.
-func emitRunArtifacts(reps []report.Report, stdout, stderr io.Writer) {
+// digest, persists each OS's full JSONL, and prints the verdict as the final
+// stdout line in every outcome.
+func emitRunArtifacts(reps []report.Report, osJSONL map[string]string, stdout, stderr io.Writer) {
 	runID, err := runspec.NewRunID()
 	if err != nil {
 		runID = "run-unknown"
 	}
-	writeVerdict(reps, writeRunArtifacts(runID, reps, stderr), stdout, stderr)
+	paths := writeRunArtifacts(runID, reps, stderr)
+	if paths.Dir != "" {
+		copyEventsJSONL(paths.Dir, osJSONL, stderr)
+	}
+	writeVerdict(reps, paths, stdout, stderr)
+}
+
+// copyEventsJSONL persists each per-OS drained JSONL into the run dir as
+// test-events-<os>.jsonl so the full per-test detail (passes included) is always
+// available, not just the failure digest (Option B, #84). Best-effort.
+func copyEventsJSONL(dir string, osJSONL map[string]string, stderr io.Writer) {
+	for osName, src := range osJSONL {
+		if src == "" {
+			continue
+		}
+		dst := filepath.Join(dir, "test-events-"+osName+".jsonl")
+		if err := copyFile(src, dst); err != nil {
+			fmt.Fprintf(stderr, "warning: persist %s JSONL: %v\n", osName, err)
+		}
+	}
+}
+
+func copyFile(src, dst string) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	out, err := os.Create(dst)
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(out, in); err != nil {
+		out.Close()
+		return err
+	}
+	return out.Close()
 }
 
 // emitRunDieArtifacts is the run-and-die single-OS path: it writes the digest

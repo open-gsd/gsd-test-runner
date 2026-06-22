@@ -55,6 +55,82 @@ func drainAndClose(ch chan<- pipeline.Event, events []pipeline.Event) {
 	close(ch)
 }
 
+// failEvent builds an EventTestFail carrying the Option I evidence fields.
+func failEvent(file string, line int, class, name, msg string) pipeline.Event {
+	return pipeline.Event{
+		Kind:       pipeline.EventTestFail,
+		Time:       time.Now(),
+		Line:       name,
+		File:       file,
+		FailLine:   line,
+		ErrorClass: class,
+		Detail:     msg,
+	}
+}
+
+func TestRenderTTY_QuietSuppressesNoiseShowsFailure(t *testing.T) {
+	var buf bytes.Buffer
+	r := renderer.New(&buf, renderer.ModeTTY).SetVerbosity(renderer.VerbosityQuiet)
+	ch := make(chan pipeline.Event, 8)
+	r.Subscribe("linux", ch)
+	drainAndClose(ch, []pipeline.Event{
+		makeEvent(pipeline.EventChildOutput, pipeline.LegNpmCI, "npm noise", "stdout", ""),
+		makeEvent(pipeline.EventTestPass, 0, "passes", "", ""),
+		failEvent("a.test.js", 12, "assertion", "boom > x", "expected 1, got 2"),
+	})
+	r.Wait()
+
+	out := buf.String()
+	if strings.Contains(out, "npm noise") {
+		t.Errorf("quiet mode must suppress child output:\n%s", out)
+	}
+	if strings.Contains(out, "✓ passes") {
+		t.Errorf("quiet mode must suppress per-test pass lines:\n%s", out)
+	}
+	if !strings.Contains(out, "✗ FAIL a.test.js:12 · assertion · boom > x — expected 1, got 2") {
+		t.Errorf("expected the enriched real-time failure line, got:\n%s", out)
+	}
+}
+
+func TestRenderTTY_VerboseShowsChildAndPass(t *testing.T) {
+	var buf bytes.Buffer
+	r := renderer.New(&buf, renderer.ModeTTY).SetVerbosity(renderer.VerbosityFull)
+	ch := make(chan pipeline.Event, 8)
+	r.Subscribe("linux", ch)
+	drainAndClose(ch, []pipeline.Event{
+		makeEvent(pipeline.EventChildOutput, pipeline.LegNpmCI, "npm noise", "stdout", ""),
+		makeEvent(pipeline.EventTestPass, 0, "passes", "", ""),
+	})
+	r.Wait()
+
+	out := buf.String()
+	if !strings.Contains(out, "npm noise") || !strings.Contains(out, "✓ passes") {
+		t.Errorf("verbose mode must show child output + pass lines:\n%s", out)
+	}
+}
+
+func TestRenderTTY_NormalHeartbeat(t *testing.T) {
+	var buf bytes.Buffer
+	r := renderer.New(&buf, renderer.ModeTTY).SetVerbosity(renderer.VerbosityNormal)
+	ch := make(chan pipeline.Event, 64)
+	r.Subscribe("linux", ch)
+
+	evs := make([]pipeline.Event, 0, 25)
+	for i := 0; i < 25; i++ {
+		evs = append(evs, makeEvent(pipeline.EventTestPass, 0, "p", "", ""))
+	}
+	drainAndClose(ch, evs)
+	r.Wait()
+
+	out := buf.String()
+	if strings.Contains(out, "✓ p") {
+		t.Errorf("normal mode must not print per-test pass lines:\n%s", out)
+	}
+	if !strings.Contains(out, "… 25 passed") {
+		t.Errorf("expected a heartbeat line at 25 passes, got:\n%s", out)
+	}
+}
+
 func TestNew_ReturnsRenderer(t *testing.T) {
 	var buf bytes.Buffer
 	r := renderer.New(&buf, renderer.ModeTTY)

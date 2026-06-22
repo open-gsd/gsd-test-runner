@@ -241,8 +241,16 @@ type Event struct {
 	Stream string
 
 	// Detail is set for LegFailure (error message), TestFail
-	// (failure output / stack).
+	// (one-line error message).
 	Detail string
+
+	// File, ErrorClass, and FailLine are set for EventTestFail to power the
+	// real-time "✗ FAIL <file>:<line> · <class> · <msg>" line (Option I, #84).
+	// All best-effort: FailLine is 0 when it can't be derived. Additive per the
+	// ADR-0017 amendment (like Stream).
+	File       string
+	ErrorClass string
+	FailLine   int
 }
 
 // dockerCp is a package-level variable for testability (matches the
@@ -714,11 +722,15 @@ func (p *Pipeline) tailJSONLForLiveEvents(ctx context.Context, wg *sync.WaitGrou
 			if !ok {
 				return
 			}
-			kind := EventTestPass
+			e := Event{Kind: EventTestPass, Leg: LegRunTests, Line: ev.Name, File: ev.File, OS: p.bench.OS}
 			if ev.Kind == "fail" {
-				kind = EventTestFail
+				// Carry the evidence for the real-time failure line (Option I).
+				e.Kind = EventTestFail
+				e.ErrorClass = ev.ErrorClass
+				e.FailLine = ev.Line
+				e.Detail = ev.Error
 			}
-			p.emit(Event{Kind: kind, Leg: LegRunTests, Line: ev.Name, OS: p.bench.OS})
+			p.emit(e)
 		},
 		nil, // ignore stderr from `tail -f`
 	)
@@ -781,6 +793,12 @@ func (p *Pipeline) Parse(ctx context.Context) error {
 // Report returns the per-OS final result. Only meaningful after
 // successful Parse (or after RunAll returns nil).
 func (p *Pipeline) Report() report.Report { return p.result }
+
+// DrainedPath returns the local path of the JSONL capture file pulled from the
+// container by Drain (empty until Drain succeeds). The orchestrator copies it
+// into the per-run artifact dir so the full per-test detail is always persisted
+// (Option B, #84).
+func (p *Pipeline) DrainedPath() string { return p.drainedPath }
 
 // Cleanup force-removes the running container if StartContainer ran
 // successfully. Called by RunAll via defer; safe to call with an empty
