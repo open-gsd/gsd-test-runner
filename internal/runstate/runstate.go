@@ -74,6 +74,32 @@ func Path(runID string) (string, error) {
 	return filepath.Join(dir, runID+".json"), nil
 }
 
+// RunDir returns the per-run artifact directory for runID: <Dir()>/<runID>.
+// It is a sibling of the <runID>.json state file written by Save and reuses the
+// same XDG resolution as Dir(). Failure-first run artifacts (FAILURES.md,
+// failures.json, per-failure files, junit, the verdict) are written here
+// (issue #84, ADR-0023).
+func RunDir(runID string) (string, error) {
+	dir, err := Dir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, runID), nil
+}
+
+// EnsureRunDir creates (MkdirAll 0o755) and returns the per-run artifact
+// directory for runID. Idempotent: a second call is a no-op.
+func EnsureRunDir(runID string) (string, error) {
+	dir, err := RunDir(runID)
+	if err != nil {
+		return "", err
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return "", fmt.Errorf("runstate: create run dir %s: %w", dir, err)
+	}
+	return dir, nil
+}
+
 // Save writes st to its state file atomically. The directory is created if it
 // does not exist. Atomicity is achieved by writing to a temp file in the same
 // directory and then calling os.Rename so a concurrent Load never sees a
