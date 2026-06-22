@@ -134,6 +134,14 @@ func TestRunAsync_DispatchReturnsZeroFastAndPrintsRunID(t *testing.T) {
 // TestWait_DoneStateRendersVerdict verifies that `gsd-test wait <id>` against
 // a pre-seeded DONE state renders the same node:test output as runrender.Render
 // and returns the same exit code.
+// lastLineIsVerdict reports whether the final non-empty stdout line is the
+// Option C machine verdict ({"type":"verdict",...}, appended after the
+// runrender text by `gsd-test run`/`wait`, epic #84).
+func lastLineIsVerdict(stdout string) bool {
+	lines := strings.Split(strings.TrimRight(stdout, "\n"), "\n")
+	return strings.HasPrefix(lines[len(lines)-1], `{"type":"verdict"`)
+}
+
 func TestWait_DoneStateRendersVerdict(t *testing.T) {
 	tmp := t.TempDir()
 	t.Setenv("XDG_STATE_HOME", tmp)
@@ -169,8 +177,11 @@ func TestWait_DoneStateRendersVerdict(t *testing.T) {
 	if !strings.Contains(stdout, "ℹ pass") {
 		t.Errorf("stdout missing 'ℹ pass' marker; got:\n%s", stdout)
 	}
-	if stdout != wantText {
-		t.Errorf("stdout mismatch:\ngot:\n%s\nwant:\n%s", stdout, wantText)
+	if !strings.HasPrefix(stdout, wantText) {
+		t.Errorf("stdout should begin with the runrender verdict text:\ngot:\n%s\nwant prefix:\n%s", stdout, wantText)
+	}
+	if !lastLineIsVerdict(stdout) {
+		t.Errorf("expected the final stdout line to be the machine verdict (#84); got:\n%s", stdout)
 	}
 }
 
@@ -442,8 +453,11 @@ func TestWait_DoneStateWithDeadPIDWinsOverLivenessGuard(t *testing.T) {
 		t.Errorf("exit code: got %d, want %d (done state with dead pid must win over liveness guard); stderr:\n%s",
 			code, wantCode, stderr)
 	}
-	if stdout != wantText {
-		t.Errorf("stdout mismatch:\ngot:\n%s\nwant:\n%s", stdout, wantText)
+	if !strings.HasPrefix(stdout, wantText) {
+		t.Errorf("stdout should begin with the runrender verdict text:\ngot:\n%s\nwant prefix:\n%s", stdout, wantText)
+	}
+	if !lastLineIsVerdict(stdout) {
+		t.Errorf("expected the final stdout line to be the machine verdict (#84); got:\n%s", stdout)
 	}
 	if strings.Contains(stderr, "worker") && strings.Contains(stderr, "gone") {
 		t.Errorf("stderr must NOT say 'worker gone' for a completed run; got:\n%s", stderr)

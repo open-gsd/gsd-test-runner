@@ -328,29 +328,51 @@ func run(args []string, stdout, stderr *os.File) int {
 	return exitAllPass
 }
 
-// emitRunArtifacts writes the failure-first run artifacts (FAILURES.md,
-// failures.json, per-failure files) to the per-run XDG dir and prints the loud
-// last-line machine verdict as the final stdout line, in every outcome (epic
-// #84, ADR-0023). All filesystem work is best-effort: a failure is logged to
-// stderr but never changes the exit code or suppresses the verdict (the
-// verdict's outcome is the source of truth).
+// writeRunArtifacts writes the failure-first digest (FAILURES.md, failures.json,
+// per-failure files) for reps under the per-run XDG dir for runID and returns
+// the artifact paths (epic #84, ADR-0023). Best-effort: a write failure is
+// logged to stderr and returns whatever paths succeeded, never affecting the
+// caller's exit code.
+func writeRunArtifacts(runID string, reps []report.Report, stderr io.Writer) digest.Paths {
+	dir, err := runstate.EnsureRunDir(runID)
+	if err != nil {
+		fmt.Fprintf(stderr, "warning: create run artifact dir: %v\n", err)
+		return digest.Paths{}
+	}
+	paths, err := digest.WriteDigest(dir, reps, digest.WriteOpts{PerFailureFiles: true})
+	if err != nil {
+		fmt.Fprintf(stderr, "warning: write run digest: %v\n", err)
+		return digest.Paths{Dir: dir}
+	}
+	return paths
+}
+
+// writeVerdict prints the loud last-line machine verdict as the final stdout
+// line (Option C). Best-effort: never changes the exit code (the verdict's
+// outcome is the source of truth regardless of the artifacts).
+func writeVerdict(reps []report.Report, paths digest.Paths, stdout, stderr io.Writer) {
+	if err := digest.Verdict(reps, paths).WriteLine(stdout); err != nil {
+		fmt.Fprintf(stderr, "warning: write verdict line: %v\n", err)
+	}
+}
+
+// emitRunArtifacts is the standard multi-OS path: it mints a run-id, writes the
+// digest, and prints the verdict as the final stdout line in every outcome.
 func emitRunArtifacts(reps []report.Report, stdout, stderr io.Writer) {
 	runID, err := runspec.NewRunID()
 	if err != nil {
 		runID = "run-unknown"
 	}
-	var paths digest.Paths
-	if dir, derr := runstate.EnsureRunDir(runID); derr != nil {
-		fmt.Fprintf(stderr, "warning: create run artifact dir: %v\n", derr)
-	} else if p, werr := digest.WriteDigest(dir, reps, digest.WriteOpts{PerFailureFiles: true}); werr != nil {
-		fmt.Fprintf(stderr, "warning: write run digest: %v\n", werr)
-		paths.Dir = dir
-	} else {
-		paths = p
-	}
-	if err := digest.Verdict(reps, paths).WriteLine(stdout); err != nil {
-		fmt.Fprintf(stderr, "warning: write verdict line: %v\n", err)
-	}
+	writeVerdict(reps, writeRunArtifacts(runID, reps, stderr), stdout, stderr)
+}
+
+// emitRunDieArtifacts is the run-and-die single-OS path: it writes the digest
+// under the run's existing run-id and prints the verdict as the final stdout
+// line, so `gsd-test run`/`wait` share the standard path's failure-first
+// contract (Option C, epic #84).
+func emitRunDieArtifacts(runID string, rep report.Report, stdout, stderr io.Writer) {
+	reps := []report.Report{rep}
+	writeVerdict(reps, writeRunArtifacts(runID, reps, stderr), stdout, stderr)
 }
 
 // runSubmit implements `gsd-test submit`: read a JSON run spec (from --spec-file
@@ -485,6 +507,8 @@ func runRun(args []string, stdout, stderr *os.File) int {
 
 	text, code := runrender.Render(rep)
 	fmt.Fprint(stdout, text)
+	// Failure-first digest + loud verdict, shared with the standard path (#84).
+	emitRunDieArtifacts(spec.RunID, rep, stdout, stderr)
 	return code
 }
 
@@ -573,6 +597,9 @@ func runWorker(args []string, stdout, stderr *os.File) int {
 	st.UpdatedAt = time.Now().UTC()
 	if ok {
 		_, code := runrender.Render(rep)
+		// Persist the failure-first digest now so artifacts exist on disk as soon
+		// as the async run finishes; `gsd-test wait` prints the verdict (#84).
+		_ = writeRunArtifacts(st.Spec.RunID, []report.Report{rep}, stderr)
 		st.Report = &rep
 		st.ExitCode = code
 		st.Status = runstate.StatusDone
@@ -667,6 +694,8 @@ func waitRun(args []string, stdout, stderr *os.File) int {
 
 	text, code := runrender.Render(*st.Report)
 	fmt.Fprint(stdout, text)
+	// Same failure-first digest + verdict as a blocking `gsd-test run` (#84).
+	emitRunDieArtifacts(st.Spec.RunID, *st.Report, stdout, stderr)
 	return code
 }
 
