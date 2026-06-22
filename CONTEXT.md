@@ -42,6 +42,10 @@ The developer-side launcher, distributed as a single static Go binary per Dev Wo
 
 The output shape for one OS run. Either `pass x/y` (with x == y) or a structured fail report listing failed tests with file, name, and captured output. Replaces the old cross-platform Diff entirely — if Linux passes and Windows fails, the user reads two reports rather than a divergence summary.
 
+### Failure-first output (ADR-0023)
+
+How runs are surfaced to an agent. The live TTY stream is **quiet by default** — a compact per-OS heartbeat plus loud, real-time failures (`✗ FAIL file:line · class · msg`); `--verbose` / `GSD_TEST_VERBOSE=1` restores the full firehose, `--quiet` drops the heartbeat, and `--json-events` still emits the full typed stream. Every run also writes a deterministic, failure-only digest under `$XDG_STATE_HOME/gsd-test/runs/<run-id>/` (`FAILURES.md`, `failures.json` with full untruncated evidence, `failures/NN-<slug>.md`, `junit.xml`, and the per-OS JSONL), and prints exactly one machine-readable **verdict** line (`{"type":"verdict",…}`) as the last line of stdout in every mode and outcome. The same `internal/digest` serializer and verdict back both the standard multi-OS path and the run-and-die path. Truncated blobs carry a pointer back into `failures.json`; identical failures are de-duplicated across OSes ("N failures, M unique"). Event emission is lossless (unbounded queue + pump; see ADR-0017 as amended).
+
 ### Fail-loud pipeline
 
 The Local Engine's contract: every leg of the pipeline (image-version check, merge, copy-in, container start, npm ci, build, test run, JSONL drain, parse, report) emits a structured failure with the specific leg that failed and a path to diagnostics. The "neither platform produced test events" silent failure is the anti-pattern this contract exists to prevent.

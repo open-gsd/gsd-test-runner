@@ -231,6 +231,40 @@ synchronously (a tight CPU loop) also blocks the reporter, so these fields may b
 empty even though the container was reaped — attribution is best-effort. The
 container-teardown guarantee is unaffected.
 
+## Result artifacts and verdict (ADR-0023)
+
+Beyond the `node --test`-style text, every `gsd-test run` / `wait` emits a
+failure-first contract shared with the standard `gsd-test` path:
+
+- **Verdict line.** The final line of stdout is one compact JSON object, in every
+  outcome:
+
+  ```json
+  {"type":"verdict","outcome":"reaped","per_os":{"linux":{"passed":0,"failed":3,"total":3,"outcome":"reaped"}},
+   "unique_failures":2,"total_failures":3,"top":[{"class":"timeout","file":"reaper.test.js","line":88,"name":"reaps orphaned node"}],
+   "artifacts":{"dir":"…","failures_json":"…","failures_md":"…","junit_xml":"…"}}
+  ```
+
+  `type:"verdict"` distinguishes it from any other line. `outcome` is the source
+  of truth (it matches the exit code); artifact writes are best-effort and never
+  change the exit code.
+
+- **Artifact directory.** Under `$XDG_STATE_HOME/gsd-test/runs/<run-id>/`
+  (fallback `~/.local/state/gsd-test/runs/<run-id>/`), a sibling of the run's
+  `<run-id>.json` state file:
+  - `failures.json` — machine-readable summary + grouped failures with **full,
+    untruncated** error/stack/output (the "full at …" target).
+  - `FAILURES.md` — headline first, one **bounded** block per unique failure
+    (`class · file:line · name · platforms`, capped error/stack/output with a
+    pointer back into `failures.json`).
+  - `failures/INDEX.md` + `failures/NN-<slug>.md` — one self-contained file per
+    failure.
+  - `junit.xml` — JUnit XML for CI/agent tooling.
+
+  Fastest path for an agent: read the verdict line (or grep `"type":"verdict"`),
+  then open `FAILURES.md` / `failures.json` — one read instead of scrolling the
+  stream.
+
 ## Container labels
 
 Each run container carries these labels (reverse-DNS, matching the image-version sentinel convention):
