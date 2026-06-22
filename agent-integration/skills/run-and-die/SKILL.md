@@ -34,6 +34,15 @@ whenever you know the suite's normal duration.
 - `1` — a test failed **or** the run was reaped (a runaway killed by the watchdog).
 - `2` — the run could not start (read stderr).
 
+The **last line of stdout is a machine verdict** — one compact JSON object
+(`{"type":"verdict","outcome":…,"unique_failures":…,"top":[…],"artifacts":{…}}`).
+For the fastest read of a failure, parse that line (or grep `"type":"verdict"`),
+then open the artifacts it points at: `FAILURES.md` (one bounded block per unique
+failure, with a `file:line`, class, and evidence) and `failures.json` (the same,
+full and untruncated) under `$XDG_STATE_HOME/gsd-test/runs/<run-id>/`. That is
+one read instead of scrolling the stream — and `junit.xml` is there too for CI
+tooling.
+
 A **REAPED** block means the run exceeded its deadline and was killed — a real
 signal, not a flake. It names the runaway (the last active / in-flight test).
 Fix that test (a leaked timer, socket, or infinite loop); do **not** just raise

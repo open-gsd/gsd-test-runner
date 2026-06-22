@@ -1,6 +1,6 @@
 # 0017 — Event emission contract for the Per-OS Pipeline
 
-Status: Accepted (2026-05-23)
+Status: Accepted (2026-05-23). Decision 4 (non-blocking, drop-on-full emit) amended by ADR-0023 — emit is now lossless via an unbounded queue + pump goroutine.
 
 ## Context
 

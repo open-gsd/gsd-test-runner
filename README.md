@@ -10,8 +10,9 @@ Run your Node test suite across Linux, Windows, and macOS in parallel — on har
 - **No shared infrastructure** — your laptop orchestrates; your own remote machines execute.
 - **Fail-loud diagnostics** — every leg of the pipeline reports a distinct exit code with a diagnostics path.
 - **Versioned Tester Images** published to GHCR. Sentinel labels catch silent stale-image drift.
-- **Live progress** — see individual test events as they run, not just at the end.
-- **Machine-readable output** via `--json-events` for CI integration or your own tooling.
+- **Failure-first output** — failures surface loudly the instant they happen (`✗ FAIL file:line · class · msg`); quiet by default with a compact heartbeat, full firehose behind `--verbose` / `GSD_TEST_VERBOSE=1`.
+- **Addressable artifacts** — every run writes a small `FAILURES.md` + `failures.json` (+ `junit.xml`) under `$XDG_STATE_HOME/gsd-test/runs/<run-id>/` and prints one machine-readable **verdict** line as the last line of stdout (ADR-0023).
+- **Machine-readable output** via `--json-events` (the full typed event stream) for CI integration or your own tooling.
 
 ## Quick Start
 
@@ -66,7 +67,7 @@ Run-and-die (containerised `node --test` for coding agents):
 2. It loads `~/.config/gsd-test/config.toml` — your list of remote machines (Benches), one per target OS.
 3. It constructs a PR-merged worktree (base branch merged with your current changes) in a scratch directory.
 4. For each target OS, it ensures the Tester Image is present on the corresponding Bench, then spawns a container, copies your worktree in, and runs `npm ci` + `npm run build` + `node --test`.
-5. Per-OS results stream back as live events; a final per-OS pass/fail summary prints at the end.
+5. Failures and a compact heartbeat stream back live (the full firehose is behind `--verbose`); at the end a per-OS summary prints, followed by a one-line machine **verdict** and a failure-first digest (`FAILURES.md` / `failures.json` / `junit.xml`) under `$XDG_STATE_HOME/gsd-test/runs/<run-id>/`.
 
 **Exit codes:** `0` all platforms pass · `1` at least one platform failed · `2` infrastructure problem (see [Troubleshooting](docs/troubleshooting.md))
 
