@@ -21,6 +21,14 @@ func newTestPipeline(t *testing.T, bufSize int) (*Pipeline, chan Event) {
 	ch := make(chan Event, bufSize)
 	b := bench.Bench{Name: "test-bench", Host: "localhost", OS: "linux"}
 	p := New(b, images.ImageID("gsd-tester-linux:dev"), "v0.0.0-test", "/tmp/worktree", nil, ch)
+	// Ensure the pump goroutine winds down at end of test: mark the stream closed
+	// and drain any backlog so a pump parked mid-send can deliver and exit. Both
+	// closeEvents and ranging a closed channel are safe to repeat.
+	t.Cleanup(func() {
+		p.closeEvents()
+		for range ch {
+		}
+	})
 	return p, ch
 }
 
@@ -109,7 +117,7 @@ func TestPipeline_EmitsLegStartBeforeReturning(t *testing.T) {
 	_ = p.CheckImageVersion(context.Background())
 
 	// Drain all events from the channel.
-	close(ch)
+	p.closeEvents()
 	var events []Event
 	for e := range ch {
 		events = append(events, e)
@@ -167,7 +175,9 @@ func TestEvent_FullChannel_DoesNotBlock(t *testing.T) {
 		ExitCode: 1,
 	})
 
-	// Capacity 1: fills after the first event; all subsequent emits must drop.
+	// Capacity 1 with no consumer: the unbounded in-pipeline queue absorbs every
+	// emit and RunAll never blocks on the channel — the pump keeps trying to
+	// deliver in the background (no events are dropped; #84, ADR-0017 amendment).
 	ch := make(chan Event, 1)
 	b := bench.Bench{Name: "bench", Host: "local", OS: "linux"}
 	p := New(b, images.ImageID("gsd-tester-linux:dev"), "v0.0.0-test", "/tmp/worktree", nil, ch)
@@ -425,7 +435,7 @@ func TestCheckImageVersion_EmitsLegSuccessOnMatch(t *testing.T) {
 		t.Fatalf("expected nil, got: %v", err)
 	}
 
-	close(ch)
+	p.closeEvents()
 	var events []Event
 	for e := range ch {
 		events = append(events, e)
@@ -452,7 +462,7 @@ func TestCheckImageVersion_EmitsLegFailureOnMismatch(t *testing.T) {
 
 	_ = p.CheckImageVersion(context.Background())
 
-	close(ch)
+	p.closeEvents()
 	var events []Event
 	for e := range ch {
 		events = append(events, e)
@@ -874,7 +884,7 @@ func TestRunAll_CleanupRunsAfterFailure(t *testing.T) {
 	}()
 
 	_, err := p.RunAll(context.Background())
-	close(ch)
+	p.closeEvents()
 
 	if err == nil {
 		t.Fatal("expected error from RunAll (CopyWorktree should fail), got nil")
@@ -935,7 +945,7 @@ func TestDrain_Success(t *testing.T) {
 		os.Remove(p.drainedPath)
 	}
 
-	close(ch)
+	p.closeEvents()
 	var events []Event
 	for e := range ch {
 		events = append(events, e)
@@ -1108,7 +1118,7 @@ func TestRunAll_DrainPlusParse_EventOrdering(t *testing.T) {
 		t.Fatalf("Parse failed: %v", err)
 	}
 
-	close(ch)
+	p.closeEvents()
 	var events []Event
 	for e := range ch {
 		events = append(events, e)
@@ -1330,7 +1340,7 @@ func TestNpmCI_Success(t *testing.T) {
 		t.Fatalf("expected nil error, got: %v", err)
 	}
 
-	close(ch)
+	p.closeEvents()
 	var events []Event
 	for e := range ch {
 		events = append(events, e)
@@ -1433,7 +1443,7 @@ func TestBuild_Success(t *testing.T) {
 		t.Fatalf("expected nil error, got: %v", err)
 	}
 
-	close(ch)
+	p.closeEvents()
 	var events []Event
 	for e := range ch {
 		events = append(events, e)
@@ -1512,7 +1522,7 @@ func TestBuild_NoBuildScript_Skipped(t *testing.T) {
 		t.Fatalf("expected nil error, got: %v", err)
 	}
 
-	close(ch)
+	p.closeEvents()
 	var events []Event
 	for e := range ch {
 		events = append(events, e)
@@ -1598,7 +1608,7 @@ func TestBuild_PackageJsonReadFailure(t *testing.T) {
 	}
 
 	// Must emit EventLegFailure, not EventLegSkipped.
-	close(ch)
+	p.closeEvents()
 	var events []Event
 	for e := range ch {
 		events = append(events, e)
@@ -1645,7 +1655,7 @@ func TestBuild_PackageJsonMalformed(t *testing.T) {
 		t.Errorf("expected BuildError.Cause to mention %q, got: %v", "parse package.json", buildErr.Cause)
 	}
 
-	close(ch)
+	p.closeEvents()
 	var events []Event
 	for e := range ch {
 		events = append(events, e)
@@ -1673,7 +1683,7 @@ func TestBuild_EmptyScriptsObject(t *testing.T) {
 		t.Fatalf("expected nil error, got: %v", err)
 	}
 
-	close(ch)
+	p.closeEvents()
 	var events []Event
 	for e := range ch {
 		events = append(events, e)
@@ -1709,7 +1719,7 @@ func TestBuild_BuildScriptEmptyString(t *testing.T) {
 		t.Error("expected dockerStream to be called for empty-string build script")
 	}
 
-	close(ch)
+	p.closeEvents()
 	var events []Event
 	for e := range ch {
 		events = append(events, e)
@@ -1742,7 +1752,7 @@ func TestRunLeg_SkipSentinel(t *testing.T) {
 		t.Fatalf("expected nil return from runLeg on ErrLegSkipped, got: %v", err)
 	}
 
-	close(ch)
+	p.closeEvents()
 	var events []Event
 	for e := range ch {
 		events = append(events, e)
@@ -2004,7 +2014,7 @@ func TestRunTests_EmitsLiveTestEvents(t *testing.T) {
 		t.Fatalf("expected nil error, got: %v", err)
 	}
 
-	close(ch)
+	p.closeEvents()
 	var events []Event
 	for e := range ch {
 		events = append(events, e)

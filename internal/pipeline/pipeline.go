@@ -345,7 +345,11 @@ type Pipeline struct {
 	expectedVersion string // per ADR-0011 decision 3: caller-supplied
 	work            string // path to the PR-merged worktree (from worktree.Worktree.Path())
 	events          chan<- Event
-	result          report.Report
+	// queue is the unbounded, lossless buffer between emit (producers) and the
+	// events channel. A single pump goroutine drains it and is the sole closer
+	// of events (#84, ADR-0017 amendment). Nil only when events is nil.
+	queue  *eventQueue
+	result report.Report
 	// containerID is the running container ID/name set by StartContainer.
 	// Drain uses it as the source for docker cp. Today StartContainer is a
 	// stub; tests seed this field directly.
@@ -360,21 +364,29 @@ type Pipeline struct {
 
 // New constructs a Pipeline. The expectedVersion parameter is the
 // Image-version sentinel value this Pipeline will verify in
-// CheckImageVersion (see ADR-0011, decision 3). The events channel
-// must be readable by some consumer; Pipeline sends are non-blocking
-// (select-with-default), so a full or unread channel silently drops
-// events. Real callers should buffer generously and drain in a
-// goroutine.
+// CheckImageVersion (see ADR-0011, decision 3). Events are buffered in an
+// unbounded in-pipeline queue and delivered to the events channel by a single
+// pump goroutine, so emit never blocks a leg and never drops an event (#84,
+// ADR-0017 amendment); the pump is the sole closer of events. Callers must
+// drain events; they must NOT close it themselves. A nil events channel makes
+// emit a no-op (no pump is started).
 func New(b bench.Bench, img images.ImageID, expectedVersion string, worktreePath string, testCommand []string, events chan<- Event) *Pipeline {
-	return &Pipeline{
+	p := &Pipeline{
 		bench:           b,
 		image:           img,
 		expectedVersion: expectedVersion,
 		work:            worktreePath,
 		testCommand:     testCommand,
 		events:          events,
+		queue:           newEventQueue(),
 		result:          report.New(b.OS, b.Name, string(img), expectedVersion, time.Now().UTC()),
 	}
+	// Start the single pump that drains the queue to events and closes it. With
+	// no events channel emit is a no-op, so no pump is needed.
+	if events != nil {
+		go p.pump()
+	}
+	return p
 }
 
 func (p *Pipeline) runTestsCommandArgs() []string {
@@ -786,6 +798,10 @@ func (p *Pipeline) Cleanup(ctx context.Context) {
 // and the LegError of the first failed leg. Defers container cleanup so
 // the idle container started by StartContainer is removed even on failure.
 func (p *Pipeline) RunAll(ctx context.Context) (report.Report, error) {
+	// Deferred so the event stream is flushed and closed on EVERY exit path —
+	// normal return, leg error, or a panic — otherwise the renderer's range over
+	// events never ends and r.Wait() hangs (#84).
+	defer p.closeEvents()
 	// Defer cleanup before legs run so it fires even if a leg panics or fails.
 	// context.Background() is used so cleanup runs even after ctx is canceled.
 	defer func() {
@@ -846,15 +862,104 @@ func (p *Pipeline) runLeg(ctx context.Context, leg Leg, work func(context.Contex
 	return nil
 }
 
-// emit sends an Event non-blockingly. If the channel is full or has
-// no consumer, the event is silently dropped. Real consumers should
-// buffer generously and drain in a goroutine.
+// emit enqueues an Event for delivery to the renderer. It never blocks a leg
+// and never drops: the event is appended to an unbounded in-pipeline queue that
+// the pump goroutine drains to the events channel (#84, ADR-0017 amendment).
+// A nil events channel makes emit a no-op (the no-consumer path).
 func (p *Pipeline) emit(e Event) {
 	if p.events == nil {
 		return
 	}
-	select {
-	case p.events <- e:
-	default:
+	p.queue.push(e)
+}
+
+// closeEvents signals that no more events will be emitted. It is idempotent and
+// non-blocking: it only marks the queue closed. The pump then delivers any
+// queued events to the consumer and closes the channel — so a caller relying on
+// the channel to close MUST keep draining it until then (a stalled consumer
+// leaves the pump parked mid-send). Called by RunAll on every exit path. A nil
+// events channel makes it a no-op.
+func (p *Pipeline) closeEvents() {
+	if p.events == nil {
+		return
 	}
+	p.queue.close()
+}
+
+// pump is the single goroutine that drains the unbounded queue to the events
+// channel in FIFO order and closes the channel once the queue is closed and
+// fully drained. It is the sole closer of p.events. RunAll never waits on it,
+// so a slow or absent consumer can never block a leg or RunAll; with no
+// consumer the pump simply parks on the channel send until the process exits.
+func (p *Pipeline) pump() {
+	defer close(p.events)
+	for {
+		e, ok := p.queue.pop()
+		if !ok {
+			return
+		}
+		p.events <- e
+	}
+}
+
+// eventQueue is an unbounded, mutex-guarded FIFO drained by one pump goroutine.
+// Producers (emit) never block and nothing is dropped; only the pump can block,
+// on a slow channel, which is bounded backpressure rather than data loss. This
+// replaces the prior non-blocking select-default emit that silently discarded
+// events on a full 128-item buffer (#84, ADR-0017 amendment).
+type eventQueue struct {
+	mu     sync.Mutex
+	cond   *sync.Cond
+	items  []Event
+	closed bool
+}
+
+func newEventQueue() *eventQueue {
+	q := &eventQueue{}
+	q.cond = sync.NewCond(&q.mu)
+	return q
+}
+
+// push appends e. It is a no-op once the queue is closed (no producers after
+// close), so a late tail-goroutine emit during shutdown can never panic.
+func (q *eventQueue) push(e Event) {
+	q.mu.Lock()
+	if q.closed {
+		q.mu.Unlock()
+		return
+	}
+	q.items = append(q.items, e)
+	q.mu.Unlock()
+	q.cond.Signal()
+}
+
+// close marks the queue closed and wakes the pump so it can drain and exit.
+// Idempotent.
+func (q *eventQueue) close() {
+	q.mu.Lock()
+	if q.closed {
+		q.mu.Unlock()
+		return
+	}
+	q.closed = true
+	q.mu.Unlock()
+	q.cond.Broadcast()
+}
+
+// pop returns the next event, blocking until one is available. It returns
+// ok=false exactly once the queue is both closed and fully drained.
+func (q *eventQueue) pop() (Event, bool) {
+	q.mu.Lock()
+	for len(q.items) == 0 && !q.closed {
+		q.cond.Wait()
+	}
+	if len(q.items) == 0 {
+		q.mu.Unlock()
+		return Event{}, false
+	}
+	e := q.items[0]
+	q.items[0] = Event{} // release the reference so the backing array can shrink
+	q.items = q.items[1:]
+	q.mu.Unlock()
+	return e, true
 }

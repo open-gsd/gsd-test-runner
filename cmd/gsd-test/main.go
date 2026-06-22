@@ -282,7 +282,8 @@ func run(args []string, stdout, stderr *os.File) int {
 			defer pwg.Done()
 			pl := pipeline.New(run.Bench, run.ImageID, run.Version, wt.Path(), cfg.Testing.Command, events)
 			rep, err := pl.RunAll(ctx)
-			close(events) // signal renderer the channel is done
+			// The pipeline's pump goroutine owns closing events (it flushes the
+			// unbounded queue first), so we must NOT close it here (#84).
 			results <- pipelineResult{os: run.OS, rep: rep, err: err}
 		}()
 	}
