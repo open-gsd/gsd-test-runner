@@ -54,7 +54,7 @@ func TestWriteDigest_Deterministic(t *testing.T) {
 	if _, err := WriteDigest(d2, reps, opts); err != nil {
 		t.Fatalf("WriteDigest d2: %v", err)
 	}
-	for _, name := range []string{"failures.json", "FAILURES.md", "failures/INDEX.md"} {
+	for _, name := range []string{"failures.json", "FAILURES.md", "junit.xml", "failures/INDEX.md"} {
 		b1 := mustRead(t, filepath.Join(d1, name))
 		b2 := mustRead(t, filepath.Join(d2, name))
 		if string(b1) != string(b2) {
