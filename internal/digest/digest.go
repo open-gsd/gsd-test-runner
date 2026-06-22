@@ -190,6 +190,17 @@ func WriteDigest(dir string, reps []report.Report, opts WriteOpts) (Paths, error
 		return paths, fmt.Errorf("digest: write FAILURES.md: %w", err)
 	}
 
+	// JUnit XML for CI/agent-tooling interop (Option H), uniform across both
+	// execution paths.
+	junitXML, err := JUnitFromReports(reps)
+	if err != nil {
+		return paths, err
+	}
+	paths.JUnitXML = filepath.Join(dir, "junit.xml")
+	if err := os.WriteFile(paths.JUnitXML, junitXML, 0o644); err != nil {
+		return paths, fmt.Errorf("digest: write junit.xml: %w", err)
+	}
+
 	if opts.PerFailureFiles && len(doc.Failures) > 0 {
 		paths.FailuresDir = filepath.Join(dir, "failures")
 		paths.IndexMD = filepath.Join(paths.FailuresDir, "INDEX.md")
