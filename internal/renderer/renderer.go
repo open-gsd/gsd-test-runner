@@ -27,6 +27,22 @@ const (
 	ModeJSONEvents             // one Event JSON line per emitted event
 )
 
+// Verbosity controls how much of the live TTY stream is shown (Option B, #84).
+// It is orthogonal to Mode and affects ModeTTY only; ModeJSONEvents always emits
+// the full typed stream. The zero value is VerbosityFull, so New preserves the
+// render-everything behavior unless the caller opts into a quieter level.
+type Verbosity int
+
+const (
+	VerbosityFull   Verbosity = iota // render every event (default)
+	VerbosityNormal                  // suppress child output + per-test pass; show a heartbeat + failures
+	VerbosityQuiet                   // failures + leg events only; no heartbeat
+)
+
+// heartbeatEvery is how many passing tests elapse between heartbeat lines in
+// VerbosityNormal, so a long quiet run stays visibly alive without the firehose.
+const heartbeatEvery = 25
+
 // Renderer multiplexes Pipeline event channels (one per OS) onto a single
 // output writer, formatting per Mode. Caller wires the lifecycle:
 //
@@ -38,13 +54,17 @@ const (
 //	r.AddResult("windows", windowsReport, windowsErr)
 //	r.Wait()  // blocks until all subscribed channels close + final summary printed
 type Renderer struct {
-	out  io.Writer
-	mode Mode
-	mu   sync.Mutex // guards writes to out
+	out       io.Writer
+	mode      Mode
+	verbosity Verbosity
+	mu        sync.Mutex // guards writes to out
 
 	eventsWG  sync.WaitGroup // tracks subscribed event-consumer goroutines
 	results   map[string]osResult
 	resultsMu sync.Mutex
+
+	progMu   sync.Mutex     // guards passSeen
+	passSeen map[string]int // per-OS passing-test counter for the heartbeat
 }
 
 type osResult struct {
@@ -52,13 +72,22 @@ type osResult struct {
 	err error
 }
 
-// New constructs a Renderer.
+// New constructs a Renderer. Verbosity defaults to VerbosityFull (render
+// everything); use SetVerbosity to choose a quieter level.
 func New(out io.Writer, mode Mode) *Renderer {
 	return &Renderer{
-		out:     out,
-		mode:    mode,
-		results: make(map[string]osResult),
+		out:      out,
+		mode:     mode,
+		results:  make(map[string]osResult),
+		passSeen: make(map[string]int),
 	}
+}
+
+// SetVerbosity sets the TTY verbosity level (Option B). Call before Subscribe.
+// Returns the receiver for chaining.
+func (r *Renderer) SetVerbosity(v Verbosity) *Renderer {
+	r.verbosity = v
+	return r
 }
 
 // Subscribe registers a Pipeline event channel for a given OS. The renderer
@@ -145,6 +174,9 @@ func (r *Renderer) renderTTY(osName string, ev pipeline.Event) {
 	case pipeline.EventLegSkipped:
 		s = fmt.Sprintf("%s SKIP  %s: %s\n", prefix, legString(ev.Leg), ev.Detail)
 	case pipeline.EventChildOutput:
+		if r.verbosity != VerbosityFull {
+			return // build/npm/test firehose: shown only with --verbose
+		}
 		// Indent + prefix with stream marker for readability.
 		tag := "1"
 		if ev.Stream == "stderr" {
@@ -152,15 +184,62 @@ func (r *Renderer) renderTTY(osName string, ev pipeline.Event) {
 		}
 		s = fmt.Sprintf("%s   |%s %s\n", prefix, tag, ev.Line)
 	case pipeline.EventTestPass:
-		s = fmt.Sprintf("%s   ✓ %s\n", prefix, ev.Line)
+		if r.verbosity == VerbosityFull {
+			s = fmt.Sprintf("%s   ✓ %s\n", prefix, ev.Line)
+		} else if s = r.heartbeat(osName); s == "" {
+			return // quiet/normal: passes are counted, not printed line-by-line
+		}
 	case pipeline.EventTestFail:
-		s = fmt.Sprintf("%s   ✗ %s\n", prefix, ev.Line)
+		// Always loud, and enriched with file:line · class · msg (Option I).
+		s = fmt.Sprintf("%s   %s\n", prefix, failLine(ev))
 	default:
 		return
 	}
 	r.mu.Lock()
 	fmt.Fprint(r.out, s)
 	r.mu.Unlock()
+}
+
+// heartbeat increments the per-OS pass counter and returns a compact progress
+// line every heartbeatEvery passes (or "" otherwise). Suppressed entirely in
+// VerbosityQuiet.
+func (r *Renderer) heartbeat(osName string) string {
+	if r.verbosity == VerbosityQuiet {
+		return ""
+	}
+	r.progMu.Lock()
+	r.passSeen[osName]++
+	n := r.passSeen[osName]
+	r.progMu.Unlock()
+	if n%heartbeatEvery != 0 {
+		return ""
+	}
+	return fmt.Sprintf("[%s]   … %d passed\n", osName, n)
+}
+
+// failLine renders the real-time failure line (Option I):
+// "✗ FAIL <file>:<line> · <class> · <name> — <msg>", degrading gracefully when
+// the evidence fields are absent.
+func failLine(ev pipeline.Event) string {
+	var b strings.Builder
+	b.WriteString("✗ FAIL ")
+	if ev.File != "" {
+		b.WriteString(ev.File)
+		if ev.FailLine > 0 {
+			fmt.Fprintf(&b, ":%d", ev.FailLine)
+		}
+		b.WriteString(" · ")
+	}
+	if ev.ErrorClass != "" {
+		b.WriteString(ev.ErrorClass)
+		b.WriteString(" · ")
+	}
+	b.WriteString(ev.Line) // fully-qualified test name
+	if ev.Detail != "" {
+		b.WriteString(" — ")
+		b.WriteString(ev.Detail)
+	}
+	return b.String()
 }
 
 func (r *Renderer) printSummary() {

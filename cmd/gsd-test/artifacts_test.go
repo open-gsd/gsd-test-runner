@@ -3,6 +3,8 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -29,7 +31,7 @@ func TestEmitRunArtifacts_VerdictIsLastLine(t *testing.T) {
 	}
 
 	var stdout, stderr bytes.Buffer
-	emitRunArtifacts(reps, &stdout, &stderr)
+	emitRunArtifacts(reps, nil, &stdout, &stderr)
 
 	lines := strings.Split(strings.TrimRight(stdout.String(), "\n"), "\n")
 	last := lines[len(lines)-1]
@@ -73,5 +75,30 @@ func TestEmitRunDieArtifacts_VerdictIsLastLine(t *testing.T) {
 	art, _ := v["artifacts"].(map[string]any)
 	if art == nil || art["dir"] == "" {
 		t.Errorf("expected artifacts.dir to be set, got %v", v["artifacts"])
+	}
+}
+
+// TestCopyEventsJSONL verifies Option B persistence: each non-empty per-OS JSONL
+// is copied into the run dir as test-events-<os>.jsonl; empty paths are skipped.
+func TestCopyEventsJSONL(t *testing.T) {
+	dir := t.TempDir()
+	src := filepath.Join(dir, "src.jsonl")
+	content := `{"type":"test_event","kind":"pass","name":"x"}` + "\n"
+	if err := os.WriteFile(src, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var stderr bytes.Buffer
+	copyEventsJSONL(dir, map[string]string{"linux": src, "windows": ""}, &stderr)
+
+	got, err := os.ReadFile(filepath.Join(dir, "test-events-linux.jsonl"))
+	if err != nil {
+		t.Fatalf("expected linux JSONL persisted: %v", err)
+	}
+	if string(got) != content {
+		t.Errorf("JSONL content mismatch: got %q want %q", got, content)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "test-events-windows.jsonl")); !os.IsNotExist(err) {
+		t.Errorf("empty src should be skipped, but a file was written")
 	}
 }

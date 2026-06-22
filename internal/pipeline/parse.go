@@ -5,6 +5,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"regexp"
+	"strconv"
+	"strings"
 
 	"github.com/open-gsd/gsd-test-runner/internal/report"
 )
@@ -123,22 +126,30 @@ func parseJSONL(r io.Reader) (passed, total int, failures []report.FailedTest, e
 // report.FailedTest from JSONL; this is the lighter shape the tail goroutine
 // consumes.
 type LiveTestEvent struct {
-	Kind string // "pass" | "fail"
-	Name string
-	File string
+	Kind       string // "pass" | "fail"
+	Name       string
+	File       string
+	Error      string // first-line error message (fail only)
+	ErrorClass string // fail only
+	Line       int    // best-effort source line derived from the stack (0 if unknown)
 }
 
 // parseLiveTestEvent attempts to parse a single JSONL line as a test_event.
 // Returns (event, true) if the line is a recognized test_event with required
 // fields; (zero, false) otherwise (silently dropped — non-test_event lines,
-// malformed lines, etc.). The tail goroutine uses this; parseJSONL uses a
-// stricter version for the final report.
+// malformed lines, etc.). For failures it also surfaces the one-line error,
+// the error_class, and a best-effort source line so the renderer can print the
+// real-time "✗ FAIL file:line · class · msg" line (Option I, #84). The tail
+// goroutine uses this; parseJSONL uses a stricter version for the final report.
 func parseLiveTestEvent(line []byte) (LiveTestEvent, bool) {
 	var envelope struct {
-		Type string `json:"type"`
-		Kind string `json:"kind"`
-		Name string `json:"name"`
-		File string `json:"file"`
+		Type       string `json:"type"`
+		Kind       string `json:"kind"`
+		Name       string `json:"name"`
+		File       string `json:"file"`
+		Error      string `json:"error"`
+		ErrorClass string `json:"error_class"`
+		Stack      string `json:"stack"`
 	}
 	if err := json.Unmarshal(line, &envelope); err != nil {
 		return LiveTestEvent{}, false
@@ -149,7 +160,62 @@ func parseLiveTestEvent(line []byte) (LiveTestEvent, bool) {
 	if envelope.Kind == "" || envelope.Name == "" {
 		return LiveTestEvent{}, false
 	}
-	return LiveTestEvent{Kind: envelope.Kind, Name: envelope.Name, File: envelope.File}, true
+	return LiveTestEvent{
+		Kind:       envelope.Kind,
+		Name:       envelope.Name,
+		File:       envelope.File,
+		Error:      firstLine(envelope.Error),
+		ErrorClass: envelope.ErrorClass,
+		Line:       deriveLine(envelope.File, envelope.Stack),
+	}, true
+}
+
+var reFrameLineCol = regexp.MustCompile(`:(\d+):\d+`)
+
+// deriveLine extracts a best-effort source line from the first stack frame
+// mentioning the test file's base name (or the first ":<line>:<col>" frame when
+// file is empty); 0 when nothing matches. Mirrors digest's derivation; the two
+// are kept independent to avoid a pipeline→digest dependency.
+func deriveLine(file, stack string) int {
+	if stack == "" {
+		return 0
+	}
+	base := file
+	if i := strings.LastIndexAny(base, "/\\"); i >= 0 {
+		base = base[i+1:]
+	}
+	lines := strings.Split(stack, "\n")
+	if base != "" {
+		for _, ln := range lines {
+			if strings.Contains(ln, base) {
+				if n := firstLineCol(ln); n > 0 {
+					return n
+				}
+			}
+		}
+	}
+	for _, ln := range lines {
+		if n := firstLineCol(ln); n > 0 {
+			return n
+		}
+	}
+	return 0
+}
+
+func firstLineCol(s string) int {
+	m := reFrameLineCol.FindStringSubmatch(s)
+	if m == nil {
+		return 0
+	}
+	n, _ := strconv.Atoi(m[1])
+	return n
+}
+
+func firstLine(s string) string {
+	if i := strings.IndexByte(s, '\n'); i >= 0 {
+		return s[:i]
+	}
+	return s
 }
 
 // snippetOf returns up to maxLen bytes of b as a string for error messages.
