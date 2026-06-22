@@ -33,6 +33,7 @@ import (
 
 	"github.com/open-gsd/gsd-test-runner/internal/bench"
 	"github.com/open-gsd/gsd-test-runner/internal/config"
+	"github.com/open-gsd/gsd-test-runner/internal/digest"
 	"github.com/open-gsd/gsd-test-runner/internal/dispatch"
 	"github.com/open-gsd/gsd-test-runner/internal/dockerexec"
 	"github.com/open-gsd/gsd-test-runner/internal/images"
@@ -290,17 +291,31 @@ func run(args []string, stdout, stderr *os.File) int {
 
 	// ── Phase 5: Aggregate + Render ────────────────────────────────────────────
 	var sawLegError, sawFail bool
+	reps := make([]report.Report, 0, len(p.Runs))
 	for res := range results {
 		r.AddResult(res.os, res.rep, res.err)
 		if res.err != nil {
 			sawLegError = true
+			// A leg error means the suite did not run as designed; record it as
+			// an infra_error per-OS report so the digest/verdict still account
+			// for this OS (RunAll returns a zero Report on error).
+			infra := res.rep
+			infra.OS = res.os
+			infra.Outcome = report.OutcomeInfraError
+			reps = append(reps, infra)
 			continue
 		}
+		reps = append(reps, res.rep)
 		if res.rep.Kind == report.KindFail {
 			sawFail = true
 		}
 	}
 	r.Wait() // blocks for renderer event consumers + emits final summary
+
+	// Failure-first artifacts + loud last-line verdict (epic #84, ADR-0023).
+	// Best-effort: a write error never changes the exit code or suppresses the
+	// verdict (the verdict's outcome is the source of truth).
+	emitRunArtifacts(reps, stdout, stderr)
 
 	// Inconclusive if any Pipeline failed OR any Plan.Skipped entry exists.
 	if sawLegError || len(p.Skipped) > 0 {
@@ -310,6 +325,31 @@ func run(args []string, stdout, stderr *os.File) int {
 		return exitSomeFailed
 	}
 	return exitAllPass
+}
+
+// emitRunArtifacts writes the failure-first run artifacts (FAILURES.md,
+// failures.json, per-failure files) to the per-run XDG dir and prints the loud
+// last-line machine verdict as the final stdout line, in every outcome (epic
+// #84, ADR-0023). All filesystem work is best-effort: a failure is logged to
+// stderr but never changes the exit code or suppresses the verdict (the
+// verdict's outcome is the source of truth).
+func emitRunArtifacts(reps []report.Report, stdout, stderr io.Writer) {
+	runID, err := runspec.NewRunID()
+	if err != nil {
+		runID = "run-unknown"
+	}
+	var paths digest.Paths
+	if dir, derr := runstate.EnsureRunDir(runID); derr != nil {
+		fmt.Fprintf(stderr, "warning: create run artifact dir: %v\n", derr)
+	} else if p, werr := digest.WriteDigest(dir, reps, digest.WriteOpts{PerFailureFiles: true}); werr != nil {
+		fmt.Fprintf(stderr, "warning: write run digest: %v\n", werr)
+		paths.Dir = dir
+	} else {
+		paths = p
+	}
+	if err := digest.Verdict(reps, paths).WriteLine(stdout); err != nil {
+		fmt.Fprintf(stderr, "warning: write verdict line: %v\n", err)
+	}
 }
 
 // runSubmit implements `gsd-test submit`: read a JSON run spec (from --spec-file
