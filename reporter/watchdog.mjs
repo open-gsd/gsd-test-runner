@@ -175,6 +175,14 @@ export function collectSamples(leakDir) {
  * The child is injectable for testing; production callers omit it and pass
  * command/args, which are spawned in their own process group (detached) so the
  * signal reaches the runner's children too.
+ *
+ * readyToken (opt-in, off by default) gates the deadline clock on the child
+ * printing that exact sentinel line on stdout: until it appears the clock is
+ * not armed, so the budget times the test run rather than interpreter/container
+ * startup. Production omits it (deadline arms at spawn, unchanged); the
+ * real-spawn reap test uses it so the SIGTERM→SIGKILL escalation is exercised
+ * only after the child has installed its handlers — deterministic, not a race
+ * between node startup and a wall-clock deadline.
  */
 export function runWithWatchdog(opts) {
   const {
@@ -182,6 +190,7 @@ export function runWithWatchdog(opts) {
     graceMs = 5000,
     reason = 'estimate_overrun',
     granularity = '',
+    readyToken = '',
   } = opts;
 
   const spawnedDetached = opts.child == null;
@@ -224,49 +233,69 @@ export function runWithWatchdog(opts) {
   const t0 = Date.now();
   const elapsed = () => Date.now() - t0;
 
-  // Parse reporter JSONL off the child's stdout to know what is in flight.
-  let buf = '';
-  if (child.stdout) {
-    child.stdout.on('data', (chunk) => {
-      buf += chunk.toString();
-      let nl;
-      while ((nl = buf.indexOf('\n')) >= 0) {
-        const line = buf.slice(0, nl).trim();
-        buf = buf.slice(nl + 1);
-        if (!line) continue;
-        try {
-          tracker.observe(JSON.parse(line));
-        } catch {
-          /* not a reporter event; ignore */
-        }
-      }
-    });
-  }
-
   return new Promise((resolve) => {
     let kill;
     let killTimer;
+    let deadlineTimer;
+    let armed = false;
 
-    const deadlineTimer = setTimeout(() => {
-      const snap = tracker.snapshot(Date.now());
-      kill = {
-        reason,
-        reapedBy: 'in_container',
-        effectiveDeadlineMs: deadlineMs,
-        elapsedMs: elapsed(),
-        lastActiveTest: snap.lastActiveTest,
-        inFlightTests: snap.inFlightTests,
-        signalChain: [],
-      };
-      if (granularity) kill.granularity = granularity;
+    // armDeadline starts the kill clock: on expiry, snapshot the in-flight
+    // tests, SIGTERM, then SIGKILL after graceMs. Idempotent — readyToken may
+    // race the spawn/exit, and double-arming would leak a timer.
+    const armDeadline = () => {
+      if (armed) return;
+      armed = true;
+      deadlineTimer = setTimeout(() => {
+        const snap = tracker.snapshot(Date.now());
+        kill = {
+          reason,
+          reapedBy: 'in_container',
+          effectiveDeadlineMs: deadlineMs,
+          elapsedMs: elapsed(),
+          lastActiveTest: snap.lastActiveTest,
+          inFlightTests: snap.inFlightTests,
+          signalChain: [],
+        };
+        if (granularity) kill.granularity = granularity;
 
-      sendSignal('SIGTERM');
-      kill.signalChain.push(`SIGTERM@${elapsed()}`);
-      killTimer = setTimeout(() => {
-        sendSignal('SIGKILL');
-        kill.signalChain.push(`SIGKILL@${elapsed()}`);
-      }, graceMs);
-    }, deadlineMs);
+        sendSignal('SIGTERM');
+        kill.signalChain.push(`SIGTERM@${elapsed()}`);
+        killTimer = setTimeout(() => {
+          sendSignal('SIGKILL');
+          kill.signalChain.push(`SIGKILL@${elapsed()}`);
+        }, graceMs);
+      }, deadlineMs);
+    };
+
+    // Parse reporter JSONL off the child's stdout to know what is in flight.
+    // When readyToken is set, the child's sentinel line (printed once it is up)
+    // arms the deadline; reporter events flow to the tracker as usual.
+    let buf = '';
+    let sawReady = !readyToken;
+    if (child.stdout) {
+      child.stdout.on('data', (chunk) => {
+        buf += chunk.toString();
+        let nl;
+        while ((nl = buf.indexOf('\n')) >= 0) {
+          const line = buf.slice(0, nl).trim();
+          buf = buf.slice(nl + 1);
+          if (!line) continue;
+          if (!sawReady && line === readyToken) {
+            sawReady = true;
+            armDeadline();
+            continue;
+          }
+          try {
+            tracker.observe(JSON.parse(line));
+          } catch {
+            /* not a reporter event; ignore */
+          }
+        }
+      });
+    }
+
+    // No token (production default) or no stdout to watch it on → arm at spawn.
+    if (!readyToken || !child.stdout) armDeadline();
 
     child.on('exit', (code) => {
       clearTimeout(deadlineTimer);

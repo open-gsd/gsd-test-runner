@@ -100,17 +100,26 @@ test('reaped kill record carries the last active test', async () => {
 // Real-spawn integration: a genuinely hanging node process must be reaped and
 // actually leave the process table (orphan guarantee, ADR-0021 Decision 4).
 test('reaps a real hanging node child', async () => {
-  // deadlineMs must comfortably exceed node *interpreter startup* so the child
-  // has installed its SIGTERM handler before the deadline fires — otherwise the
-  // watchdog's SIGTERM lands during boot, the default action ends the child
-  // before our SIGKILL escalation, and the test flakes. 700ms was too tight
-  // under load (node boot spiked past it on a saturated machine); 2500ms gives
-  // a wide margin while keeping the test sub-3s.
+  // The escalation must not race node *interpreter startup*. If the watchdog's
+  // SIGTERM lands before the child installs its handler, the default action
+  // ends the child during boot and we never reach SIGKILL. Widening the
+  // deadline only widens that window — it was bumped 100→700→2500ms and still
+  // flaked under CPU saturation (commits 691eb31, 64f15cf). Instead, the child
+  // installs its SIGTERM handler, prints a readiness sentinel, *then* hangs; the
+  // watchdog arms its deadline only on that sentinel (readyToken), so by
+  // construction SIGTERM can never precede the handler. The escalation is now
+  // deterministic regardless of how slow startup is, and the deadline can be
+  // tight. Still exercises the real spawn + process-group/taskkill signal path.
+  const READY = '__gsd_watchdog_ready__';
   const res = await runWithWatchdog({
     command: process.execPath,
-    args: ['-e', 'process.on("SIGTERM", () => {}); setInterval(() => {}, 1000);'],
-    deadlineMs: 2500,
-    graceMs: 300,
+    args: ['-e',
+      'process.on("SIGTERM", () => {}); ' +
+      `process.stdout.write(${JSON.stringify(READY + '\n')}); ` +
+      'setInterval(() => {}, 1000);'],
+    readyToken: READY,
+    deadlineMs: 50, // armed only after READY → the SIGTERM handler is installed
+    graceMs: 50,
   });
   assert.equal(res.outcome, 'reaped');
   assert.ok(res.kill.signalChain.some((s) => s.startsWith('SIGKILL')),
