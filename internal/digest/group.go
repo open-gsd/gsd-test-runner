@@ -3,7 +3,6 @@ package digest
 import (
 	"regexp"
 	"sort"
-	"strconv"
 	"strings"
 
 	"github.com/open-gsd/gsd-test-runner/internal/report"
@@ -27,9 +26,30 @@ type Group struct {
 
 var (
 	reHexAddr = regexp.MustCompile(`0x[0-9a-f]+`)
-	reAbsPath = regexp.MustCompile(`(?:[a-z]:\\|/)[^\s:]+(?::\d+)*`)
-	reDigits  = regexp.MustCompile(`\d+`)
-	reWS      = regexp.MustCompile(`\s+`)
+	// reAbsPath matches genuine filesystem absolute paths (B-15 fix).
+	//
+	// The original `(?:[a-z]:\\|/)[^\s:]+(?::\d+)*` matched ANY token starting
+	// with `/`, which collapsed regex literals (/foo/), date strings (matching
+	// /01/02 inside 2024/01/02), and URL routes (/v1/users) into "path",
+	// merging distinct failures.
+	//
+	// The fixed pattern requires:
+	//   - A token boundary: the match must be preceded by whitespace or
+	//     punctuation (space, (, ,, ") — prevents matching sub-tokens like
+	//     the /01/02 inside 2024/01/02.
+	//   - Multi-separator path shape: at least three path components
+	//     (/seg/seg/…) for Unix paths — prevents matching single-component
+	//     regex literals (/foo/) and two-component API routes (/v1/users).
+	//   - Windows drive paths retain their own branch (C:\…).
+	//
+	// ReplaceAllStringFunc (see normalizeMessage) preserves the leading
+	// whitespace/punctuation that the match consumed.
+	reAbsPath = regexp.MustCompile(
+		`(?:^|[\s(,"])/[^\s:/]+/[^\s:/]+/[^\s:]*(?::\d+)*` +
+			`|(?:^|[\s(,"])[a-z]:\\[^\s]*(?::\d+)*`,
+	)
+	reDigits = regexp.MustCompile(`\d+`)
+	reWS     = regexp.MustCompile(`\s+`)
 )
 
 // normalizeMessage masks volatile tokens so the same logical failure groups
@@ -38,7 +58,16 @@ var (
 // Over-grouping is preferred to under-grouping for the "M unique" headline.
 func normalizeMessage(msg string) string {
 	s := strings.ToLower(msg)
-	s = reAbsPath.ReplaceAllString(s, "path") // before hex/digits so :line:col is consumed
+	// Replace abs paths before hex/digits so :line:col is consumed.
+	// Use ReplaceAllStringFunc to preserve any leading whitespace/punctuation
+	// that the pattern consumed to establish the token boundary (B-15).
+	s = reAbsPath.ReplaceAllStringFunc(s, func(m string) string {
+		if len(m) > 0 && m[0] != '/' && !(m[0] >= 'a' && m[0] <= 'z') {
+			// Leading char is whitespace or punctuation — preserve it.
+			return string(m[0]) + "path"
+		}
+		return "path"
+	})
 	s = reHexAddr.ReplaceAllString(s, "addr") // digit-free placeholder, survives the int mask
 	s = reDigits.ReplaceAllString(s, "n")
 	s = reWS.ReplaceAllString(s, " ")
@@ -67,6 +96,16 @@ func GroupFailures(reps []report.Report) []Group {
 			if a == nil {
 				a = &acc{g: Group{Key: key, Sample: f}, platforms: map[string]bool{}}
 				m[key] = a
+			} else {
+				// B-16: keep the lexicographically-minimal (Error, Stack, Output)
+				// sample so the displayed failure content is deterministic across
+				// runs regardless of goroutine-completion order.
+				cur := a.g.Sample
+				if f.Error < cur.Error ||
+					(f.Error == cur.Error && f.Stack < cur.Stack) ||
+					(f.Error == cur.Error && f.Stack == cur.Stack && f.Output < cur.Output) {
+					a.g.Sample = f
+				}
 			}
 			a.g.Count++
 			if rep.OS != "" {
@@ -101,43 +140,9 @@ func GroupFailures(reps []report.Report) []Group {
 	return groups
 }
 
-var reFrameLineCol = regexp.MustCompile(`:(\d+):\d+`)
-
-// deriveLine extracts a best-effort source line for a failure from the first
-// stack frame mentioning the test file's base name (or, when file is empty, the
-// first "<path>:<line>:<col>" frame). Returns 0 when nothing matches. The same
-// helper backs the live ✗ FAIL line (Option I) and the digest's file:line.
+// deriveLine is the shared implementation from internal/report (B-22/B-23/B-24
+// fix). Exposed here as a package-level alias so callers in this package read
+// naturally. See report.DeriveLine for the full contract and bug-fix notes.
 func deriveLine(file, stack string) int {
-	if stack == "" {
-		return 0
-	}
-	base := file
-	if i := strings.LastIndexAny(base, "/\\"); i >= 0 {
-		base = base[i+1:]
-	}
-	lines := strings.Split(stack, "\n")
-	if base != "" {
-		for _, ln := range lines {
-			if strings.Contains(ln, base) {
-				if n := firstLineCol(ln); n > 0 {
-					return n
-				}
-			}
-		}
-	}
-	for _, ln := range lines {
-		if n := firstLineCol(ln); n > 0 {
-			return n
-		}
-	}
-	return 0
-}
-
-func firstLineCol(s string) int {
-	m := reFrameLineCol.FindStringSubmatch(s)
-	if m == nil {
-		return 0
-	}
-	n, _ := strconv.Atoi(m[1])
-	return n
+	return report.DeriveLine(file, stack)
 }

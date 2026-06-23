@@ -61,11 +61,16 @@ func Cap(text string, opts CapOpts) (string, CapMeta) {
 	if text == "" {
 		return "", CapMeta{}
 	}
+	// B-18: normalize CRLF → LF once at entry so no bare \r survives on kept
+	// lines. Windows test reporters emit \r\n; without this, strings.Split on
+	// "\n" retains the trailing \r and writeIndented emits stray CRs.
+	text = strings.ReplaceAll(text, "\r\n", "\n")
 	maxLines := opts.maxLines()
 	maxBytes := opts.maxBytes()
 
 	var meta CapMeta
 	lines := strings.Split(text, "\n")
+	origLineCount := len(lines) // preserved for B-9 recomputation after byte cap
 	if len(lines) > maxLines {
 		meta.Truncated = true
 		meta.OmittedLines = len(lines) - maxLines
@@ -84,6 +89,13 @@ func Cap(text string, opts CapOpts) (string, CapMeta) {
 			for cut < len(kept) && !utf8.RuneStart(kept[cut]) {
 				cut++ // advance to the next rune boundary
 			}
+			// Seek forward to the next \n so we don't truncate mid-line (B-10).
+			// If there is no newline (single oversized line), fall through with
+			// the rune-boundary cut — no better boundary exists.
+			nl := strings.IndexByte(kept[cut:], '\n')
+			if nl >= 0 {
+				cut += nl + 1 // skip past the newline
+			}
 			meta.OmittedBytes = cut
 			kept = kept[cut:]
 		} else {
@@ -91,8 +103,26 @@ func Cap(text string, opts CapOpts) (string, CapMeta) {
 			for cut > 0 && !utf8.RuneStart(kept[cut]) {
 				cut-- // back off to a rune boundary
 			}
+			// Seek back to the previous \n so we don't truncate mid-line (B-10).
+			// If there is no newline before cut (single oversized line), fall
+			// through with the rune-boundary cut — no better boundary exists.
+			nl := strings.LastIndexByte(kept[:cut], '\n')
+			if nl >= 0 {
+				cut = nl // keep up to (but not including) the newline
+			}
 			meta.OmittedBytes = len(kept) - cut
 			kept = kept[:cut]
+		}
+		// B-9: recompute OmittedLines as original-minus-final-kept so that the
+		// line count reflects ALL lines removed (by either cap), not just the
+		// lines removed by the line cap alone.
+		finalLineCount := strings.Count(kept, "\n") + 1
+		if kept == "" {
+			finalLineCount = 0
+		}
+		meta.OmittedLines = origLineCount - finalLineCount
+		if meta.OmittedLines < 0 {
+			meta.OmittedLines = 0
 		}
 	}
 	return kept, meta
@@ -100,8 +130,11 @@ func Cap(text string, opts CapOpts) (string, CapMeta) {
 
 // Pointer renders the explicit truncation footer Option E specifies, e.g.
 //
-//	… (truncated 1,240 lines · full at failures.json#/0/output)
+//	… (truncated 1,240 lines · full at failures.json#/failures/0/output)
 //
+// The fragment is an RFC-6901 JSON Pointer into the produced failures.json
+// document (FailuresDoc.Failures is the top-level "failures" array, so the
+// pointer form is /failures/<index>/<field>).
 // It returns "" when nothing was truncated.
 func Pointer(meta CapMeta, ref string) string {
 	if !meta.Truncated {
