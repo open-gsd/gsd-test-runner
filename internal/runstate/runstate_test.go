@@ -207,3 +207,67 @@ func TestDir_FallbackWhenXDGUnset(t *testing.T) {
 		t.Errorf("Dir (no XDG): got %q, want %q", dir, want)
 	}
 }
+
+// ── B-5: path-traversal defense-in-depth ─────────────────────────────────────
+
+// TestLoad_TraversalRejected verifies that runstate.Load rejects RunID values
+// that would escape the store via path traversal (B-5, read-sink protection).
+// It must return a traversal error, NOT ErrNotFound — ErrNotFound would indicate
+// the function reached the filesystem (information disclosure).
+func TestLoad_TraversalRejected(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("XDG_STATE_HOME", tmp)
+
+	traversalIDs := []struct {
+		name  string
+		runID string
+	}{
+		{"dotdot two levels", "../../etc/passwd"},
+		{"dotdot many levels", "../../../../etc/passwd"},
+		{"parent only", ".."},
+	}
+	for _, tc := range traversalIDs {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := runstate.Load(tc.runID)
+			if err == nil {
+				t.Fatalf("Load(%q): expected error, got nil", tc.runID)
+			}
+			if errors.Is(err, runstate.ErrNotFound) {
+				t.Errorf("Load(%q): got ErrNotFound — filesystem was reached; want traversal error", tc.runID)
+			}
+			if !errors.Is(err, runstate.ErrTraversal) {
+				t.Errorf("Load(%q): got %v, want ErrTraversal (or wrapping it)", tc.runID, err)
+			}
+		})
+	}
+}
+
+// TestEnsureRunDir_TraversalRejected verifies that runstate.EnsureRunDir rejects
+// RunID values that would create directories outside the store (B-5, write-sink
+// protection). No directory must be created on the filesystem.
+func TestEnsureRunDir_TraversalRejected(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("XDG_STATE_HOME", tmp)
+
+	traversalIDs := []struct {
+		name  string
+		runID string
+	}{
+		{"dotdot escape", "../escape"},
+		{"many dotdots", "../../../../tmp/pwned"},
+		{"parent only", ".."},
+	}
+	for _, tc := range traversalIDs {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := runstate.EnsureRunDir(tc.runID)
+			if err == nil {
+				t.Fatalf("EnsureRunDir(%q): expected error, got nil", tc.runID)
+			}
+			if !errors.Is(err, runstate.ErrTraversal) {
+				t.Errorf("EnsureRunDir(%q): got %v, want ErrTraversal (or wrapping it)", tc.runID, err)
+			}
+		})
+	}
+}

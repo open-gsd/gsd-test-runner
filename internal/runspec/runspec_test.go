@@ -1,8 +1,10 @@
 package runspec
 
 import (
+	"encoding/json"
 	"errors"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -238,5 +240,59 @@ func TestParse_NegativeSampleHandlesRejected(t *testing.T) {
 	var invalid *InvalidSpecError
 	if !errors.As(err, &invalid) || invalid.Field != "telemetry.sampleHandlesMs" {
 		t.Errorf("err = %v, want InvalidSpecError on telemetry.sampleHandlesMs", err)
+	}
+}
+
+// ── B-5: RunID validation ─────────────────────────────────────────────────────
+
+// TestParse_TraversalRunIDRejected verifies that Parse rejects RunID values
+// that could cause path-traversal in the runs store (B-5, security).
+func TestParse_TraversalRunIDRejected(t *testing.T) {
+	cases := []struct {
+		name  string
+		runID string
+	}{
+		{"dotdot", "../../../../etc/passwd"},
+		{"slash", "run/id"},
+		{"space", "run id"},
+		{"too long", strings.Repeat("a", 129)},
+		{"backslash in segment", `run\id`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			body, _ := json.Marshal(map[string]string{
+				"repo":   "/work",
+				"target": "linux",
+				"runId":  tc.runID,
+			})
+			_, err := Parse(body)
+			var inv *InvalidSpecError
+			if !errors.As(err, &inv) {
+				t.Fatalf("Parse(runId=%q): expected *InvalidSpecError, got %v", tc.runID, err)
+			}
+			if inv.Field != "runId" {
+				t.Errorf("InvalidSpecError.Field = %q, want %q", inv.Field, "runId")
+			}
+		})
+	}
+}
+
+// TestValidRunID verifies the exported ValidRunID helper (B-5).
+func TestValidRunID(t *testing.T) {
+	want := map[string]bool{
+		"abc":                    true,
+		"run-001":                true,
+		"run_001":                true,
+		strings.Repeat("a", 128): true,
+		"":                       false,
+		strings.Repeat("a", 129): false,
+		"../../../../etc/passwd": false,
+		"run/id":                 false,
+		"run id":                 false,
+	}
+	for id, wantOK := range want {
+		if got := ValidRunID(id); got != wantOK {
+			t.Errorf("ValidRunID(%q) = %v, want %v", id, got, wantOK)
+		}
 	}
 }

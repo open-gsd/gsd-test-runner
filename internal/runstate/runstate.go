@@ -11,11 +11,16 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/open-gsd/gsd-test-runner/internal/report"
 	"github.com/open-gsd/gsd-test-runner/internal/runspec"
 )
+
+// ErrTraversal is returned when a runID would escape the runs store directory
+// via path traversal (B-5, defense-in-depth).
+var ErrTraversal = errors.New("runstate: run-id escapes the store directory (path traversal detected)")
 
 // Status values for State.Status (ADR-0022 Decision 3).
 const (
@@ -65,10 +70,28 @@ func Dir() (string, error) {
 	return filepath.Join(stateDir, "gsd-test", "runs"), nil
 }
 
+// containmentCheck verifies that joining dir and a runID-derived suffix does
+// not escape dir. It is defense-in-depth (B-5): the primary gate is
+// runspec.validate(), but raw filepath.Join is vulnerable to paths containing
+// ".." even after the charset gate. Returns ErrTraversal when the resolved path
+// is not rooted under dir.
+func containmentCheck(dir, suffix string) error {
+	resolved := filepath.Clean(filepath.Join(dir, suffix))
+	// filepath.Rel returns an error or a ".." path when resolved is outside dir.
+	rel, err := filepath.Rel(dir, resolved)
+	if err != nil || strings.HasPrefix(rel, "..") {
+		return ErrTraversal
+	}
+	return nil
+}
+
 // Path returns the absolute path to the state file for runID.
 func Path(runID string) (string, error) {
 	dir, err := Dir()
 	if err != nil {
+		return "", err
+	}
+	if err := containmentCheck(dir, runID+".json"); err != nil {
 		return "", err
 	}
 	return filepath.Join(dir, runID+".json"), nil
@@ -82,6 +105,9 @@ func Path(runID string) (string, error) {
 func RunDir(runID string) (string, error) {
 	dir, err := Dir()
 	if err != nil {
+		return "", err
+	}
+	if err := containmentCheck(dir, runID); err != nil {
 		return "", err
 	}
 	return filepath.Join(dir, runID), nil

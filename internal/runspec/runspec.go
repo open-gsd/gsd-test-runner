@@ -8,7 +8,19 @@ import (
 	"crypto/rand"
 	"encoding/json"
 	"fmt"
+	"regexp"
 )
+
+// runIDRe is the charset/length gate for RunID values supplied by agents.
+// Only alphanumerics, hyphens, and underscores are allowed, with a maximum
+// length of 128 characters. This prevents path-traversal when RunID is joined
+// into filesystem paths (B-5, security).
+var runIDRe = regexp.MustCompile(`^[A-Za-z0-9_-]{1,128}$`)
+
+// ValidRunID reports whether id satisfies the RunID charset/length gate
+// (^[A-Za-z0-9_-]{1,128}$). Callers that receive a RunID from external input
+// (CLI args, JSON fields) should call this before passing it to runstate functions.
+func ValidRunID(id string) bool { return runIDRe.MatchString(id) }
 
 // NewRunID returns a random RFC-4122 v4 UUID string. The submit command assigns
 // one when the agent omits runId (ADR-0021); Parse never calls this so it stays
@@ -163,6 +175,12 @@ func Parse(data []byte) (*Spec, error) {
 }
 
 func (s *Spec) validate() error {
+	// B-5 (security): reject RunID values that could escape the store via path
+	// traversal. An empty RunID is allowed here — the submit command assigns one
+	// after Parse returns.
+	if s.RunID != "" && !runIDRe.MatchString(s.RunID) {
+		return &InvalidSpecError{Field: "runId", Reason: fmt.Sprintf("must match ^[A-Za-z0-9_-]{1,128}$ ; got %q", s.RunID)}
+	}
 	if !validTargets[s.Target] {
 		return &InvalidSpecError{Field: "target", Reason: fmt.Sprintf("must be one of linux, windows, macos-container; got %q", s.Target)}
 	}

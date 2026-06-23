@@ -187,6 +187,9 @@ func run(args []string, stdout, stderr *os.File) int {
 	})
 	if err != nil {
 		fmt.Fprintf(stderr, "config.Load: %v\n", err)
+		// B-4: emit infra_error verdict before every pre-pipeline return so the
+		// last stdout line is always machine-readable (ADR-0023 Decision 2).
+		writeInconclusiveVerdict(stdout, stderr)
 		return exitInconclusive
 	}
 
@@ -196,6 +199,7 @@ func run(args []string, stdout, stderr *os.File) int {
 	}
 	if len(targets) == 0 {
 		fmt.Fprintln(stderr, "no target OSes specified (use --targets or set defaults.targets in config)")
+		writeInconclusiveVerdict(stdout, stderr) // B-4
 		return exitInconclusive
 	}
 
@@ -214,12 +218,14 @@ func run(args []string, stdout, stderr *os.File) int {
 	})
 	if err != nil {
 		fmt.Fprintf(stderr, "bench.NewSelector: %v\n", err)
+		writeInconclusiveVerdict(stdout, stderr) // B-4
 		return exitInconclusive
 	}
 
 	p, err := plan.Build(cfg, selector, targets)
 	if err != nil {
 		fmt.Fprintf(stderr, "plan.Build: %v\n", err)
+		writeInconclusiveVerdict(stdout, stderr) // B-4
 		return exitInconclusive
 	}
 	p.AddUnreachable(cfg.Unreachable, targets)
@@ -229,11 +235,13 @@ func run(args []string, stdout, stderr *os.File) int {
 	baseSHA, err := refs.Resolve(ctx, flags.source, flags.base)
 	if err != nil {
 		fmt.Fprintf(stderr, "refs.Resolve(%q): %v\n", flags.base, err)
+		writeInconclusiveVerdict(stdout, stderr) // B-4
 		return exitInconclusive
 	}
 	headSHA, err := refs.Resolve(ctx, flags.source, flags.head)
 	if err != nil {
 		fmt.Fprintf(stderr, "refs.Resolve(%q): %v\n", flags.head, err)
+		writeInconclusiveVerdict(stdout, stderr) // B-4
 		return exitInconclusive
 	}
 
@@ -242,6 +250,7 @@ func run(args []string, stdout, stderr *os.File) int {
 		scratchDir, err = os.MkdirTemp("", "gsd-test-")
 		if err != nil {
 			fmt.Fprintf(stderr, "create scratch dir: %v\n", err)
+			writeInconclusiveVerdict(stdout, stderr) // B-4
 			return exitInconclusive
 		}
 	}
@@ -254,12 +263,14 @@ func run(args []string, stdout, stderr *os.File) int {
 	})
 	if err != nil {
 		fmt.Fprintf(stderr, "worktree.Construct: %v\n", err)
+		writeInconclusiveVerdict(stdout, stderr) // B-4
 		return exitInconclusive
 	}
 	defer wt.Close()
 
 	// ── Phase 3: EnsureImages (parallel) ──────────────────────────────────────
 	if ensureErr := ensureImagesParallel(ctx, p.Runs, stderr); ensureErr != nil {
+		writeInconclusiveVerdict(stdout, stderr) // B-4
 		return exitInconclusive
 	}
 
@@ -374,6 +385,26 @@ func writeVerdict(reps []report.Report, paths digest.Paths, stdout, stderr io.Wr
 	}
 }
 
+// writeInconclusiveVerdict emits a minimal verdict line with outcome=infra_error
+// (the canonical project outcome for a genuine-inconclusive run) to stdout.
+// Called before any early-return in runSubmit that represents a run-outcome
+// failure (not a CLI usage error). Best-effort: a write error is reported to
+// stderr and never changes the exit code.
+func writeInconclusiveVerdict(stdout, stderr io.Writer) {
+	v := digest.VerdictLine{
+		Type:           "verdict",
+		Outcome:        string(report.OutcomeInfraError),
+		PerOS:          map[string]digest.OSCount{},
+		UniqueFailures: 0,
+		TotalFailures:  0,
+		Top:            []digest.VerdictTop{},
+		Artifacts:      digest.VerdictArtifacts{},
+	}
+	if err := v.WriteLine(stdout); err != nil {
+		fmt.Fprintf(stderr, "warning: write inconclusive verdict line: %v\n", err)
+	}
+}
+
 // emitRunArtifacts is the standard multi-OS path: it mints a run-id, writes the
 // digest, persists each OS's full JSONL, and prints the verdict as the final
 // stdout line in every outcome.
@@ -384,7 +415,9 @@ func emitRunArtifacts(reps []report.Report, osJSONL map[string]string, stdout, s
 	}
 	paths := writeRunArtifacts(runID, reps, stderr)
 	if paths.Dir != "" {
-		copyEventsJSONL(paths.Dir, osJSONL, stderr)
+		// B-11: assign the persisted events JSONL path so the verdict's
+		// events_jsonl field is populated (was always omitted before).
+		paths.EventsJSONL = copyEventsJSONL(paths.Dir, osJSONL, stderr)
 	}
 	writeVerdict(reps, paths, stdout, stderr)
 }
@@ -392,7 +425,10 @@ func emitRunArtifacts(reps []report.Report, osJSONL map[string]string, stdout, s
 // copyEventsJSONL persists each per-OS drained JSONL into the run dir as
 // test-events-<os>.jsonl so the full per-test detail (passes included) is always
 // available, not just the failure digest (Option B, #84). Best-effort.
-func copyEventsJSONL(dir string, osJSONL map[string]string, stderr io.Writer) {
+// Returns the path of the last successfully persisted file (or "" when none),
+// which the caller assigns to paths.EventsJSONL for the verdict (B-11).
+func copyEventsJSONL(dir string, osJSONL map[string]string, stderr io.Writer) string {
+	var lastPersisted string
 	for osName, src := range osJSONL {
 		if src == "" {
 			continue
@@ -400,8 +436,11 @@ func copyEventsJSONL(dir string, osJSONL map[string]string, stderr io.Writer) {
 		dst := filepath.Join(dir, "test-events-"+osName+".jsonl")
 		if err := copyFile(src, dst); err != nil {
 			fmt.Fprintf(stderr, "warning: persist %s JSONL: %v\n", osName, err)
+			continue
 		}
+		lastPersisted = dst
 	}
+	return lastPersisted
 }
 
 func copyFile(src, dst string) error {
@@ -460,12 +499,14 @@ func runSubmit(args []string, stdout, stderr *os.File) int {
 	}
 	if err != nil {
 		fmt.Fprintf(stderr, "submit: read spec: %v\n", err)
+		writeInconclusiveVerdict(stdout, stderr)
 		return exitInconclusive
 	}
 
 	spec, err := runspec.Parse(data)
 	if err != nil {
 		fmt.Fprintf(stderr, "submit: invalid run spec: %v\n", err)
+		writeInconclusiveVerdict(stdout, stderr)
 		return exitInconclusive
 	}
 
@@ -557,6 +598,10 @@ func runRun(args []string, stdout, stderr *os.File) int {
 
 	rep, ok := dispatchRun(*spec, *configPath, "run", stderr)
 	if !ok {
+		// B-3: ADR-0023 Decision 2 requires a verdict on EVERY outcome, including
+		// infra_error. Emit an inconclusive verdict so the last stdout line is
+		// always machine-readable, even when the run could not start.
+		writeInconclusiveVerdict(stdout, stderr)
 		return exitInconclusive
 	}
 
@@ -659,6 +704,13 @@ func runWorker(args []string, stdout, stderr *os.File) int {
 		st.ExitCode = code
 		st.Status = runstate.StatusDone
 	} else {
+		// B-3: synthesize an infra_error report and persist the verdict artifact
+		// so `gsd-test wait` can emit the ADR-0023 verdict even on infra_error.
+		infraRep := report.Report{
+			OS:      st.Spec.Target,
+			Outcome: report.OutcomeInfraError,
+		}
+		_ = writeRunArtifacts(st.Spec.RunID, []report.Report{infraRep}, stderr)
 		st.Status = runstate.StatusDone
 		st.ExitCode = exitInconclusive
 		st.Err = "dispatch failed"
@@ -678,6 +730,11 @@ func waitRun(args []string, stdout, stderr *os.File) int {
 		return exitInconclusive
 	}
 	runID := args[0]
+	// B-5: validate CLI arg before it reaches the filesystem (runstate.Load).
+	if !runspec.ValidRunID(runID) {
+		fmt.Fprintf(stderr, "wait: invalid run-id %q (must match ^[A-Za-z0-9_-]{1,128}$)\n", runID)
+		return exitInconclusive
+	}
 
 	st, err := runstate.Load(runID)
 	if err != nil {
@@ -740,10 +797,15 @@ func waitRun(args []string, stdout, stderr *os.File) int {
 
 	if st.Err != "" {
 		fmt.Fprintf(stderr, "wait: run %s failed: %s\n", runID, st.Err)
+		// B-3: ADR-0023 Decision 2 requires a verdict on EVERY outcome. The
+		// worker persisted an infra_error artifact; emit the verdict from it so
+		// the last stdout line is always machine-readable.
+		writeInconclusiveVerdict(stdout, stderr)
 		return exitInconclusive
 	}
 	if st.Report == nil {
 		fmt.Fprintf(stderr, "wait: run %s has no report\n", runID)
+		writeInconclusiveVerdict(stdout, stderr)
 		return exitInconclusive
 	}
 
@@ -764,6 +826,11 @@ func statusRun(args []string, stdout, stderr *os.File) int {
 		return exitInconclusive
 	}
 	runID := args[0]
+	// B-5: validate CLI arg before it reaches the filesystem (runstate.Load).
+	if !runspec.ValidRunID(runID) {
+		fmt.Fprintf(stderr, "status: invalid run-id %q (must match ^[A-Za-z0-9_-]{1,128}$)\n", runID)
+		return exitInconclusive
+	}
 
 	st, err := runstate.Load(runID)
 	if err != nil {
@@ -1015,10 +1082,14 @@ func dispatchRun(spec runspec.Spec, configPath, label string, stderr *os.File) (
 }
 
 // executeSpec dispatches a validated run spec to a Bench (via dispatchRun) and
-// emits the per-OS Report as JSON — the `submit --execute` front door.
+// emits the per-OS Report as JSON followed by the ADR-0023 compact verdict line
+// as the final stdout line — the `submit --execute` front door.
 func executeSpec(spec runspec.Spec, configPath string, stdout, stderr *os.File) int {
 	rep, ok := dispatchRun(spec, configPath, "submit --execute", stderr)
 	if !ok {
+		// B-12: emit inconclusive verdict even when dispatch fails so every
+		// submit --execute outcome conforms to ADR-0023 Decision 2.
+		writeInconclusiveVerdict(stdout, stderr)
 		return exitInconclusive
 	}
 
@@ -1028,6 +1099,11 @@ func executeSpec(spec runspec.Spec, configPath string, stdout, stderr *os.File) 
 		fmt.Fprintf(stderr, "submit --execute: encode report: %v\n", encErr)
 		return exitInconclusive
 	}
+
+	// B-12: emit the compact verdict as the LAST stdout line (ADR-0023 Option C).
+	// The indented JSON report is emitted above for human/agent consumption; the
+	// verdict below is the machine-readable last-line contract.
+	emitRunDieArtifacts(spec.RunID, rep, stdout, stderr)
 
 	if rep.Outcome == report.OutcomePassed {
 		return exitAllPass

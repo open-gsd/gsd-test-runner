@@ -120,12 +120,18 @@ func Summarize(reps []report.Report, groups []Group, now time.Time) Summary {
 		if key == "" {
 			key = rep.Bench
 		}
-		s.PerOS[key] = OSCount{
-			Passed:  rep.Passed,
-			Failed:  rep.Failed,
-			Total:   rep.Total,
-			Outcome: string(rep.Outcome),
+		// Aggregate into the existing entry instead of overwriting, so that two
+		// reports sharing the same OS key (e.g. duplicate targets) accumulate
+		// counts rather than silently replacing the earlier leg (B-2).
+		c := s.PerOS[key]
+		c.Passed += rep.Passed
+		c.Failed += rep.Failed
+		c.Total += rep.Total
+		// Worst-of outcome for this OS key.
+		if severity(string(rep.Outcome)) > severity(c.Outcome) {
+			c.Outcome = string(rep.Outcome)
 		}
+		s.PerOS[key] = c
 		s.TotalFailures += rep.Failed
 		if severity(string(rep.Outcome)) > severity(s.Outcome) {
 			s.Outcome = string(rep.Outcome)
@@ -270,7 +276,9 @@ func writeFailureBlock(b *strings.Builder, f FailureEntry, opts WriteOpts, headi
 	b.WriteString("\n")
 
 	ref := func(field string) string {
-		return fmt.Sprintf("failures.json#/%d/%s", f.Index-1, field)
+		// RFC-6901 JSON Pointer: FailuresDoc.Failures marshals under the top-level
+		// "failures" array, so the fragment must be /failures/<idx>/<field>.
+		return fmt.Sprintf("failures.json#/failures/%d/%s", f.Index-1, field)
 	}
 	if f.Error != "" {
 		capped, _ := Cap(f.Error, errorCapOpts(opts))
@@ -359,6 +367,12 @@ func writePerFailureFiles(failuresDir string, doc FailuresDoc, opts WriteOpts) e
 		}
 		fmt.Fprintf(&idx, "| %d | %s | %s | %s | %s | [%s](%s) |\n",
 			f.Index, f.Class, loc, mdEscape(f.Name), strings.Join(f.Platforms, ", "), fname, fname)
+	}
+	// B-17: mirror renderFailuresMD by appending an omission note when more
+	// failures exist than were written, so the header count and the table row
+	// count are consistent for the reader.
+	if n := len(doc.Failures) - max; n > 0 {
+		fmt.Fprintf(&idx, "\n… %d more omitted; see failures.json\n", n)
 	}
 	if err := os.WriteFile(filepath.Join(failuresDir, "INDEX.md"), []byte(idx.String()), 0o644); err != nil {
 		return fmt.Errorf("digest: write INDEX.md: %w", err)
