@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
+import { spawn } from 'node:child_process';
 
 import { ActiveTracker, runWithWatchdog } from './watchdog.mjs';
 
@@ -99,22 +100,63 @@ test('reaped kill record carries the last active test', async () => {
 
 // Real-spawn integration: a genuinely hanging node process must be reaped and
 // actually leave the process table (orphan guarantee, ADR-0021 Decision 4).
+//
+// Deterministic by construction: the child announces "READY" on stdout only
+// AFTER it has installed its SIGTERM handler, and we arm the watchdog (via the
+// injected-child seam) only once we have seen it. That closes the old race —
+// where the watchdog's SIGTERM could land during node interpreter boot, hit the
+// default disposition, and end the child before it could ignore-then-escalate —
+// instead of papering over it with a wall-clock margin to tune. The deadline is
+// tiny because timing no longer guards correctness; the handshake does.
 test('reaps a real hanging node child', async () => {
-  // deadlineMs must comfortably exceed node *interpreter startup* so the child
-  // has installed its SIGTERM handler before the deadline fires — otherwise the
-  // watchdog's SIGTERM lands during boot, the default action ends the child
-  // before our SIGKILL escalation, and the test flakes. 700ms was too tight
-  // under load (node boot spiked past it on a saturated machine); 2500ms gives
-  // a wide margin while keeping the test sub-3s.
-  const res = await runWithWatchdog({
-    command: process.execPath,
-    args: ['-e', 'process.on("SIGTERM", () => {}); setInterval(() => {}, 1000);'],
-    deadlineMs: 2500,
-    graceMs: 300,
-  });
-  assert.equal(res.outcome, 'reaped');
-  assert.ok(res.kill.signalChain.some((s) => s.startsWith('SIGKILL')),
-    'a SIGTERM-ignoring child must escalate to SIGKILL');
+  const child = spawn(
+    process.execPath,
+    ['-e',
+      'process.on("SIGTERM", () => {});' +  // ignore SIGTERM (so we MUST escalate)
+      'process.stdout.write("READY\\n");' + // ... announce the handler is installed
+      'setInterval(() => {}, 1000);'],      // ... then hang forever
+    { stdio: ['ignore', 'pipe', 'inherit'] },
+  );
+
+  try {
+    // Wait for the readiness handshake. Fail LOUD if it never arrives — never a
+    // silent skip — so a broken child surfaces as a real failure.
+    await new Promise((resolve, reject) => {
+      let out = '';
+      let timer;
+      const done = (act) => {
+        clearTimeout(timer);
+        child.stdout.off('data', onData);
+        child.off('exit', onExit);
+        act();
+      };
+      const onData = (chunk) => {
+        out += chunk.toString();
+        if (out.includes('READY')) done(resolve);
+      };
+      const onExit = () => done(() => reject(new Error('child exited before signalling READY')));
+      timer = setTimeout(
+        () => done(() => reject(new Error('child never signalled READY within 30s'))),
+        30_000,
+      );
+      child.stdout.on('data', onData);
+      child.on('exit', onExit);
+    });
+
+    // The child is alive with its SIGTERM handler installed — a tiny deadline now
+    // deterministically exercises SIGTERM → grace → SIGKILL escalation.
+    const res = await runWithWatchdog({ child, deadlineMs: 20, graceMs: 50 });
+    assert.equal(res.outcome, 'reaped');
+    assert.ok(res.kill.signalChain.some((s) => s.startsWith('SIGTERM')),
+      'the watchdog must send SIGTERM first');
+    assert.ok(res.kill.signalChain.some((s) => s.startsWith('SIGKILL')),
+      'a SIGTERM-ignoring child must escalate to SIGKILL');
+  } finally {
+    // Never leak the child if an assertion threw before it was reaped.
+    if (child.exitCode === null && child.signalCode === null) {
+      try { child.kill('SIGKILL'); } catch { /* already gone */ }
+    }
+  }
 });
 
 // ── CLI argument parsing (pure) ──────────────────────────────────────────────
