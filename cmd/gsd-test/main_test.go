@@ -335,8 +335,22 @@ func TestRunSubmit_InvalidSpec_Exit2(t *testing.T) {
 	if code != exitInconclusive {
 		t.Errorf("exit code: got %d, want %d", code, exitInconclusive)
 	}
-	if strings.TrimSpace(out) != "" {
-		t.Errorf("stdout: got %q, want empty (no run accepted)", out)
+	// ADR-0023 Option C: stdout must contain a verdict line even on inconclusive
+	// early-return paths (run-outcome failure, not a CLI usage error).
+	var foundVerdict bool
+	for _, line := range strings.Split(strings.TrimRight(out, "\n"), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		var m map[string]any
+		if json.Unmarshal([]byte(line), &m) == nil && m["type"] == "verdict" {
+			foundVerdict = true
+			break
+		}
+	}
+	if !foundVerdict {
+		t.Errorf("stdout: got %q, want a verdict line (ADR-0023 Option C)", out)
 	}
 	if !strings.Contains(errOut, "target") {
 		t.Errorf("stderr: got %q, want it to name the bad field 'target'", errOut)

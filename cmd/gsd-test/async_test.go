@@ -186,7 +186,8 @@ func TestWait_DoneStateRendersVerdict(t *testing.T) {
 }
 
 // TestWait_DoneStateWithErr verifies that `gsd-test wait <id>` against a done
-// state with Err set returns exit 2 (inconclusive).
+// state with Err set returns exit 2 (inconclusive) AND emits an infra_error
+// verdict line to stdout (ADR-0023 Decision 2, B-3).
 func TestWait_DoneStateWithErr(t *testing.T) {
 	tmp := t.TempDir()
 	t.Setenv("XDG_STATE_HOME", tmp)
@@ -200,7 +201,7 @@ func TestWait_DoneStateWithErr(t *testing.T) {
 	code := run([]string{"wait", runID}, outW, errW)
 	outW.Close()
 	errW.Close()
-	_ = drain(outR)
+	stdout := drain(outR)
 	stderr := drain(errR)
 
 	if code != exitInconclusive {
@@ -208,6 +209,11 @@ func TestWait_DoneStateWithErr(t *testing.T) {
 	}
 	if !strings.Contains(stderr, "dispatch failed") {
 		t.Errorf("stderr must mention the error; got:\n%s", stderr)
+	}
+	// B-3: ADR-0023 Decision 2 — stdout must contain a verdict line even on
+	// infra_error outcomes so an agent can always read the last line.
+	if !lastLineIsVerdict(stdout) {
+		t.Errorf("B-3: want last stdout line to be a verdict on infra_error path; got:\n%q", stdout)
 	}
 }
 
