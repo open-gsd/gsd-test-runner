@@ -427,6 +427,8 @@ func emitRunArtifacts(reps []report.Report, osJSONL map[string]string, stdout, s
 // available, not just the failure digest (Option B, #84). Best-effort.
 // Returns the path of the last successfully persisted file (or "" when none),
 // which the caller assigns to paths.EventsJSONL for the verdict (B-11).
+// After a successful copy the source temp file is removed to avoid orphaned
+// os.TempDir() files (issue #102, Option D).
 func copyEventsJSONL(dir string, osJSONL map[string]string, stderr io.Writer) string {
 	var lastPersisted string
 	for osName, src := range osJSONL {
@@ -439,6 +441,7 @@ func copyEventsJSONL(dir string, osJSONL map[string]string, stderr io.Writer) st
 			continue
 		}
 		lastPersisted = dst
+		_ = os.Remove(src) // release the throwaway drain temp once persisted (issue #102, Option D)
 	}
 	return lastPersisted
 }
