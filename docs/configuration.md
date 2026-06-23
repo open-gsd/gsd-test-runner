@@ -181,10 +181,18 @@ CLI flags override the corresponding config values. Flags always take precedence
 | `--exclude <name,...>` | `defaults.exclude` | Comma-separated Bench names to exclude |
 | `--probe-benches` | — | Probe each Bench for reachability at startup |
 | `--json-events` | — | Emit events as JSON Lines instead of human-readable TTY output |
+| `--verbose` | — | Show the full child-output firehose + per-test pass lines (also `GSD_TEST_VERBOSE=1`) |
+| `--quiet` | — | Suppress the progress heartbeat; show only leg events and failures |
 | `--base <ref>` | — | Base git ref to merge from (default: `main`) |
 | `--head <ref>` | — | PR git ref to merge into base (default: `HEAD`) |
 | `--source <path>` | — | Source git repo path (default: `.`) |
 | `--scratch <dir>` | — | Scratch directory for worktree construction (default: system temp) |
+
+The output stream is **quiet by default** (a compact per-OS heartbeat + leg
+events + loud failures). `--verbose` restores the full firehose; `--quiet` drops
+even the heartbeat; `--json-events` always emits the full typed stream regardless.
+For the verbosity levels, the verdict line, and the run artifacts these produce,
+see the [Failure-first Output Reference](failure-first-output-reference.md).
 
 ## Complete annotated example
 

@@ -50,9 +50,15 @@ gsd-test
 - **[Installation](docs/installation.md)** — Install the binary on macOS, Linux, or Windows
 - **[Getting Started](docs/getting-started.md)** — Your first end-to-end test run
 - **[Setting up Benches](docs/benches.md)** — Configure your Linux, Windows, and macOS hardware
-- **[Configuration Reference](docs/configuration.md)** — Every `config.toml` field explained
+- **[Configuration Reference](docs/configuration.md)** — Every `config.toml` field and CLI flag explained
 - **[Troubleshooting](docs/troubleshooting.md)** — When things go wrong
 - **[Architecture](docs/architecture.md)** — How `gsd-test` is built (for contributors)
+
+Failure-first output (quiet-by-default stream, loud verdict, saved artifacts):
+
+- **[Failure-first Output](docs/failure-first-output.md)** — Why runs are quiet by default, what the verdict and artifacts are for
+- **[Output How-to Guides](docs/failure-first-output-how-to.md)** — Read a failed run, control verbosity, script the verdict, wire JUnit into CI
+- **[Output Reference](docs/failure-first-output-reference.md)** — Verbosity levels, the verdict schema, and the artifact directory
 
 Run-and-die (containerised `node --test` for coding agents):
 

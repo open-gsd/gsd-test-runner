@@ -235,11 +235,42 @@ Look at the stderr output for the specific phase:
 | `[<os>] <leg> ✗` in TTY output | Phase 4 (RunPipelines) | Leg-specific failure — see the error detail and `diagnostics:` path |
 | `worktree.Construct:` | Pre-phase (worktree) | Merge conflict or git error |
 
+The fastest discriminator is the **verdict line** — the last line of stdout. An
+`"outcome":"infra_error"` confirms an infrastructure problem rather than a test
+failure, and its (possibly empty) `per_os` shows which OSes produced a result:
+
+```bash
+gsd-test | tail -n1 | jq '{outcome, per_os}'
+```
+
 Run with `--json-events` for structured output that is easier to pipe and grep:
 
 ```bash
 gsd-test --json-events 2>&1 | grep '"kind":"leg_failure"'
 ```
+
+---
+
+## I can't find the failure in the terminal scrollback
+
+**Cause**
+
+`gsd-test` is quiet by default and a long run scrolls; the failure may be above
+the top of your terminal buffer.
+
+**Solution**
+
+You do not need the scrollback. Every run writes its failures to disk and prints
+where. Read the verdict line and open `FAILURES.md`:
+
+```bash
+gsd-test | tail -n1 | jq -r '.artifacts.failures_md'   # path to FAILURES.md
+```
+
+`FAILURES.md` leads with the headline and gives one bounded block per unique
+failure; `failures.json` (same directory) holds the full, untruncated stacks and
+captured output. See the [output how-to guides](failure-first-output-how-to.md#how-to-read-a-failed-run)
+and the [Failure-first Output Reference](failure-first-output-reference.md).
 
 ---
 
