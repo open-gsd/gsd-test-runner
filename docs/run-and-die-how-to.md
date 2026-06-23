@@ -73,7 +73,39 @@ gsd-test wait <run-id>
 
 `wait` exits with the same codes as blocking `run` (`0` passed, `1` failed or reaped, `2` infra error). It never returns a partial result. The 90-minute absolute backstop means it cannot hang indefinitely.
 
-`--async` is unix-only. Blocking `gsd-test run` (the default) works everywhere and is the right choice when the agent needs the verdict before continuing. See the [reference](run-and-die-reference.md#gsd-test-run---async-wait-and-status) for flag details.
+`--async` is unix-only. Blocking `gsd-test run` (the default) works everywhere and is the right choice when the agent needs the verdict before continuing. See the [reference](run-and-die-reference.md#gsd-test-run---async-wait-and-status) for flag details. By default `wait` releases the run's artifacts once it has printed the result; pass `--keep` (see [How to keep a run's artifacts](#how-to-keep-a-runs-artifacts)) if you need them to persist.
+
+## How to keep a run's artifacts
+
+By default a run's on-disk artifacts are released once you collect the result (see [ephemeral mode](run-and-die.md#artifact-lifecycle-and-ephemeral-mode)). To keep them for one run:
+
+```bash
+gsd-test run --async --keep --target linux < spec.json
+gsd-test wait <run-id>          # renders the result but does NOT delete the run
+```
+
+`--keep` requires `--async`: it tells the later `wait` to preserve the run. The files stay under `$XDG_STATE_HOME/gsd-test/runs/<run-id>/`.
+
+To keep artifacts for every run, set it in config instead:
+
+```toml
+[storage]
+keep_artifacts = true
+```
+
+A blocking `gsd-test run` (no `--async`) always leaves its artifacts on disk for you to read immediately; they are reclaimed by the retention sweep on a later run unless `keep_artifacts` is set.
+
+## How to set an artifact retention policy
+
+When you keep artifacts, bound how many accumulate with `[storage]`:
+
+```toml
+[storage]
+artifact_ttl = "72h"     # delete runs older than three days
+keep_last_runs = 25      # ...and never keep more than the 25 newest
+```
+
+The sweep runs at the start of each `gsd-test run`. Set `keep_artifacts = true` to disable it entirely, or `artifact_ttl = "0"` to drop the age bound. Full field definitions are in the [configuration reference](configuration.md#storage).
 
 ## How to test a PR-merged tree
 

@@ -276,3 +276,35 @@ The Tester Image present on the Bench carries a different `sh.gsd-test.image-ver
 **Solution**
 
 Pull or rebuild the Tester Image for that target so its version matches `[versions].<os>` in your config, or update the configured version. See [Configuration Reference](configuration.md) and [Setting up Benches](benches.md).
+
+---
+
+## Run artifacts are gone after `gsd-test wait`
+
+**Error**
+
+After `gsd-test wait <run-id>` returns, `$XDG_STATE_HOME/gsd-test/runs/<run-id>/` no longer exists and the verdict line's `artifacts` object is empty.
+
+**Cause**
+
+This is the default ephemeral behavior. `wait` is the terminal consumer of a run — once it has rendered the result to stdout it releases the run and emits the verdict without artifact paths. stdout is the authoritative record (ADR-0023).
+
+**Solution**
+
+If you need the files to persist, dispatch with `--keep` (`gsd-test run --async --keep …`) or set `keep_artifacts = true` under `[storage]`. See [How to keep a run's artifacts](run-and-die-how-to.md#how-to-keep-a-runs-artifacts).
+
+---
+
+## `--keep` had no effect
+
+**Error**
+
+You passed `--keep` but the artifacts were still released, or the flag seemed to be ignored.
+
+**Cause**
+
+`--keep` applies to the async flow — it instructs the later `gsd-test wait` to preserve the run. A blocking `gsd-test run` has nothing to consume-on-read, so `--keep` has no per-run effect there; those artifacts persist until the retention sweep on a later run reclaims them.
+
+**Solution**
+
+Use `gsd-test run --async --keep` followed by `gsd-test wait`. To retain artifacts from blocking runs as well, set `keep_artifacts = true` under `[storage]`.

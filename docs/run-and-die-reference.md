@@ -46,7 +46,7 @@ Blocks until the async run completes, then renders the same `node --test`-style 
 
 Takes no flags — only the positional run-id.
 
-**Ephemeral mode (default):** After rendering the result to stdout, `wait` emits the verdict line with empty artifact paths (stdout is the authoritative record, not the on-disk files), then releases the run — deleting the state file and artifact directory. Pass `--keep` to `gsd-test run --async`, or set `keep_artifacts = true` in `[storage]`, to skip the release and keep artifacts on disk.
+**Ephemeral mode (default):** After rendering the result to stdout, `wait` emits the verdict line with empty artifact paths (stdout is the authoritative record, not the on-disk files), then releases the run — deleting the state file and artifact directory. Pass `--keep` to `gsd-test run --async`, or set `keep_artifacts = true` in `[storage]`, to skip the release and keep artifacts on disk. Retention for kept artifacts is governed by the `[storage]` config section — see the [configuration reference](configuration.md#storage).
 
 `gsd-test status` never releases, regardless of ephemeral mode — it is a pure reporter. Blocking `gsd-test run` (non-async) is reclaimed by the prune pass on the next invocation.
 

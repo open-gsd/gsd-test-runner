@@ -36,6 +36,7 @@ Phases 3 and 4 do I/O. Phases 1, 2, and 5 are CPU/memory only and are independen
 | `dispatch` | `internal/dispatch/` | Run-and-die: hardened `node --test` / `docker run` arg builders, the copy-in `Exec`/`RunCopyIn` execution, and `VerifyImageVersion`. |
 | `reaper` | `internal/reaper/` | Run-and-die Tier-2: `Overdue` selection and the stale-label `Sweep`. |
 | `telemetry` | `internal/telemetry/` | Run-and-die: per-repo JSONL log, median fallback, runaway leaderboard. |
+| `runstate` | `internal/runstate/` | per-run state files + artifact-dir paths; `Release`/`Prune` retention (#102). |
 
 ## The 8 pipeline legs
 
@@ -64,6 +65,8 @@ The `pipeline.Pipeline` type owns 8 legs (per ADR-0008). They run in order; a fa
 - `reaper.Sweep` is the Tier-2 backstop: the Engine kills any container past its `sh.gsd-test.deadline` label on its next contact with a Bench.
 - `telemetry` appends each run to a per-repo log on the workstation for the median deadline fallback and the runaway leaderboard.
 - `agent-integration/` holds the Claude Code `PreToolUse` hook and Codex shim that route `node --test`/`npm test` to this front door.
+
+Run artifacts are ephemeral by default: `runstate.Release` is called by `wait` once it has rendered the result, and `runstate.Prune` sweeps older runs at the start of each invocation — see [Artifact lifecycle and ephemeral mode](run-and-die.md#artifact-lifecycle-and-ephemeral-mode).
 
 User-facing documentation: [Run-and-die Execution](run-and-die.md) and its tutorial, how-to, and reference.
 

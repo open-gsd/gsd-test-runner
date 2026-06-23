@@ -47,6 +47,22 @@ The leaderboard ranks on **two** signals, on purpose (Goodhart's Law): reaper tr
 
 Run-and-die is additive, not a replacement. The ordinary `gsd-test` run (no subcommand) still drives the five-phase pipeline across your configured targets and produces per-OS reports — see [Getting Started](getting-started.md) and [Architecture](architecture.md). Run-and-die is a second front door (`gsd-test submit`) aimed at *agents*, built on the same machinery: the same Benches, the same Tester Images, the same copy-in worktree, the same JSON result shape (extended with the `kill` record). The result envelope is `schema_version: 2` — additive over the per-OS report, with `outcome` and `kill` fields added.
 
+## Artifact lifecycle and ephemeral mode
+
+A run-and-die container is disposable by design — `--rm` removes it the moment the watchdog exits. The artifacts a run leaves on the host follow the same philosophy.
+
+The authoritative record of a run is its **stdout**: the human-readable render plus the final machine verdict line (ADR-0023). The files written under `$XDG_STATE_HOME/gsd-test/runs/<run-id>/` — `FAILURES.md`, `failures.json`, `junit.xml`, the JSONL event stream — are a convenience copy of that same information, not a database you are expected to curate. Left unmanaged they accumulate forever, one directory per run, with no signal to the operator.
+
+So by default `gsd-test` treats them as transient scratch and releases them once they have been consumed:
+
+- After `gsd-test wait` has rendered the result, the artifacts have served their purpose — the caller is holding the full output on stdout. `wait` therefore deletes the run's state file and artifact directory, and emits a verdict line with the artifact paths omitted (there is nothing left to point at). This is "consume on read".
+- A blocking `gsd-test run` cannot delete in place — the caller may still open `FAILURES.md` after the process exits. Those runs are reclaimed instead by a retention sweep at the start of the *next* run, bounded by `artifact_ttl` and `keep_last_runs`.
+- `gsd-test status` is a progress check, not a consumer, so it never releases anything.
+
+You opt out when you genuinely need the files to persist — comparing two runs side by side, attaching artifacts to a CI record, or debugging the harness itself. `--keep` does this for a single run; `keep_artifacts = true` does it permanently. Both also disable the retention sweep, returning to keep-everything behavior.
+
+The trade-off is deliberate. The default keeps a busy Bench's disk bounded and self-managing, at the cost of artifacts being short-lived: if you treat stdout as the record — as the verdict contract intends — you never notice they are gone. If you need the directory to be durable storage, set `[storage]` accordingly (see the [configuration reference](configuration.md#storage)).
+
 ## Trade-offs and limits
 
 - **`isolation: "none"` is faster but less precise.** Under process isolation a wedged test is a contained child the watchdog reaps with exact attribution. Under `none` all tests share one process, so a hang wedges everything and the kill record marks attribution best-effort. Use `none` only for suites you know are clean.
