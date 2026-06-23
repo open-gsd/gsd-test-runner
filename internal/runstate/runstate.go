@@ -51,6 +51,10 @@ type State struct {
 
 	// Err is set (with Status=done, ExitCode=2) when dispatch was inconclusive.
 	Err string `json:"err,omitempty"`
+
+	// Keep, when true, opts this run out of ephemeral auto-release: `wait` will
+	// not Release it on consume (#102 Option B). Set by `run --async --keep`.
+	Keep bool `json:"keep,omitempty"`
 }
 
 // Dir returns the directory where per-run state files are stored.

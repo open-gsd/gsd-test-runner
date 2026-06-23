@@ -24,6 +24,7 @@ mkdir -p ~/.config/gsd-test
 | `[[benches]]` | Table-array | One entry per Bench |
 | `[versions]` | Table | OS-to-image-version mapping |
 | `[testing]` | Table | Optional test command override for RunTests leg |
+| `[storage]` | Table | Run-artifact retention policy |
 
 ## `[defaults]`
 
@@ -169,6 +170,41 @@ command = "npm test -- --test-reporter={{REPORTER_PATH}} --test-reporter-destina
 command = ["bash", "-c", "npm run pretest && node --test tests/*.test.cjs"]
 ```
 
+## `[storage]`
+
+Controls run-artifact retention. By default, `gsd-test` operates in **ephemeral mode**: after `gsd-test wait` renders the result, it releases (deletes) the run's state file and artifact directory, and emits the verdict without artifact paths (stdout is the authoritative record). Use `[storage]` or the per-invocation `--keep` flag to opt out.
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `keep_artifacts` | `bool` | `false` | When `true`, opt all runs out of ephemeral auto-release globally. Equivalent to passing `--keep` on every `gsd-test run --async` invocation. |
+| `artifact_ttl` | `string` | `""` | Duration string (e.g. `"72h"`, `"7d"`). Runs older than this are pruned at the start of each `gsd-test run`. Ignored when `keep_artifacts = true` or `--keep` is passed. |
+| `keep_last_runs` | `int` | `0` | Keep at most this many completed runs (newest first) regardless of age. `0` = no count bound. Ignored when `keep_artifacts = true` or `--keep` is passed. |
+
+### Ephemeral vs non-ephemeral
+
+**Ephemeral (default):**
+
+- `gsd-test wait` renders the run result to stdout (self-contained), emits a verdict line with empty artifact paths, then calls `runstate.Release` to delete the state file and run directory.
+- `gsd-test status` never releases — it is a pure reporter regardless of ephemeral mode.
+- Blocking `gsd-test run` (non-async) is reclaimed by the prune pass on the next invocation — no in-process deletion.
+- Old runs are pruned at startup according to `artifact_ttl` and `keep_last_runs`.
+
+**Non-ephemeral (`keep_artifacts = true` or `--keep`):**
+
+- `gsd-test wait` writes the failure-first digest (FAILURES.md, failures.json, per-failure files) and emits the verdict with artifact paths, then exits without releasing.
+- The prune pass is skipped entirely for that invocation.
+
+```toml
+[storage]
+# Opt out of ephemeral mode globally (keep all run artifacts until manual cleanup).
+keep_artifacts = true
+
+# — or — keep only the 10 newest runs, each for up to 72 hours.
+# keep_artifacts = false
+# artifact_ttl = "72h"
+# keep_last_runs = 10
+```
+
 ## CLI flags
 
 CLI flags override the corresponding config values. Flags always take precedence.
@@ -180,6 +216,7 @@ CLI flags override the corresponding config values. Flags always take precedence
 | `--bench <name>` | `defaults.pin` | Pin to a specific Bench |
 | `--exclude <name,...>` | `defaults.exclude` | Comma-separated Bench names to exclude |
 | `--probe-benches` | — | Probe each Bench for reachability at startup |
+| `--keep` | — | (on `gsd-test run --async`) Preserve run artifacts; opt this invocation out of ephemeral auto-release |
 | `--json-events` | — | Emit events as JSON Lines instead of human-readable TTY output |
 | `--base <ref>` | — | Base git ref to merge from (default: `main`) |
 | `--head <ref>` | — | PR git ref to merge into base (default: `HEAD`) |

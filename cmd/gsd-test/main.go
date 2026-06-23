@@ -556,6 +556,7 @@ func runRun(args []string, stdout, stderr *os.File) int {
 	configPath := fs.String("config", "", "path to config.toml")
 	estimateMs := fs.Int64("estimate-ms", 0, "expected suite duration in ms (tightens the watchdog deadline)")
 	async := fs.Bool("async", false, "submit and return immediately; use `gsd-test wait <run-id>` to collect the result")
+	keep := fs.Bool("keep", false, "preserve run artifacts; opt out of ephemeral auto-release (prune + consume-on-read)")
 	if err := fs.Parse(args); err != nil {
 		return exitInconclusive
 	}
@@ -596,7 +597,7 @@ func runRun(args []string, stdout, stderr *os.File) int {
 	// non-fatal (the run itself will re-load and fail loudly if the config is
 	// actually broken).
 	if pruneCfg, pruneErr := config.Load(*configPath, config.LoadOptions{}); pruneErr == nil {
-		if !pruneCfg.Storage.KeepArtifacts {
+		if !*keep && !pruneCfg.Storage.KeepArtifacts {
 			if n, err := runstate.Prune(runstate.PruneOptions{TTL: pruneCfg.Storage.ArtifactTTL, KeepLastRuns: pruneCfg.Storage.KeepLastRuns}); err != nil {
 				fmt.Fprintf(stderr, "warning: prune run store: %v\n", err)
 			} else if n > 0 {
@@ -606,7 +607,7 @@ func runRun(args []string, stdout, stderr *os.File) int {
 	}
 
 	if *async {
-		return runAsync(*spec, *configPath, stdout, stderr, defaultSpawn)
+		return runAsync(*spec, *configPath, *keep, stdout, stderr, defaultSpawn)
 	}
 
 	// Notify the caller the handoff is happening (ADR-0022 Decision 4) so it does
@@ -634,7 +635,7 @@ func runRun(args []string, stdout, stderr *os.File) int {
 // dispatched-notice to stdout, and returns exit 0 immediately. The run
 // continues in the worker process; use `gsd-test wait <run-id>` to collect
 // the result.
-func runAsync(spec runspec.Spec, configPath string, stdout, stderr *os.File, spawn spawnFunc) int {
+func runAsync(spec runspec.Spec, configPath string, keep bool, stdout, stderr *os.File, spawn spawnFunc) int {
 	now := time.Now().UTC()
 	st := runstate.State{
 		RunID:     spec.RunID,
@@ -644,6 +645,7 @@ func runAsync(spec runspec.Spec, configPath string, stdout, stderr *os.File, spa
 		StartedAt: now,
 		UpdatedAt: now,
 		Spec:      spec,
+		Keep:      keep,
 	}
 	if err := runstate.Save(st); err != nil {
 		fmt.Fprintf(stderr, "run --async: save initial state: %v\n", err)
@@ -828,8 +830,30 @@ func waitRun(args []string, stdout, stderr *os.File) int {
 
 	text, code := runrender.Render(*st.Report)
 	fmt.Fprint(stdout, text)
-	// Same failure-first digest + verdict as a blocking `gsd-test run` (#84).
-	emitRunDieArtifacts(st.Spec.RunID, *st.Report, stdout, stderr)
+
+	keepArtifacts := st.Keep
+	if !keepArtifacts {
+		// Best-effort: honor config keep_artifacts from the default config path.
+		if cfg, cerr := config.Load("", config.LoadOptions{}); cerr == nil && cfg.Storage.KeepArtifacts {
+			keepArtifacts = true
+		}
+	}
+
+	if keepArtifacts {
+		// Non-ephemeral: write the failure-first digest + verdict as a blocking
+		// `gsd-test run` would (#84).
+		emitRunDieArtifacts(st.Spec.RunID, *st.Report, stdout, stderr)
+		return code
+	}
+	// Ephemeral (#102 Option B): stdout above is self-contained. Emit the verdict
+	// WITHOUT artifact paths (we are about to delete them) then release the run.
+	v := digest.Verdict([]report.Report{*st.Report}, digest.Paths{})
+	if werr := v.WriteLine(stdout); werr != nil {
+		fmt.Fprintf(stderr, "warning: write verdict: %v\n", werr)
+	}
+	if rerr := runstate.Release(runID); rerr != nil {
+		fmt.Fprintf(stderr, "warning: release run %s: %v\n", runID, rerr)
+	}
 	return code
 }
 
