@@ -8,30 +8,59 @@ This page summarizes the recent releases so you can quickly decide what to adopt
 - `v1.3.1`: shell-aware parsing for string commands + explicit argv command arrays
 - `v1.3.2`: per-bench container platform pinning (`linux/amd64`, `linux/arm64`, etc.)
 - `v1.4.0`: run-and-die for coding agents — the `gsd-test run` handoff, a one-command installer, and non-blocking `--async`/`wait`/`status`
-- Unreleased: ephemeral run storage — artifacts auto-released after `wait`; opt out with `--keep` or `[storage]`
+- `v1.5.0`: failure-first output — a quiet-by-default stream, a loud machine-readable verdict, and saved `FAILURES.md` / `failures.json` / `junit.xml` artifacts; plus ephemeral run storage you opt out of with `--keep` or `[storage]`
 
 ## Unreleased
 
+_Nothing yet — changes land here before the next tagged release._
+
+## v1.5.0
+
 ### Added
 
-- **Ephemeral run storage with opt-out.** Run artifacts are released automatically once consumed, so the runs store under `$XDG_STATE_HOME/gsd-test/runs/` no longer grows without bound. A new `[storage]` config section (`keep_artifacts`, `artifact_ttl`, `keep_last_runs`) and a per-run `--keep` flag control retention.
-
-  **Why it matters:** a long-lived Bench previously accumulated every run's artifacts forever, with no operator signal. Now `gsd-test wait` releases a run after printing its result, blocking runs are pruned on a later invocation, and you opt out only when you need the files to persist.
-
-  **Example:**
-  ```bash
-  gsd-test run --async --keep < spec.json   # keep this run's artifacts
-  ```
-  ```toml
-  [storage]
-  artifact_ttl = "72h"
-  keep_last_runs = 25
-  ```
+- **Failure-first run output.** Runs are now quiet by default: you see the pipeline legs, a compact heartbeat (one line per 25 passing tests, per OS), and failures — not every passing test. Each failure surfaces loudly the instant it happens as `✗ FAIL <file>:<line> · <class> · <name> — <msg>`, so you never scroll back to find it. The full firehose is still one flag away (`--verbose` / `GSD_TEST_VERBOSE=1`); `--quiet` trims output to the essentials (epic #84, ADR-0023).
+- **A machine-readable verdict on every run.** The last line of stdout is always one compact JSON `verdict` object whose `outcome` (`passed` / `failed` / `reaped` / `infra_error`) matches the exit code and whose `artifacts.dir` points at the saved output. Script against the last stdout line instead of parsing the stream.
+- **Saved failure-first artifacts.** Every run writes a `FAILURES.md`, `failures.json`, per-failure files, and a `junit.xml` under `$XDG_STATE_HOME/gsd-test/runs/<run-id>/`. The JUnit XML (one `<testsuite>` per OS) drops straight into CI test-report viewers.
+- **Lossless event emission.** Events flow through an unbounded queue and pump, so nothing is dropped under load — the digest and verdict stay complete even when a suite is noisy.
+- **Ephemeral run storage with opt-out.** Run artifacts are released automatically once consumed, so the runs store under `$XDG_STATE_HOME/gsd-test/runs/` no longer grows without bound. `gsd-test wait` releases a run after printing its result, and blocking runs are pruned on a later invocation. A new `[storage]` config section (`keep_artifacts`, `artifact_ttl`, `keep_last_runs`) and a per-run `--keep` flag opt out (#102).
 
 ### Fixed
 
+- Every infrastructure outcome now ends in a `verdict`, and run-ids are guarded against path traversal before they touch the runs directory (epic #84).
 - The reaper no longer aborts a sweep when a container has already exited; it verifies actual state and reaps the remaining overdue containers (#104).
 - The JSONL drain temp file is now removed after it is persisted into the run directory, fixing a per-run temp-file leak.
+
+### Why it matters
+
+A failing run used to bury its one important line under a wall of passing-test noise. Now the signal is loud and immediate — the failure prints in real time, the last line is a verdict you can parse, and the full detail is saved as `FAILURES.md` / `failures.json` / `junit.xml`. And the runs store no longer grows without bound: artifacts are released once consumed, with `--keep` or `[storage]` when you need them to persist.
+
+### Example
+
+```bash
+# quiet by default — pipeline legs, a heartbeat, and failures only
+gsd-test
+
+# full firehose (every passing test, plus npm ci / build output)
+gsd-test --verbose
+```
+
+The last stdout line is the `verdict`; its `artifacts.dir` holds `FAILURES.md`, `failures.json`, and `junit.xml`.
+
+Keep an async run's artifacts instead of auto-releasing them, or set a retention policy:
+
+```bash
+gsd-test run --async --keep < spec.json
+```
+
+```toml
+[storage]
+artifact_ttl = "72h"
+keep_last_runs = 25
+```
+
+### Learn more
+
+Start with [Failure-first Output](failure-first-output.md), the [output how-to guides](failure-first-output-how-to.md), and the [output reference](failure-first-output-reference.md). For retention, see the `[storage]` section of the [Configuration Reference](configuration.md).
 
 ## v1.4.0
 
