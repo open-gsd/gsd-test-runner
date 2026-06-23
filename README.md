@@ -18,11 +18,11 @@ Run your Node test suite across Linux, Windows, and macOS in parallel — on har
 
 ```bash
 # 1. Install (macOS arm64 example — see docs/installation.md for all platforms)
-GSD_TEST_VERSION=v1.4.0
+GSD_TEST_VERSION=v1.5.0
 curl -L -o gsd-test \
   "https://github.com/open-gsd/gsd-test-runner/releases/download/${GSD_TEST_VERSION}/gsd-test-${GSD_TEST_VERSION}-darwin-arm64"
 chmod +x gsd-test && mv gsd-test ~/.local/bin/
-gsd-test --version   # → v1.4.0
+gsd-test --version   # → v1.5.0
 
 # 2. Configure a Bench (a remote machine you SSH to with Docker installed)
 mkdir -p ~/.config/gsd-test
@@ -36,7 +36,7 @@ host = "lab-rig-1.local"
 os = "linux"
 
 [versions]
-linux = "v1.4.0"
+linux = "v1.5.0"
 EOF
 
 # 3. Run your tests
