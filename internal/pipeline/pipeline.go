@@ -198,6 +198,11 @@ const (
 	EventChildOutput // a line of subprocess stdout/stderr
 	EventTestPass
 	EventTestFail
+	// EventDroppedOutput is a synthetic marker emitted once when the bounded
+	// event queue drops old EventChildOutput events to protect memory under a
+	// slow consumer. Detail contains the drop count. Failure events are never
+	// dropped. (B-7 fix.)
+	EventDroppedOutput
 )
 
 func (k EventKind) String() string {
@@ -216,6 +221,8 @@ func (k EventKind) String() string {
 		return "test_pass"
 	case EventTestFail:
 		return "test_fail"
+	case EventDroppedOutput:
+		return "dropped_output"
 	}
 	return fmt.Sprintf("event(%d)", int(k))
 }
@@ -353,11 +360,12 @@ type Pipeline struct {
 	expectedVersion string // per ADR-0011 decision 3: caller-supplied
 	work            string // path to the PR-merged worktree (from worktree.Worktree.Path())
 	events          chan<- Event
-	// queue is the unbounded, lossless buffer between emit (producers) and the
+	// queue is the bounded, loss-tolerant buffer between emit (producers) and the
 	// events channel. A single pump goroutine drains it and is the sole closer
 	// of events (#84, ADR-0017 amendment). Nil only when events is nil.
-	queue  *eventQueue
-	result report.Report
+	queue    *eventQueue
+	pumpOnce sync.Once // B-8 fix: start pump lazily on first emit; prevents leak when New is called without RunAll
+	result   report.Report
 	// containerID is the running container ID/name set by StartContainer.
 	// Drain uses it as the source for docker cp. Today StartContainer is a
 	// stub; tests seed this field directly.
@@ -372,12 +380,13 @@ type Pipeline struct {
 
 // New constructs a Pipeline. The expectedVersion parameter is the
 // Image-version sentinel value this Pipeline will verify in
-// CheckImageVersion (see ADR-0011, decision 3). Events are buffered in an
-// unbounded in-pipeline queue and delivered to the events channel by a single
-// pump goroutine, so emit never blocks a leg and never drops an event (#84,
-// ADR-0017 amendment); the pump is the sole closer of events. Callers must
-// drain events; they must NOT close it themselves. A nil events channel makes
-// emit a no-op (no pump is started).
+// CheckImageVersion (see ADR-0011, decision 3). Events are buffered in a
+// bounded in-pipeline queue and delivered to the events channel by a single
+// pump goroutine. The pump is started lazily on the first emit call (B-8 fix):
+// this ensures that a Pipeline constructed but never used (early return / panic
+// before RunAll) does not leak a goroutine parked on cond.Wait. The pump is the
+// sole closer of events; callers must drain events and must NOT close it
+// themselves. A nil events channel makes emit a no-op (no pump is ever started).
 func New(b bench.Bench, img images.ImageID, expectedVersion string, worktreePath string, testCommand []string, events chan<- Event) *Pipeline {
 	p := &Pipeline{
 		bench:           b,
@@ -389,11 +398,7 @@ func New(b bench.Bench, img images.ImageID, expectedVersion string, worktreePath
 		queue:           newEventQueue(),
 		result:          report.New(b.OS, b.Name, string(img), expectedVersion, time.Now().UTC()),
 	}
-	// Start the single pump that drains the queue to events and closes it. With
-	// no events channel emit is a no-op, so no pump is needed.
-	if events != nil {
-		go p.pump()
-	}
+	// Pump is NOT started here — see emit for the lazy start (B-8 fix).
 	return p
 }
 
@@ -519,6 +524,7 @@ func (p *Pipeline) StartContainer(ctx context.Context) error {
 // NpmCIError is the typed Cause for LegError when the NpmCI leg fails.
 type NpmCIError struct {
 	Stderr   string
+	Stdout   string // B-14 fix: captured stdout so crash diagnostics are visible at Normal verbosity
 	ExitCode int
 	Cause    error // non-nil for non-exec errors (ctx canceled, etc.)
 }
@@ -526,6 +532,14 @@ type NpmCIError struct {
 func (e *NpmCIError) Error() string {
 	if e.Cause != nil {
 		return fmt.Sprintf("npm ci failed: %v", e.Cause)
+	}
+	// B-14 fix: include stdout in the error message when it carries diagnostic
+	// content that wouldn't otherwise be visible at Normal/Quiet verbosity.
+	if e.Stdout != "" && e.Stderr != "" {
+		return fmt.Sprintf("npm ci failed (exit=%d): %s\n%s", e.ExitCode, strings.TrimSpace(e.Stderr), strings.TrimSpace(e.Stdout))
+	}
+	if e.Stdout != "" {
+		return fmt.Sprintf("npm ci failed (exit=%d): %s", e.ExitCode, strings.TrimSpace(e.Stdout))
 	}
 	return fmt.Sprintf("npm ci failed (exit=%d): %s", e.ExitCode, strings.TrimSpace(e.Stderr))
 }
@@ -538,11 +552,14 @@ func (p *Pipeline) NpmCI(ctx context.Context) error {
 		if p.containerID == "" {
 			return "", &NpmCIError{Cause: errors.New("StartContainer did not run; containerID is empty")}
 		}
-		var stderrBuf bytes.Buffer
+		// B-14 fix: capture stdout as well as stderr so a crash that writes its
+		// fatal diagnostic to stdout is visible in the error at Normal verbosity.
+		var stderrBuf, stdoutBuf bytes.Buffer
 		args := []string{"exec", "--workdir", "/work", p.containerID, "npm", "ci"}
 		err := dockerStream(ctx, p.bench, args,
 			func(line string) {
 				p.emit(Event{Kind: EventChildOutput, Leg: LegNpmCI, Line: line, Stream: "stdout"})
+				stdoutBuf.WriteString(line + "\n")
 			},
 			func(line string) {
 				p.emit(Event{Kind: EventChildOutput, Leg: LegNpmCI, Line: line, Stream: "stderr"})
@@ -552,7 +569,7 @@ func (p *Pipeline) NpmCI(ctx context.Context) error {
 		if err != nil {
 			var execErr *dockerexec.ExecError
 			if errors.As(err, &execErr) {
-				return "", &NpmCIError{Stderr: stderrBuf.String(), ExitCode: execErr.ExitCode}
+				return "", &NpmCIError{Stderr: stderrBuf.String(), Stdout: stdoutBuf.String(), ExitCode: execErr.ExitCode}
 			}
 			return "", &NpmCIError{Cause: err}
 		}
@@ -563,6 +580,7 @@ func (p *Pipeline) NpmCI(ctx context.Context) error {
 // BuildError is the typed Cause for LegError when the Build leg fails.
 type BuildError struct {
 	Stderr   string
+	Stdout   string // B-14 fix: captured stdout so crash diagnostics are visible at Normal verbosity
 	ExitCode int
 	Cause    error // non-nil for non-exec errors (ctx canceled, etc.)
 }
@@ -570,6 +588,13 @@ type BuildError struct {
 func (e *BuildError) Error() string {
 	if e.Cause != nil {
 		return fmt.Sprintf("npm run build failed: %v", e.Cause)
+	}
+	// B-14 fix: include stdout when it carries diagnostic content.
+	if e.Stdout != "" && e.Stderr != "" {
+		return fmt.Sprintf("npm run build failed (exit=%d): %s\n%s", e.ExitCode, strings.TrimSpace(e.Stderr), strings.TrimSpace(e.Stdout))
+	}
+	if e.Stdout != "" {
+		return fmt.Sprintf("npm run build failed (exit=%d): %s", e.ExitCode, strings.TrimSpace(e.Stdout))
 	}
 	return fmt.Sprintf("npm run build failed (exit=%d): %s", e.ExitCode, strings.TrimSpace(e.Stderr))
 }
@@ -610,11 +635,14 @@ func (p *Pipeline) Build(ctx context.Context) error {
 		if !hasScript {
 			return "no build script defined in package.json", ErrLegSkipped
 		}
-		var stderrBuf bytes.Buffer
+		// B-14 fix: capture stdout as well as stderr so a crash that writes its
+		// fatal diagnostic to stdout is visible in the error at Normal verbosity.
+		var stderrBuf, stdoutBuf bytes.Buffer
 		args := []string{"exec", "--workdir", "/work", p.containerID, "npm", "run", "build"}
 		err = dockerStream(ctx, p.bench, args,
 			func(line string) {
 				p.emit(Event{Kind: EventChildOutput, Leg: LegBuild, Line: line, Stream: "stdout"})
+				stdoutBuf.WriteString(line + "\n")
 			},
 			func(line string) {
 				p.emit(Event{Kind: EventChildOutput, Leg: LegBuild, Line: line, Stream: "stderr"})
@@ -624,7 +652,7 @@ func (p *Pipeline) Build(ctx context.Context) error {
 		if err != nil {
 			var execErr *dockerexec.ExecError
 			if errors.As(err, &execErr) {
-				return "", &BuildError{Stderr: stderrBuf.String(), ExitCode: execErr.ExitCode}
+				return "", &BuildError{Stderr: stderrBuf.String(), Stdout: stdoutBuf.String(), ExitCode: execErr.ExitCode}
 			}
 			return "", &BuildError{Cause: err}
 		}
@@ -637,6 +665,7 @@ func (p *Pipeline) Build(ctx context.Context) error {
 // not a leg error per ADR-0017).
 type TestRunError struct {
 	Stderr   string
+	Stdout   string // B-14 fix: captured stdout so crash diagnostics are visible at Normal verbosity
 	ExitCode int
 	Cause    error // non-nil for non-exec errors (ctx canceled, etc.)
 }
@@ -644,6 +673,13 @@ type TestRunError struct {
 func (e *TestRunError) Error() string {
 	if e.Cause != nil {
 		return fmt.Sprintf("test runner failed: %v", e.Cause)
+	}
+	// B-14 fix: include stdout when it carries diagnostic content.
+	if e.Stdout != "" && e.Stderr != "" {
+		return fmt.Sprintf("test runner crashed (exit=%d): %s\n%s", e.ExitCode, strings.TrimSpace(e.Stderr), strings.TrimSpace(e.Stdout))
+	}
+	if e.Stdout != "" {
+		return fmt.Sprintf("test runner crashed (exit=%d): %s", e.ExitCode, strings.TrimSpace(e.Stdout))
 	}
 	return fmt.Sprintf("test runner crashed (exit=%d): %s", e.ExitCode, strings.TrimSpace(e.Stderr))
 }
@@ -670,11 +706,14 @@ func (p *Pipeline) RunTests(ctx context.Context) error {
 
 		// Run the test subprocess. Reporter writes JSONL to containerJSONLPath
 		// while the JSONL-tail goroutine emits live test events from it.
-		var stderrBuf bytes.Buffer
+		// B-14 fix: capture stdout as well as stderr so a crash that writes its
+		// fatal diagnostic to stdout is visible in the error at Normal verbosity.
+		var stderrBuf, stdoutBuf bytes.Buffer
 		args := append([]string{"exec", "--workdir", "/work", p.containerID}, p.runTestsCommandArgs()...)
 		err := dockerStream(ctx, p.bench, args,
 			func(line string) {
 				p.emit(Event{Kind: EventChildOutput, Leg: LegRunTests, Line: line, Stream: "stdout"})
+				stdoutBuf.WriteString(line + "\n")
 			},
 			func(line string) {
 				p.emit(Event{Kind: EventChildOutput, Leg: LegRunTests, Line: line, Stream: "stderr"})
@@ -692,7 +731,7 @@ func (p *Pipeline) RunTests(ctx context.Context) error {
 			var execErr *dockerexec.ExecError
 			if errors.As(err, &execErr) {
 				if execErr.ExitCode > 1 {
-					return "", &TestRunError{Stderr: stderrBuf.String(), ExitCode: execErr.ExitCode}
+					return "", &TestRunError{Stderr: stderrBuf.String(), Stdout: stdoutBuf.String(), ExitCode: execErr.ExitCode}
 				}
 				// exit 1: tests failed — Parse leg surfaces it via Report.Failures.
 				return "", nil
@@ -706,14 +745,21 @@ func (p *Pipeline) RunTests(ctx context.Context) error {
 // tailJSONLForLiveEvents tails containerJSONLPath inside the running container
 // and emits EventTestPass/EventTestFail per parsed test event. Stops when ctx
 // is canceled (which RunTests does after the test subprocess exits). Errors are
-// best-effort — failures here don't fail the leg (Parse reads the final file).
+// best-effort — failures here don't fail the leg (Parse reads the final file),
+// but are logged via a synthetic EventChildOutput so they are visible in verbose
+// mode rather than silently discarded.
+//
+// B-6 fix: uses "tail -F" (capital F / --retry) instead of "-f" so that tail
+// waits for the JSONL file to appear rather than exiting immediately when the
+// file does not yet exist at the start of the leg. The dockerStream error is
+// no longer discarded — non-cancellation errors are surfaced as a diagnostic event.
 func (p *Pipeline) tailJSONLForLiveEvents(ctx context.Context, wg *sync.WaitGroup) {
 	defer wg.Done()
 	args := []string{
 		"exec", p.containerID,
-		"tail", "-f", "-n", "+1", containerJSONLPath,
+		"tail", "-F", "-n", "+1", containerJSONLPath,
 	}
-	_ = dockerStream(ctx, p.bench, args,
+	err := dockerStream(ctx, p.bench, args,
 		func(line string) {
 			if line == "" {
 				return
@@ -732,8 +778,20 @@ func (p *Pipeline) tailJSONLForLiveEvents(ctx context.Context, wg *sync.WaitGrou
 			}
 			p.emit(e)
 		},
-		nil, // ignore stderr from `tail -f`
+		nil, // ignore stderr from tail
 	)
+	// B-6 fix: surface non-cancellation errors so they are visible in verbose
+	// mode. Context cancellation is the expected exit path (RunTests cancels the
+	// tail goroutine's context after the main test exec returns), so we ignore it.
+	if err != nil && ctx.Err() == nil {
+		p.emit(Event{
+			Kind:   EventChildOutput,
+			Leg:    LegRunTests,
+			Stream: "stderr",
+			Line:   fmt.Sprintf("[tail-jsonl] %v", err),
+			OS:     p.bench.OS,
+		})
+	}
 }
 
 // Drain pulls the JSON Lines capture file from the container to the
@@ -880,14 +938,19 @@ func (p *Pipeline) runLeg(ctx context.Context, leg Leg, work func(context.Contex
 	return nil
 }
 
-// emit enqueues an Event for delivery to the renderer. It never blocks a leg
-// and never drops: the event is appended to an unbounded in-pipeline queue that
-// the pump goroutine drains to the events channel (#84, ADR-0017 amendment).
+// emit enqueues an Event for delivery to the renderer. It never blocks a leg;
+// the bounded in-pipeline queue handles backpressure (dropping oldest
+// EventChildOutput under a slow consumer — see eventQueue). The pump goroutine
+// is started lazily on the first emit call so a Pipeline that is constructed
+// but never used (New without RunAll) does not leak a goroutine (B-8 fix).
 // A nil events channel makes emit a no-op (the no-consumer path).
 func (p *Pipeline) emit(e Event) {
 	if p.events == nil {
 		return
 	}
+	// B-8 fix: start the pump goroutine lazily on the first emit, not in New.
+	// pumpOnce ensures exactly one pump regardless of concurrent emits.
+	p.pumpOnce.Do(func() { go p.pump() })
 	p.queue.push(e)
 }
 
@@ -897,10 +960,18 @@ func (p *Pipeline) emit(e Event) {
 // the channel to close MUST keep draining it until then (a stalled consumer
 // leaves the pump parked mid-send). Called by RunAll on every exit path. A nil
 // events channel makes it a no-op.
+//
+// B-8 fix: also ensures the pump goroutine is started (if it hasn't been
+// started via emit yet), so a Pipeline that is created and immediately closed
+// without any leg running still closes the events channel as expected.
 func (p *Pipeline) closeEvents() {
 	if p.events == nil {
 		return
 	}
+	// Ensure the pump is running before we close the queue, so the pump can
+	// drain any queued events and close the channel. This is the B-8 fix for
+	// the case where New is called but RunAll never runs (or panics before emit).
+	p.pumpOnce.Do(func() { go p.pump() })
 	p.queue.close()
 }
 
@@ -920,32 +991,111 @@ func (p *Pipeline) pump() {
 	}
 }
 
-// eventQueue is an unbounded, mutex-guarded FIFO drained by one pump goroutine.
-// Producers (emit) never block and nothing is dropped; only the pump can block,
-// on a slow channel, which is bounded backpressure rather than data loss. This
-// replaces the prior non-blocking select-default emit that silently discarded
-// events on a full 128-item buffer (#84, ADR-0017 amendment).
+// defaultEventQueueCap is the default high-water mark for the bounded event
+// queue (B-7 fix). When q.items reaches this cap, the oldest EventChildOutput
+// entries are evicted and a single EventDroppedOutput marker is injected so the
+// consumer knows output was dropped. Failure/result events are never evicted.
+// Configurable for tests via newEventQueueWithCap.
+const defaultEventQueueCap = 50_000
+
+// eventQueue is a mutex-guarded, bounded FIFO drained by one pump goroutine.
+// Producers (emit) never block; if the queue exceeds its high-water cap the
+// oldest EventChildOutput events are dropped (bounded-with-marker strategy) and
+// a single synthetic EventDroppedOutput marker is emitted so consumers know.
+// Failure events (EventTestFail, EventLegFailure, EventDroppedOutput) are never
+// dropped — failure-first is lossless. This replaces the prior unbounded queue
+// that could grow to OOM under a stalled consumer (#84 B-7 fix, ADR-0017
+// amendment). The "bounded backpressure" comment in the old code was misleading
+// — producers never actually blocked; this implementation makes the bound real.
 type eventQueue struct {
-	mu     sync.Mutex
-	cond   *sync.Cond
-	items  []Event
-	closed bool
+	mu        sync.Mutex
+	cond      *sync.Cond
+	items     []Event
+	closed    bool
+	cap       int  // high-water mark; 0 means use defaultEventQueueCap
+	dropped   int  // count of EventChildOutput events evicted since last marker
+	hasMarker bool // true if a marker for this drop episode is already in items
 }
 
 func newEventQueue() *eventQueue {
-	q := &eventQueue{}
+	return newEventQueueWithCap(defaultEventQueueCap)
+}
+
+func newEventQueueWithCap(cap int) *eventQueue {
+	q := &eventQueue{cap: cap}
 	q.cond = sync.NewCond(&q.mu)
 	return q
 }
 
+// isLossless reports whether event kind e must never be dropped.
+// EventChildOutput is the only droppable kind; all others are lossless.
+func isLosslessKind(k EventKind) bool {
+	return k != EventChildOutput
+}
+
 // push appends e. It is a no-op once the queue is closed (no producers after
 // close), so a late tail-goroutine emit during shutdown can never panic.
+// B-7 fix: when q.items would exceed the cap, the oldest EventChildOutput
+// events are evicted and a synthetic EventDroppedOutput marker is injected
+// (once per drop episode). Lossless events (non-EventChildOutput) are always
+// appended unconditionally.
 func (q *eventQueue) push(e Event) {
 	q.mu.Lock()
 	if q.closed {
 		q.mu.Unlock()
 		return
 	}
+
+	hwm := q.cap
+	if hwm <= 0 {
+		hwm = defaultEventQueueCap
+	}
+
+	// For droppable events: if we would exceed the cap, evict the oldest
+	// EventChildOutput items to make room for both e and a marker (if needed).
+	if !isLosslessKind(e.Kind) && len(q.items) >= hwm {
+		// Evict from the front: scan for oldest EventChildOutput to remove.
+		// We need at least one free slot; keep removing until we have room.
+		for len(q.items) >= hwm {
+			removed := false
+			for i, item := range q.items {
+				if item.Kind == EventChildOutput {
+					// Shift left.
+					copy(q.items[i:], q.items[i+1:])
+					q.items[len(q.items)-1] = Event{}
+					q.items = q.items[:len(q.items)-1]
+					q.dropped++
+					removed = true
+					break
+				}
+			}
+			if !removed {
+				// No EventChildOutput items to evict; just append (lossless-only
+				// backpressure doesn't apply — failure events are always kept).
+				break
+			}
+		}
+		// Inject a marker if there isn't already one pending.
+		if q.dropped > 0 && !q.hasMarker {
+			marker := Event{
+				Kind:   EventDroppedOutput,
+				Leg:    e.Leg,
+				OS:     e.OS,
+				Detail: fmt.Sprintf("%d output lines dropped due to slow consumer", q.dropped),
+			}
+			q.items = append(q.items, marker)
+			q.hasMarker = true
+		} else if q.dropped > 0 && q.hasMarker {
+			// Update the existing marker's count.
+			for i := len(q.items) - 1; i >= 0; i-- {
+				if q.items[i].Kind == EventDroppedOutput {
+					q.items[i].Detail = fmt.Sprintf("%d output lines dropped due to slow consumer", q.dropped)
+					break
+				}
+			}
+		}
+	}
+
 	q.items = append(q.items, e)
 	q.mu.Unlock()
 	q.cond.Signal()
@@ -978,6 +1128,12 @@ func (q *eventQueue) pop() (Event, bool) {
 	e := q.items[0]
 	q.items[0] = Event{} // release the reference so the backing array can shrink
 	q.items = q.items[1:]
+	// When the marker is consumed, reset the drop-episode state so the next
+	// burst of drops gets its own fresh marker with an accurate count.
+	if e.Kind == EventDroppedOutput {
+		q.dropped = 0
+		q.hasMarker = false
+	}
 	q.mu.Unlock()
 	return e, true
 }

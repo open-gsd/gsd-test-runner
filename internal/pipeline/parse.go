@@ -5,8 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"regexp"
-	"strconv"
 	"strings"
 
 	"github.com/open-gsd/gsd-test-runner/internal/report"
@@ -157,7 +155,12 @@ func parseLiveTestEvent(line []byte) (LiveTestEvent, bool) {
 	if envelope.Type != "test_event" {
 		return LiveTestEvent{}, false
 	}
-	if envelope.Kind == "" || envelope.Name == "" {
+	// B-21: validate kind against the known enum (fail-closed).
+	// An unknown kind must not be treated as a pass; drop it silently.
+	if envelope.Kind != "pass" && envelope.Kind != "fail" {
+		return LiveTestEvent{}, false
+	}
+	if envelope.Name == "" {
 		return LiveTestEvent{}, false
 	}
 	return LiveTestEvent{
@@ -170,45 +173,12 @@ func parseLiveTestEvent(line []byte) (LiveTestEvent, bool) {
 	}, true
 }
 
-var reFrameLineCol = regexp.MustCompile(`:(\d+):\d+`)
-
-// deriveLine extracts a best-effort source line from the first stack frame
-// mentioning the test file's base name (or the first ":<line>:<col>" frame when
-// file is empty); 0 when nothing matches. Mirrors digest's derivation; the two
-// are kept independent to avoid a pipeline→digest dependency.
+// deriveLine delegates to the shared report.DeriveLine implementation
+// (B-22/B-23/B-24 fix). Using report.DeriveLine avoids a pipeline→digest
+// dependency and ensures the live ✗ FAIL line and the digest file:line always
+// agree. See report.DeriveLine for the full contract and bug-fix notes.
 func deriveLine(file, stack string) int {
-	if stack == "" {
-		return 0
-	}
-	base := file
-	if i := strings.LastIndexAny(base, "/\\"); i >= 0 {
-		base = base[i+1:]
-	}
-	lines := strings.Split(stack, "\n")
-	if base != "" {
-		for _, ln := range lines {
-			if strings.Contains(ln, base) {
-				if n := firstLineCol(ln); n > 0 {
-					return n
-				}
-			}
-		}
-	}
-	for _, ln := range lines {
-		if n := firstLineCol(ln); n > 0 {
-			return n
-		}
-	}
-	return 0
-}
-
-func firstLineCol(s string) int {
-	m := reFrameLineCol.FindStringSubmatch(s)
-	if m == nil {
-		return 0
-	}
-	n, _ := strconv.Atoi(m[1])
-	return n
+	return report.DeriveLine(file, stack)
 }
 
 func firstLine(s string) string {
