@@ -591,6 +591,20 @@ func runRun(args []string, stdout, stderr *os.File) int {
 		spec.RunID = id
 	}
 
+	// Best-effort prune of old run artifacts (#102 Option C) unless configured to
+	// keep them. Load config here solely to obtain Storage settings; errors are
+	// non-fatal (the run itself will re-load and fail loudly if the config is
+	// actually broken).
+	if pruneCfg, pruneErr := config.Load(*configPath, config.LoadOptions{}); pruneErr == nil {
+		if !pruneCfg.Storage.KeepArtifacts {
+			if n, err := runstate.Prune(runstate.PruneOptions{TTL: pruneCfg.Storage.ArtifactTTL, KeepLastRuns: pruneCfg.Storage.KeepLastRuns}); err != nil {
+				fmt.Fprintf(stderr, "warning: prune run store: %v\n", err)
+			} else if n > 0 {
+				fmt.Fprintf(stderr, "released %d old run(s) from the store\n", n)
+			}
+		}
+	}
+
 	if *async {
 		return runAsync(*spec, *configPath, stdout, stderr, defaultSpawn)
 	}

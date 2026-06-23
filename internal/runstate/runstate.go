@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -197,4 +198,208 @@ func Load(runID string) (State, error) {
 		return State{}, fmt.Errorf("runstate: unmarshal %s: %w", path, err)
 	}
 	return st, nil
+}
+
+// Release deletes all on-disk artifacts for runID: the <runID>.json state file,
+// the <runID>/ artifact dir, and the <runID>.worker.log if present. Used by the
+// ephemeral consume-on-read path (#102 Option B) and Prune. Containment-checked
+// like Path/RunDir. Missing files are not an error (idempotent).
+func Release(runID string) error {
+	dir, err := Dir()
+	if err != nil {
+		return err
+	}
+
+	var errs []error
+
+	// Remove the .json state file.
+	jsonPath, err := Path(runID)
+	if err != nil {
+		return err
+	}
+	if err := os.Remove(jsonPath); err != nil && !os.IsNotExist(err) {
+		errs = append(errs, fmt.Errorf("runstate: release %s json: %w", runID, err))
+	}
+
+	// Remove the artifact directory.
+	runDir, err := RunDir(runID)
+	if err != nil {
+		return err
+	}
+	if err := os.RemoveAll(runDir); err != nil && !os.IsNotExist(err) {
+		errs = append(errs, fmt.Errorf("runstate: release %s dir: %w", runID, err))
+	}
+
+	// Remove the worker log.
+	workerLog := runID + ".worker.log"
+	if err := containmentCheck(dir, workerLog); err != nil {
+		return err
+	}
+	workerLogPath := filepath.Join(dir, workerLog)
+	if err := os.Remove(workerLogPath); err != nil && !os.IsNotExist(err) {
+		errs = append(errs, fmt.Errorf("runstate: release %s worker.log: %w", runID, err))
+	}
+
+	return errors.Join(errs...)
+}
+
+// PruneOptions controls Prune behavior.
+type PruneOptions struct {
+	TTL          time.Duration // 0 = no TTL bound
+	KeepLastRuns int           // 0 = no count bound
+	Now          time.Time     // injectable for tests; zero value = time.Now().UTC()
+}
+
+// Prune enforces retention on the runs store (#102 Option C). It groups on-disk
+// entries by run-id (<id>.json state, <id>/ dir, <id>.worker.log), and removes
+// runs that are older than TTL or beyond the KeepLastRuns newest. A run whose
+// state file has Status == StatusRunning is NEVER pruned (an in-flight async run
+// from a concurrent invocation). Returns the number of runs removed. Best-effort
+// per run: a failure to remove one run does not stop the others (errors joined).
+func Prune(opts PruneOptions) (int, error) {
+	dir, err := Dir()
+	if err != nil {
+		return 0, err
+	}
+
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return 0, nil
+		}
+		return 0, fmt.Errorf("runstate: prune readdir %s: %w", dir, err)
+	}
+
+	now := opts.Now
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+
+	// Group entries by runID.
+	type runEntry struct {
+		runID   string
+		entries []os.DirEntry
+	}
+	runMap := make(map[string]*runEntry)
+
+	for _, e := range entries {
+		name := e.Name()
+		// Skip hidden/temp files (e.g. .runstate-tmp-*).
+		if strings.HasPrefix(name, ".") {
+			continue
+		}
+
+		var runID string
+		switch {
+		case strings.HasSuffix(name, ".json"):
+			runID = strings.TrimSuffix(name, ".json")
+		case strings.HasSuffix(name, ".worker.log"):
+			runID = strings.TrimSuffix(name, ".worker.log")
+		default:
+			// Plain entry (directory) — the name itself is the runID.
+			runID = name
+		}
+
+		// Defense-in-depth: skip non-conforming names.
+		if !runspec.ValidRunID(runID) {
+			continue
+		}
+
+		if runMap[runID] == nil {
+			runMap[runID] = &runEntry{runID: runID}
+		}
+		runMap[runID].entries = append(runMap[runID].entries, e)
+	}
+
+	// For each runID, determine: running? and timestamp.
+	type runInfo struct {
+		runID     string
+		running   bool
+		timestamp time.Time
+	}
+
+	infos := make([]runInfo, 0, len(runMap))
+	for runID, re := range runMap {
+		info := runInfo{runID: runID}
+
+		// Check if running via state file.
+		st, loadErr := Load(runID)
+		if loadErr == nil {
+			if st.Status == StatusRunning {
+				info.running = true
+			}
+			info.timestamp = st.UpdatedAt
+		}
+
+		// If we couldn't load the state (missing or corrupt), fall back to newest
+		// ModTime among the runID's entries.
+		if info.timestamp.IsZero() {
+			for _, e := range re.entries {
+				fi, fiErr := e.Info()
+				if fiErr != nil {
+					continue
+				}
+				if mt := fi.ModTime(); mt.After(info.timestamp) {
+					info.timestamp = mt
+				}
+			}
+		}
+
+		infos = append(infos, info)
+	}
+
+	// Build the prunable set = all non-running runs.
+	type candidate struct {
+		runID     string
+		timestamp time.Time
+	}
+	var prunable []candidate
+	for _, info := range infos {
+		if !info.running {
+			prunable = append(prunable, candidate{runID: info.runID, timestamp: info.timestamp})
+		}
+	}
+
+	// Mark for removal by TTL first.
+	markedForRemoval := make(map[string]bool)
+	if opts.TTL > 0 {
+		cutoff := now.Add(-opts.TTL)
+		for _, c := range prunable {
+			if c.timestamp.Before(cutoff) {
+				markedForRemoval[c.runID] = true
+			}
+		}
+	}
+
+	// Then apply KeepLastRuns to the survivors.
+	if opts.KeepLastRuns > 0 {
+		// Collect survivors (not yet marked for removal).
+		survivors := make([]candidate, 0, len(prunable))
+		for _, c := range prunable {
+			if !markedForRemoval[c.runID] {
+				survivors = append(survivors, c)
+			}
+		}
+		// Sort survivors newest first.
+		sort.Slice(survivors, func(i, j int) bool {
+			return survivors[i].timestamp.After(survivors[j].timestamp)
+		})
+		// Mark everything beyond KeepLastRuns for removal.
+		for i := opts.KeepLastRuns; i < len(survivors); i++ {
+			markedForRemoval[survivors[i].runID] = true
+		}
+	}
+
+	// Remove each marked run.
+	var errs []error
+	removed := 0
+	for runID := range markedForRemoval {
+		if err := Release(runID); err != nil {
+			errs = append(errs, err)
+		} else {
+			removed++
+		}
+	}
+
+	return removed, errors.Join(errs...)
 }
