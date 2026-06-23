@@ -9,6 +9,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/open-gsd/gsd-test-runner/internal/bench"
 )
@@ -530,5 +531,108 @@ func TestValidateAndTransform_Errors(t *testing.T) {
 				t.Errorf("error type = %T, want *InvalidConfigError", err)
 			}
 		})
+	}
+}
+
+// --- Storage section tests ---
+
+// TestLoad_Storage_ExplicitValues verifies that [storage] fields parse correctly.
+func TestLoad_Storage_ExplicitValues(t *testing.T) {
+	path := writeTOML(t, `
+[storage]
+keep_artifacts = true
+artifact_ttl = "48h"
+keep_last_runs = 5
+`)
+
+	cfg, err := Load(path, LoadOptions{})
+	if err != nil {
+		t.Fatalf("Load returned error: %v", err)
+	}
+
+	if !cfg.Storage.KeepArtifacts {
+		t.Errorf("Storage.KeepArtifacts = false, want true")
+	}
+	wantTTL := 48 * time.Hour
+	if cfg.Storage.ArtifactTTL != wantTTL {
+		t.Errorf("Storage.ArtifactTTL = %v, want %v", cfg.Storage.ArtifactTTL, wantTTL)
+	}
+	if cfg.Storage.KeepLastRuns != 5 {
+		t.Errorf("Storage.KeepLastRuns = %d, want 5", cfg.Storage.KeepLastRuns)
+	}
+}
+
+// TestLoad_Storage_Defaults verifies that defaults apply when [storage] is absent.
+func TestLoad_Storage_Defaults(t *testing.T) {
+	// Config with no [storage] section.
+	path := writeTOML(t, `
+[[benches]]
+name = "bench-a"
+host = "host-a"
+os = "linux"
+`)
+
+	cfg, err := Load(path, LoadOptions{})
+	if err != nil {
+		t.Fatalf("Load returned error: %v", err)
+	}
+
+	if cfg.Storage.KeepArtifacts {
+		t.Errorf("Storage.KeepArtifacts = true, want false (default)")
+	}
+	wantTTL := 24 * time.Hour
+	if cfg.Storage.ArtifactTTL != wantTTL {
+		t.Errorf("Storage.ArtifactTTL = %v, want %v (default)", cfg.Storage.ArtifactTTL, wantTTL)
+	}
+	if cfg.Storage.KeepLastRuns != 10 {
+		t.Errorf("Storage.KeepLastRuns = %d, want 10 (default)", cfg.Storage.KeepLastRuns)
+	}
+}
+
+// TestLoad_Storage_ArtifactTTL_Disabled verifies that "0" disables the TTL.
+func TestLoad_Storage_ArtifactTTL_Disabled(t *testing.T) {
+	path := writeTOML(t, `
+[storage]
+artifact_ttl = "0"
+`)
+
+	cfg, err := Load(path, LoadOptions{})
+	if err != nil {
+		t.Fatalf("Load returned error: %v", err)
+	}
+	if cfg.Storage.ArtifactTTL != 0 {
+		t.Errorf("Storage.ArtifactTTL = %v, want 0 (disabled)", cfg.Storage.ArtifactTTL)
+	}
+}
+
+// TestLoad_Storage_ArtifactTTL_InvalidDuration verifies a parse error.
+func TestLoad_Storage_ArtifactTTL_InvalidDuration(t *testing.T) {
+	path := writeTOML(t, `
+[storage]
+artifact_ttl = "not-a-duration"
+`)
+
+	_, err := Load(path, LoadOptions{})
+	if err == nil {
+		t.Fatal("expected error for invalid artifact_ttl, got nil")
+	}
+	if !strings.Contains(err.Error(), "storage.artifact_ttl") {
+		t.Errorf("error = %q, want 'storage.artifact_ttl' in message", err.Error())
+	}
+}
+
+// TestLoad_Storage_NegativeKeepLastRuns verifies that a negative value is rejected.
+func TestLoad_Storage_NegativeKeepLastRuns(t *testing.T) {
+	path := writeTOML(t, `
+[storage]
+keep_last_runs = -1
+`)
+
+	_, err := Load(path, LoadOptions{})
+	if err == nil {
+		t.Fatal("expected error for negative keep_last_runs, got nil")
+	}
+	if !strings.Contains(err.Error(), "storage.keep_last_runs") {
+		t.Errorf("error = %q, want 'storage.keep_last_runs' in message", err.Error())
 	}
 }

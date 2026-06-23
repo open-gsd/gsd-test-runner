@@ -2,6 +2,7 @@ package reaper
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -65,20 +66,45 @@ func Kill(ctx context.Context, run Runner, id string) error {
 	return nil
 }
 
+// isRunning reports whether a container with the given id is still present and
+// running on the Bench. Used by Sweep to distinguish a benign already-exited
+// container (kill fails, but it is already reaped) from a real kill failure.
+func isRunning(ctx context.Context, run Runner, id string) (bool, error) {
+	out, err := run(ctx, "ps", "-q", "--no-trunc", "--filter", "id="+id)
+	if err != nil {
+		return false, err
+	}
+	return strings.TrimSpace(string(out)) != "", nil
+}
+
 // Sweep lists run containers, selects those past their deadline at nowMs, kills
-// each, and returns the reaped containers. This is the "reap on next contact"
-// backstop: any container whose in-container watchdog wedged is still bounded
-// because the next Engine contact with the Bench kills it (ADR-0021 D2).
+// each, and returns the full overdue slice. It tolerates already-gone containers
+// — if a Kill fails but the container is no longer present (e.g. it exited and
+// was removed by --rm, or a concurrent sweeper beat us to it), the error is
+// suppressed and the sweep continues (#104). Only genuine kill failures (the
+// container is still running) are returned as errors, joined via errors.Join so
+// all remaining containers are still attempted.
 func Sweep(ctx context.Context, run Runner, nowMs int64) ([]Container, error) {
 	containers, err := List(ctx, run)
 	if err != nil {
 		return nil, err
 	}
 	overdue := Overdue(containers, nowMs)
+	var errs []error
 	for _, c := range overdue {
 		if err := Kill(ctx, run, c.ID); err != nil {
-			return overdue, err
+			// A container that already exited (its own --rm self-removal, or a
+			// concurrent sweeper) is already reaped — not a failure. Verify the
+			// actual state before treating the kill error as fatal, and keep
+			// reaping the rest either way (#104).
+			if running, verr := isRunning(ctx, run, c.ID); verr == nil && !running {
+				continue
+			}
+			errs = append(errs, err)
 		}
+	}
+	if len(errs) > 0 {
+		return overdue, errors.Join(errs...)
 	}
 	return overdue, nil
 }

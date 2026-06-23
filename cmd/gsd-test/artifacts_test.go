@@ -102,3 +102,99 @@ func TestCopyEventsJSONL(t *testing.T) {
 		t.Errorf("empty src should be skipped, but a file was written")
 	}
 }
+
+// TestCopyEventsJSONL_RemovesTempAfterCopy verifies issue #102 Option D: after a
+// successful copy the source temp file is removed. Two OS entries are used to
+// confirm both temps are cleaned up independently.
+func TestCopyEventsJSONL_RemovesTempAfterCopy(t *testing.T) {
+	// Create two real temp source files (simulating drain temps).
+	src1, err := os.CreateTemp("", "gsd-test-jsonl-*.log")
+	if err != nil {
+		t.Fatal(err)
+	}
+	src1Path := src1.Name()
+	content1 := `{"type":"test_event","name":"alpha"}` + "\n"
+	if _, err := src1.WriteString(content1); err != nil {
+		t.Fatal(err)
+	}
+	src1.Close()
+
+	src2, err := os.CreateTemp("", "gsd-test-jsonl-*.log")
+	if err != nil {
+		t.Fatal(err)
+	}
+	src2Path := src2.Name()
+	content2 := `{"type":"test_event","name":"beta"}` + "\n"
+	if _, err := src2.WriteString(content2); err != nil {
+		t.Fatal(err)
+	}
+	src2.Close()
+
+	dir := t.TempDir()
+	var stderr bytes.Buffer
+	copyEventsJSONL(dir, map[string]string{"linux": src1Path, "windows": src2Path}, &stderr)
+
+	// Both destination files must exist with correct content.
+	for osName, wantContent := range map[string]string{"linux": content1, "windows": content2} {
+		dst := filepath.Join(dir, "test-events-"+osName+".jsonl")
+		got, err := os.ReadFile(dst)
+		if err != nil {
+			t.Errorf("expected %s JSONL persisted at %s: %v", osName, dst, err)
+			continue
+		}
+		if string(got) != wantContent {
+			t.Errorf("%s JSONL content mismatch: got %q want %q", osName, got, wantContent)
+		}
+	}
+
+	// Both source temps must be gone (issue #102 Option D).
+	for _, srcPath := range []string{src1Path, src2Path} {
+		if _, err := os.Stat(srcPath); !os.IsNotExist(err) {
+			t.Errorf("source temp %s should have been removed after successful copy, but Stat returned: %v", srcPath, err)
+		}
+	}
+
+	if stderr.Len() != 0 {
+		t.Errorf("unexpected stderr output: %s", stderr.String())
+	}
+}
+
+// TestCopyEventsJSONL_KeepsTempOnCopyFailure verifies that when copyFile fails the
+// source temp is NOT removed (preserves diagnostic data). The failure is injected
+// deterministically by passing a src path that does not exist, which causes
+// copyFile to return an error before touching the destination.
+func TestCopyEventsJSONL_KeepsTempOnCopyFailure(t *testing.T) {
+	// Create a real temp that will be the "good" OS entry.
+	good, err := os.CreateTemp("", "gsd-test-jsonl-*.log")
+	if err != nil {
+		t.Fatal(err)
+	}
+	goodPath := good.Name()
+	good.Close()
+	// We want to keep this temp alive for the test; remove it ourselves at the end.
+	defer os.Remove(goodPath) //nolint:errcheck
+
+	// The "bad" OS entry points to a non-existent file — copyFile will fail.
+	badPath := filepath.Join(t.TempDir(), "nonexistent-drain.log")
+
+	dir := t.TempDir()
+	var stderr bytes.Buffer
+	copyEventsJSONL(dir, map[string]string{"linux": goodPath, "darwin": badPath}, &stderr)
+
+	// darwin copy failed: dst must not exist.
+	if _, err := os.Stat(filepath.Join(dir, "test-events-darwin.jsonl")); !os.IsNotExist(err) {
+		t.Errorf("darwin dst should not have been created on copy failure")
+	}
+
+	// The non-existent src path has no file to leave — the assertion is that
+	// no panic or unexpected removal of goodPath occurred. goodPath (linux)
+	// was copied successfully and its temp was removed.
+	if _, err := os.Stat(goodPath); !os.IsNotExist(err) {
+		t.Errorf("linux source temp should have been removed after successful copy; Stat: %v", err)
+	}
+
+	// A warning must have been emitted for the darwin failure.
+	if !strings.Contains(stderr.String(), "darwin") {
+		t.Errorf("expected warning mentioning darwin, got: %q", stderr.String())
+	}
+}

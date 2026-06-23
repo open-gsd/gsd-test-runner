@@ -12,6 +12,7 @@ The explicit executor agents call instead of `node --test`. Builds a run spec fr
 | `--config <path>` | (standard config search) | `config.toml` path, used to resolve Benches and image versions. |
 | `--estimate-ms <int>` | `0` | Expected suite duration in milliseconds. Tightens the watchdog deadline; `0` falls back to telemetry median then `hardCapMs`. |
 | `--async` | off | Submit and return immediately (POSIX only). Prints a dispatched-notice to stdout and exits `0`; the run continues in a detached worker. See [`gsd-test wait` and `gsd-test status`](#gsd-test-run---async-wait-and-status). |
+| `--keep` | off | (requires `--async`) Preserve run artifacts after `gsd-test wait` collects the result. Opts this invocation out of ephemeral auto-release and skips the startup prune. Equivalent to `keep_artifacts = true` in `[storage]` but scoped to one run. |
 
 Positional arguments after flags are treated as test path patterns appended to the run spec's `testPathPatterns`.
 
@@ -44,6 +45,10 @@ Unix-only (POSIX process groups). On non-POSIX hosts (Windows) it exits `2` with
 Blocks until the async run completes, then renders the same `node --test`-style verdict and exits with the same codes (`0` / `1` / `2`) a blocking `run` would produce. Never renders a partial result. There is a 90-minute absolute backstop; if the worker died without writing a result the command exits `2` (fail-loud, never a silent hang).
 
 Takes no flags — only the positional run-id.
+
+**Ephemeral mode (default):** After rendering the result to stdout, `wait` emits the verdict line with empty artifact paths (stdout is the authoritative record, not the on-disk files), then releases the run — deleting the state file and artifact directory. Pass `--keep` to `gsd-test run --async`, or set `keep_artifacts = true` in `[storage]`, to skip the release and keep artifacts on disk. Retention for kept artifacts is governed by the `[storage]` config section — see the [configuration reference](configuration.md#storage).
+
+`gsd-test status` never releases, regardless of ephemeral mode — it is a pure reporter. Blocking `gsd-test run` (non-async) is reclaimed by the prune pass on the next invocation.
 
 ### Exit codes — `wait`
 

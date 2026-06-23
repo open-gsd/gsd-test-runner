@@ -8,6 +8,30 @@ This page summarizes the recent releases so you can quickly decide what to adopt
 - `v1.3.1`: shell-aware parsing for string commands + explicit argv command arrays
 - `v1.3.2`: per-bench container platform pinning (`linux/amd64`, `linux/arm64`, etc.)
 - `v1.4.0`: run-and-die for coding agents — the `gsd-test run` handoff, a one-command installer, and non-blocking `--async`/`wait`/`status`
+- Unreleased: ephemeral run storage — artifacts auto-released after `wait`; opt out with `--keep` or `[storage]`
+
+## Unreleased
+
+### Added
+
+- **Ephemeral run storage with opt-out.** Run artifacts are released automatically once consumed, so the runs store under `$XDG_STATE_HOME/gsd-test/runs/` no longer grows without bound. A new `[storage]` config section (`keep_artifacts`, `artifact_ttl`, `keep_last_runs`) and a per-run `--keep` flag control retention.
+
+  **Why it matters:** a long-lived Bench previously accumulated every run's artifacts forever, with no operator signal. Now `gsd-test wait` releases a run after printing its result, blocking runs are pruned on a later invocation, and you opt out only when you need the files to persist.
+
+  **Example:**
+  ```bash
+  gsd-test run --async --keep < spec.json   # keep this run's artifacts
+  ```
+  ```toml
+  [storage]
+  artifact_ttl = "72h"
+  keep_last_runs = 25
+  ```
+
+### Fixed
+
+- The reaper no longer aborts a sweep when a container has already exited; it verifies actual state and reaps the remaining overdue containers (#104).
+- The JSONL drain temp file is now removed after it is persisted into the run directory, fixing a per-run temp-file leak.
 
 ## v1.4.0
 

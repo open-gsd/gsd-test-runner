@@ -25,6 +25,14 @@ type Config struct {
 	Versions    map[string]string  // OS -> expected image version
 	Defaults    Defaults
 	Testing     Testing
+	Storage     Storage
+}
+
+// Storage controls run-artifact retention (#102 Option C).
+type Storage struct {
+	KeepArtifacts bool
+	ArtifactTTL   time.Duration // 0 = no TTL bound
+	KeepLastRuns  int           // 0 = no count bound
 }
 
 // UnreachableBench records a Bench that failed reachability probing.
@@ -64,6 +72,13 @@ type rawConfig struct {
 	Benches  []rawBench        `toml:"benches"`
 	Versions map[string]string `toml:"versions"`
 	Testing  rawTesting        `toml:"testing"`
+	Storage  rawStorage        `toml:"storage"`
+}
+
+type rawStorage struct {
+	KeepArtifacts bool   `toml:"keep_artifacts"`
+	ArtifactTTL   string `toml:"artifact_ttl"`  // Go duration string, e.g. "24h"; "" = default, "0" = disabled
+	KeepLastRuns  int    `toml:"keep_last_runs"` // 0 = disabled (use default 10)
 }
 
 type rawDefaults struct {
@@ -189,6 +204,11 @@ func validateAndTransform(raw rawConfig) (*Config, error) {
 		}
 	}
 
+	storage, err := transformStorage(raw.Storage)
+	if err != nil {
+		return nil, err
+	}
+
 	return &Config{
 		Registry: registry,
 		Targets:  raw.Defaults.Targets,
@@ -201,6 +221,44 @@ func validateAndTransform(raw rawConfig) (*Config, error) {
 		Testing: Testing{
 			Command: command,
 		},
+		Storage: storage,
+	}, nil
+}
+
+// transformStorage maps rawStorage to Storage, applying defaults for unset fields.
+// Defaults: ArtifactTTL = 24h (when empty), KeepLastRuns = 10 (when 0).
+// "0" or "0s" for ArtifactTTL disables the TTL bound (sets 0).
+// Negative KeepLastRuns is a validation error.
+func transformStorage(raw rawStorage) (Storage, error) {
+	var ttl time.Duration
+	switch raw.ArtifactTTL {
+	case "":
+		ttl = 24 * time.Hour
+	case "0", "0s":
+		ttl = 0
+	default:
+		var err error
+		ttl, err = time.ParseDuration(raw.ArtifactTTL)
+		if err != nil {
+			return Storage{}, fmt.Errorf("storage.artifact_ttl: %w", err)
+		}
+	}
+
+	keepLastRuns := raw.KeepLastRuns
+	if keepLastRuns < 0 {
+		return Storage{}, &InvalidConfigError{
+			Section: "storage.keep_last_runs",
+			Reason:  "must not be negative",
+		}
+	}
+	if keepLastRuns == 0 {
+		keepLastRuns = 10
+	}
+
+	return Storage{
+		KeepArtifacts: raw.KeepArtifacts,
+		ArtifactTTL:   ttl,
+		KeepLastRuns:  keepLastRuns,
 	}, nil
 }
 
