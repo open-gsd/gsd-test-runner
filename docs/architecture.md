@@ -31,7 +31,8 @@ Phases 3 and 4 do I/O. Phases 1, 2, and 5 are CPU/memory only and are independen
 | `pipeline` | `internal/pipeline/` | 8-leg Per-OS Pipeline. `LegError` envelope. Typed Cause errors per leg. Event emission. |
 | `parse` | `internal/pipeline/` (same package) | JSONL parser for test events emitted by the Reporter. Called by the Parse leg. |
 | `report` | `internal/report/` | `Report` type: pass/fail counts, `[]Failure` list. `KindPass` / `KindFail` discriminant. `schema_version: 2` adds `Outcome` and the `Kill` record for reaped runs (ADR-0021). |
-| `renderer` | `internal/renderer/` | Consumes per-OS event channels. TTY mode (human) and JSON-events mode (machine). |
+| `renderer` | `internal/renderer/` | Consumes per-OS event channels. TTY mode (human, with `Verbosity` Full/Normal/Quiet) and JSON-events mode (machine). Default is Normal: heartbeat + leg events + loud failures. |
+| `digest` | `internal/digest/` | Failure-first output (ADR-0023). Cross-OS grouping, truncation, the `failures.json` / `FAILURES.md` / `junit.xml` serializers, and the last-line `verdict`. Operates on a slice of `report.Report`, so the standard and run-and-die paths share one contract. |
 | `runspec` | `internal/runspec/` | Run-and-die: parse/validate the agent run spec, defaults, `Budget.EffectiveDeadlineMs`. |
 | `dispatch` | `internal/dispatch/` | Run-and-die: hardened `node --test` / `docker run` arg builders, the copy-in `Exec`/`RunCopyIn` execution, and `VerifyImageVersion`. |
 | `reaper` | `internal/reaper/` | Run-and-die Tier-2: `Overdue` selection and the stale-label `Sweep`. |
@@ -93,7 +94,9 @@ The Pipeline emits typed `Event` values on a `chan<- Event` (per ADR-0017):
 | `EventTestPass` | Reporter emits a passing test | `Line` (test name) |
 | `EventTestFail` | Reporter emits a failing test | `Line` (test name), `Detail` (failure output) |
 
-The `renderer.Renderer` is one consumer. `--json-events` switches to a JSON Lines renderer that emits the same events as machine-readable output.
+The `renderer.Renderer` is one consumer; it applies a `Verbosity` (Full/Normal/Quiet) to decide what reaches the TTY. `--json-events` switches to a JSON Lines renderer that emits the same events as machine-readable output, unfiltered by verbosity.
+
+Emission is **lossless** (ADR-0023, amending ADR-0017 decision 4): `emit` writes to an unbounded in-pipeline queue drained by a single pump goroutine that is the sole closer of the events channel, so a failure event can never be dropped on saturation. After the run, `internal/digest` turns the collected per-OS `Report`s into the on-disk artifacts and the last-line `verdict`.
 
 ## ADR index
 
@@ -122,3 +125,5 @@ All design decisions live in [docs/adr/](adr/). Read them in numeric order for t
 | 0019 | Local Engine binary distribution via GitHub Release assets |
 | 0020 | macOS Bench via Apple Containers (amended 2026-05-24: pivoted to Docker on macOS) |
 | 0021 | Run-and-die execution and two-tier reaping |
+| 0022 | Agent test handoff and installer |
+| 0023 | Failure-first run output: artifact dir, verdict, truncation, grouping, lossless emit |

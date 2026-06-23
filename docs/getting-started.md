@@ -69,17 +69,19 @@ cd ~/my-node-project
 gsd-test
 ```
 
-`gsd-test` runs five sequential phases before you see test events:
+`gsd-test` runs five sequential phases before you see test results:
 
 1. **Load** — reads `config.toml`.
 2. **Plan** — resolves target OSes to Benches.
 3. **EnsureImages** — confirms the Tester Image is present on each Bench (pulls from GHCR if absent).
 4. **RunPipelines** — runs the 8-leg pipeline on each Bench in parallel.
-5. **Aggregate+Render** — prints the final per-OS summary.
+5. **Aggregate+Render** — prints the final per-OS summary and a one-line verdict.
 
 ## Step 4: Read the output
 
-A successful run with one Linux Bench looks like this:
+`gsd-test` is **quiet by default**: it prints the pipeline legs, a periodic
+heartbeat, and any failures — but not every passing test. A successful run with
+one Linux Bench looks like this:
 
 ```text
 [linux] check_image_version ✔
@@ -87,21 +89,22 @@ A successful run with one Linux Bench looks like this:
 [linux] copy_worktree ✔
 [linux] npm_ci ✔
 [linux] build ✔
-[linux] run_tests
-[linux]   ✔ parses config (3ms)
-[linux]   ✔ returns 404 for unknown routes (1ms)
-[linux]   ✔ fails on missing HOME directory (2ms)
 [linux] run_tests ✔
 [linux] drain ✔
 [linux] parse ✔
 
 ── Results ──────────────────────────────────────────
 linux    PASS  3/3
+{"type":"verdict","outcome":"passed","per_os":{"linux":{"passed":3,"failed":0,"total":3,"outcome":"passed"}},"unique_failures":0,"total_failures":0,"top":[],"artifacts":{"dir":"~/.local/state/gsd-test/runs/9f2c1a","failures_json":"…","failures_md":"…","junit_xml":"…","events_jsonl":"…"}}
 ```
 
-Each line begins with `[linux]` — the target OS. Legs print `✔` on success. Inside `run_tests`, individual test results stream live.
+Each line begins with `[linux]` — the target OS. Legs print `✔` on success. The
+**last line is always a `verdict`** — one compact JSON object whose `outcome`
+matches the exit code and whose `artifacts.dir` points at this run's saved
+output. On a larger suite you would also see a heartbeat, `[linux]   … 25 passed`,
+once every 25 passing tests.
 
-A failed run looks like this:
+A failed run surfaces the failure loudly, the instant it happens:
 
 ```text
 [linux] check_image_version ✔
@@ -109,11 +112,7 @@ A failed run looks like this:
 [linux] copy_worktree ✔
 [linux] npm_ci ✔
 [linux] build ✔
-[linux] run_tests
-[linux]   ✔ parses config (3ms)
-[linux]   ✗ returns 404 for unknown routes
-[linux]     AssertionError: 404 !== 200
-[linux]   ✔ fails on missing HOME directory (2ms)
+[linux]   ✗ FAIL routes.test.js:42 · assertion · returns 404 for unknown routes — AssertionError: 404 !== 200
 [linux] run_tests ✔
 [linux] drain ✔
 [linux] parse ✔
@@ -122,7 +121,15 @@ A failed run looks like this:
 linux    FAIL  2/3
   ✗ returns 404 for unknown routes
       AssertionError: 404 !== 200
+{"type":"verdict","outcome":"failed","per_os":{"linux":{"passed":2,"failed":1,"total":3,"outcome":"failed"}},"unique_failures":1,"total_failures":1,"top":[{"class":"assertion","file":"routes.test.js","line":42,"name":"returns 404 for unknown routes"}],"artifacts":{"dir":"~/.local/state/gsd-test/runs/9f2c1a","failures_json":"…","failures_md":"…","junit_xml":"…","events_jsonl":"…"}}
 ```
+
+You do not need to scroll back to find the failure: it appears in real time as
+`✗ FAIL <file>:<line> · <class> · <name> — <msg>`, and the same run also writes a
+`FAILURES.md` (plus `failures.json` and `junit.xml`) to the `artifacts.dir`
+directory shown in the verdict — open that to read the full stack and captured
+output. See [Failure-first Output](failure-first-output.md) for the model and the
+[output how-to guides](failure-first-output-how-to.md) for reading a failed run.
 
 A leg failure (infrastructure problem, not test failure) looks like this:
 
@@ -134,7 +141,12 @@ A leg failure (infrastructure problem, not test failure) looks like this:
 
 ── Results ──────────────────────────────────────────
 linux    INCONCLUSIVE (leg check_image_version failed)
+{"type":"verdict","outcome":"infra_error","per_os":{},"unique_failures":0,"total_failures":0,"top":[],"artifacts":{}}
 ```
+
+The verdict's `outcome` is `infra_error` here — the suite did not run as designed.
+To turn the full firehose back on (every passing test and all `npm ci` / build
+output), add `--verbose`.
 
 ## Step 5: Interpret exit codes
 

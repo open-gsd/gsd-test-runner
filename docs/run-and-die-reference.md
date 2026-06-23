@@ -234,7 +234,11 @@ container-teardown guarantee is unaffected.
 ## Result artifacts and verdict (ADR-0023)
 
 Beyond the `node --test`-style text, every `gsd-test run` / `wait` emits a
-failure-first contract shared with the standard `gsd-test` path:
+failure-first contract shared with the standard `gsd-test` path. The full
+contract — verbosity levels, the verdict schema, truncation, and cross-OS
+grouping — is documented once in the
+[Failure-first Output Reference](failure-first-output-reference.md); the
+run-and-die specifics are below:
 
 - **Verdict line.** The final line of stdout is one compact JSON object, in every
   outcome:
