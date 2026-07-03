@@ -223,6 +223,8 @@ To always use a specific Bench, pass **`--bench <name>`** on the command line or
 
 ## Node.js version matrix and fan-out
 
+> This section is the Bench-setup view. For why the matrix exists and how fan-out works, see [The Node version matrix](node-matrix.md); for task recipes, the [Node matrix how-to guides](node-matrix-how-to.md).
+
 Every run tests each target OS against one or more Node.js major versions — an **(OS × Node) cell**. `linux` with `["22", "24"]` configured produces two cells, `linux-node22` and `linux-node24`, each running its own Tester container.
 
 Which majors run on which OS is controlled by the `[node]` table in `config.toml` (see [Configuration Reference](configuration.md#node)); if an OS is absent from `[node]`, `gsd-test` falls back to the currently-supported Node LTS majors. Pass **`--node <majors>`** on the command line to override the Node set for every target OS for that invocation, ignoring both `[node]` and the LTS default.
@@ -235,7 +237,7 @@ Each Tester Image is published per (OS × Node major) — see the tag-suffix not
 
 | `os` value | Image | Runtime | Notes |
 |------------|-------|---------|-------|
-| `linux` | `ghcr.io/open-gsd/gsd-tester-linux` | `docker` | non-default Node majors are published with a `-node<major>` tag suffix (e.g. `:v1.5.0-node22`); the Active LTS major also gets the plain `:<version>` tag |
+| `linux` | `ghcr.io/open-gsd/gsd-tester-linux` | `docker` | non-default Node majors are published with a `-node<major>` tag suffix (e.g. `:v1.6.0-node22`); the Active LTS major also gets the plain `:<version>` tag |
 | `windows` | `ghcr.io/open-gsd/gsd-tester-windows` | `docker` | requires Windows host; same `-node<major>` tag suffix convention |
 | `macos` | `ghcr.io/open-gsd/gsd-tester-macos` (alias of linux) | `docker` | Mac host running Docker Desktop or colima; tests Linux behavior; same `-node<major>` tag suffix convention |
 

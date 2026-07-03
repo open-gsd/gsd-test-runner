@@ -9,10 +9,44 @@ This page summarizes the recent releases so you can quickly decide what to adopt
 - `v1.3.2`: per-bench container platform pinning (`linux/amd64`, `linux/arm64`, etc.)
 - `v1.4.0`: run-and-die for coding agents — the `gsd-test run` handoff, a one-command installer, and non-blocking `--async`/`wait`/`status`
 - `v1.5.0`: failure-first output — a quiet-by-default stream, a loud machine-readable verdict, and saved `FAILURES.md` / `failures.json` / `junit.xml` artifacts; plus ephemeral run storage you opt out of with `--keep` or `[storage]`
+- `v1.6.0`: Node LTS matrix — test your project on every supported Node LTS line at once, fanned out across your Benches with per-Bench concurrency
 
 ## Unreleased
 
 _Nothing yet — changes land here before the next tagged release._
+
+## v1.6.0
+
+### Added
+
+- **A Node.js version axis.** `gsd-test` now tests each OS against more than one Node major at once. Add a `[node]` table to `config.toml` (`linux = ["22", "24"]`) or pass `--node 22,24`; absent config, it uses the currently-supported Node LTS lines. Each `(OS, Node)` pair is a **cell** with its own live stream (`linux-node22`, `linux-node24`), its own row in the verdict's `per_os`, and its own `<testsuite>` in `junit.xml` (issue #108, [ADR-0024](adr/0024-node-matrix-tester-images.md)).
+- **Tester Images per Node LTS major.** Images are published per major with a node-suffixed tag — `ghcr.io/open-gsd/gsd-tester-linux:v1.6.0-node22` — and carry a companion `sh.gsd-test.node-major` sentinel label. The Active-LTS major additionally keeps the plain `:v1.6.0` / `:latest` tags, so existing single-version configs keep resolving unchanged.
+- **Fan-out across Benches with per-Bench concurrency.** Cells are dispatched, not statically pinned: all cells for an OS are pulled from a shared queue by whichever eligible Benches have free capacity, so a bigger Bench takes more work automatically (least-loaded, no tuning). A new per-Bench `capacity` field caps concurrent containers; leave it unset and `gsd-test` uses the Bench's own CPU count, so a capable Bench runs several cells side by side out of the box (issue #108, [ADR-0025](adr/0025-capacity-aware-fanout-scheduler.md)).
+
+### Why it matters
+
+A suite that passes on Node 22 can break on Node 24 — API removals, V8 changes, `node:test` runner changes. Before v1.6.0 you exercised exactly one Node line and found out about the others in production. Now one `gsd-test` run covers every supported LTS line, and because the cells fan out across your Benches in parallel, widening the matrix spends your hardware instead of your wall-clock. Nothing changes for anyone who does not opt in: absent `[node]` and `capacity`, a run behaves exactly as it did in v1.5.0.
+
+### Example
+
+```toml
+# config.toml
+[node]
+linux = ["22", "24"]
+
+[[benches]]
+name = "lab-rig-1"
+host = "lab-rig-1"
+os   = "linux"
+capacity = 6        # run up to 6 cells at once; unset = the Bench's CPU count
+```
+
+```bash
+gsd-test                    # runs linux-node22 and linux-node24, fanned out
+gsd-test --node 24          # this run: Node 24 only, every target OS
+```
+
+The verdict's `per_os` and the saved `junit.xml` report each `(OS, Node)` cell separately. See [The Node version matrix](node-matrix.md) for the full picture.
 
 ## v1.5.0
 

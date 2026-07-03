@@ -18,11 +18,11 @@ Run your Node test suite across Linux, Windows, and macOS in parallel — on har
 
 ```bash
 # 1. Install (macOS arm64 example — see docs/installation.md for all platforms)
-GSD_TEST_VERSION=v1.5.0
+GSD_TEST_VERSION=v1.6.0
 curl -L -o gsd-test \
   "https://github.com/open-gsd/gsd-test-runner/releases/download/${GSD_TEST_VERSION}/gsd-test-${GSD_TEST_VERSION}-darwin-arm64"
 chmod +x gsd-test && mv gsd-test ~/.local/bin/
-gsd-test --version   # → v1.5.0
+gsd-test --version   # → v1.6.0
 
 # 2. Configure a Bench (a remote machine you SSH to with Docker installed)
 mkdir -p ~/.config/gsd-test
@@ -36,7 +36,7 @@ host = "lab-rig-1.local"
 os = "linux"
 
 [versions]
-linux = "v1.5.0"
+linux = "v1.6.0"
 EOF
 
 # 3. Run your tests
@@ -66,6 +66,12 @@ Run-and-die (containerised `node --test` for coding agents):
 - **[Tutorial: Your First Run-and-die Run](docs/run-and-die-tutorial.md)** — Submit a run and watch a runaway test get reaped
 - **[Run-and-die How-to Guides](docs/run-and-die-how-to.md)** — Install the agent hooks, verify the handoff, dispatch tests with `gsd-test run` (blocking or async), tune the budget, find the bugged test
 - **[Run-and-die Reference](docs/run-and-die-reference.md)** — `gsd-test run`, `--async`/`wait`/`status`, `install-agent-hooks`, run spec, result envelope, labels, telemetry
+
+Node version matrix (test every supported Node LTS line, fanned out across your Benches):
+
+- **[The Node version matrix](docs/node-matrix.md)** — Why one Node line is not enough, what a cell is, how cells fan out
+- **[Node matrix How-to Guides](docs/node-matrix-how-to.md)** — Test several Node versions, tune Bench capacity, read per-cell results, move with the LTS schedule
+- **[Node matrix Reference](docs/node-matrix-reference.md)** — The `[node]` table, `capacity`, `--node`, cell identity, image tags, exit codes
 
 ## How it Works (30-second version)
 
