@@ -208,6 +208,12 @@ type Report struct {
 	// OS is the Bench.OS value ("linux", "windows", "macos-container").
 	OS string `json:"os"`
 
+	// NodeMajor is the Node.js major version this run tested against (e.g.
+	// "22") — the second matrix axis alongside OS (enhancement #108). Empty
+	// for legacy single-Node runs; set by the Pipeline from its job's node
+	// major. Use StreamKey/Label (below) to derive display + aggregation keys.
+	NodeMajor string `json:"node_major,omitempty"`
+
 	// Bench is the Bench.Name (e.g. "bench-linux-1").
 	Bench string `json:"bench"`
 
@@ -243,6 +249,27 @@ type Report struct {
 
 	// Failures holds one entry per failing test. Populated by the Parse leg.
 	Failures []FailedTest `json:"failures"`
+}
+
+// StreamKey is the stable per-cell identity for an (os, nodeMajor) run, used
+// to key renderer streams and per-cell aggregation. Returns "linux" when
+// nodeMajor is empty (legacy single-Node), "linux-node22" otherwise. The
+// caller computes this before a Report exists (at dispatch time), so it is a
+// free function rather than a method.
+func StreamKey(os, nodeMajor string) string {
+	if nodeMajor == "" {
+		return os
+	}
+	return os + "-node" + nodeMajor
+}
+
+// Label is the human-facing name for an (os, nodeMajor) cell, e.g.
+// "linux (node 22)" or just "linux" for a legacy single-Node run.
+func Label(os, nodeMajor string) string {
+	if nodeMajor == "" {
+		return os
+	}
+	return os + " (node " + nodeMajor + ")"
 }
 
 // New constructs a Report with SchemaVersion=2 and all run-context fields

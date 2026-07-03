@@ -1,5 +1,10 @@
 # syntax=docker/dockerfile:1.7
-FROM node:22-bookworm-slim
+
+# NODE_VERSION selects the Node major baked into this image (Slice 1 of
+# enhancement #108). Must be declared before FROM to be usable there.
+# Default stays 22 so a plain `docker build` is unaffected.
+ARG NODE_VERSION=22
+FROM node:${NODE_VERSION}-bookworm-slim
 
 # Per ADR-0011: sh.gsd-test.image-version label is the sentinel. The version
 # tag is injected at build time. Build with:
@@ -8,7 +13,13 @@ FROM node:22-bookworm-slim
 #     -t ghcr.io/open-gsd/gsd-tester-linux:v1.4.0 .
 # (The label can also be set via LABEL instruction with ARG injection — see below.)
 ARG IMAGE_VERSION=dev
+# Re-declare NODE_VERSION post-FROM: ARGs above FROM don't survive into the
+# build stage automatically.
+ARG NODE_VERSION
 LABEL sh.gsd-test.image-version=$IMAGE_VERSION
+# Companion sentinel to image-version (mirrors ADR-0011): records the Node
+# major this image was built with, so consumers can select/verify by major.
+LABEL sh.gsd-test.node-major=$NODE_VERSION
 LABEL org.opencontainers.image.source="https://github.com/open-gsd/gsd-test-runner"
 LABEL org.opencontainers.image.description="gsd-test Tester Image (Linux)"
 

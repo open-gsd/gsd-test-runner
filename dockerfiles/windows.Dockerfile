@@ -4,14 +4,30 @@
 FROM mcr.microsoft.com/windows/servercore:ltsc2022
 
 ARG IMAGE_VERSION=dev
+# NODE_VERSION selects the Node major baked into this image (Slice 1 of
+# enhancement #108). Default stays 22 so a plain `docker build` is unaffected.
+ARG NODE_VERSION=22
 LABEL sh.gsd-test.image-version=$IMAGE_VERSION
+# Companion sentinel to image-version (mirrors ADR-0011): records the Node
+# major this image was built with, so consumers can select/verify by major.
+LABEL sh.gsd-test.node-major=$NODE_VERSION
 LABEL org.opencontainers.image.source="https://github.com/open-gsd/gsd-test-runner"
 LABEL org.opencontainers.image.description="gsd-test Tester Image (Windows)"
 
-# Install Node 22 (Windows MSI install). PowerShell-based fetch.
+# Install Node (Windows MSI install), resolved to the latest patch release
+# for NODE_VERSION's major at build time. PowerShell-based fetch.
 SHELL ["powershell", "-Command", "$ErrorActionPreference = 'Stop'; $ProgressPreference = 'SilentlyContinue';"]
 
-RUN $url = 'https://nodejs.org/dist/v22.11.0/node-v22.11.0-x64.msi'; \
+# Re-declare NODE_VERSION here: ARG scope doesn't cross the intervening
+# SHELL instruction implicitly for this RUN's $env: lookup, and RUN needs
+# the ARG in-scope to expose it as an environment variable.
+ARG NODE_VERSION
+RUN $index = Invoke-RestMethod -UseBasicParsing -Uri 'https://nodejs.org/dist/index.json'; \
+    $match = $index | Where-Object { $_.version -like "v$env:NODE_VERSION.*" } | Select-Object -First 1; \
+    if (-not $match) { Write-Error "No Node release found for major version $env:NODE_VERSION"; exit 1 }; \
+    $ver = $match.version; \
+    Write-Host "Resolved Node $env:NODE_VERSION -> $ver"; \
+    $url = "https://nodejs.org/dist/$ver/node-$ver-x64.msi"; \
     Invoke-WebRequest -UseBasicParsing -Uri $url -OutFile node.msi; \
     Start-Process msiexec.exe -ArgumentList '/i', 'node.msi', '/quiet', '/norestart' -Wait; \
     Remove-Item node.msi

@@ -82,15 +82,18 @@ func JUnitFromReports(reps []report.Report) ([]byte, error) {
 	sorted := make([]report.Report, len(reps))
 	copy(sorted, reps)
 	sort.SliceStable(sorted, func(i, j int) bool {
-		if sorted[i].OS != sorted[j].OS {
-			return sorted[i].OS < sorted[j].OS
+		ki, kj := report.StreamKey(sorted[i].OS, sorted[i].NodeMajor), report.StreamKey(sorted[j].OS, sorted[j].NodeMajor)
+		if ki != kj {
+			return ki < kj
 		}
 		return sorted[i].Bench < sorted[j].Bench
 	})
 
 	root := junitTestsuites{Name: "gsd-test"}
 	for _, rep := range sorted {
-		name := rep.OS
+		// One testsuite per (OS, NodeMajor) cell (enhancement #108); StreamKey
+		// collapses to rep.OS for legacy single-Node reports.
+		name := report.StreamKey(rep.OS, rep.NodeMajor)
 		if name == "" {
 			name = rep.Bench
 		}

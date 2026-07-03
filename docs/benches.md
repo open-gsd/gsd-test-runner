@@ -205,7 +205,7 @@ See [Configuration Reference](configuration.md) for all available fields.
 
 ## Multiple Benches per OS
 
-You can list more than one Bench for the same OS. `gsd-test` round-robins across them per invocation:
+You can list more than one Bench for the same OS. When exactly one Bench is eligible for an OS, `gsd-test` uses it directly. When more than one Bench is eligible for the same OS, selection is **capacity-aware pull**, not plain round-robin: candidate Benches pull work from a shared per-OS queue, so a higher-capacity or faster Bench naturally drains more of the queue without any explicit load tracking. See [ADR-0025](adr/0025-capacity-aware-fanout-scheduler.md) for the full design; ADR-0016 still governs which Benches are *eligible* (Pin/Exclude filtering) for an OS in the first place.
 
 ```toml
 [[benches]]
@@ -221,13 +221,23 @@ os   = "linux"
 
 To always use a specific Bench, pass **`--bench <name>`** on the command line or set `defaults.pin` in `config.toml`. To exclude a Bench from selection, pass **`--exclude <name>`**.
 
+## Node.js version matrix and fan-out
+
+Every run tests each target OS against one or more Node.js major versions — an **(OS × Node) cell**. `linux` with `["22", "24"]` configured produces two cells, `linux-node22` and `linux-node24`, each running its own Tester container.
+
+Which majors run on which OS is controlled by the `[node]` table in `config.toml` (see [Configuration Reference](configuration.md#node)); if an OS is absent from `[node]`, `gsd-test` falls back to the currently-supported Node LTS majors. Pass **`--node <majors>`** on the command line to override the Node set for every target OS for that invocation, ignoring both `[node]` and the LTS default.
+
+Cells are dispatched, not statically assigned: all (OS × Node) cells for a given OS are pulled from a shared queue by whichever eligible Benches for that OS have free capacity, so cells spread across all matching Benches rather than being pinned to one Bench per cell. A Bench's `capacity` (see the `[[benches]]` reference below) bounds how many containers it runs concurrently; leaving `capacity` unset lets `gsd-test` probe the Bench's own CPU count and use that as the default, so a capable multi-core Bench runs several containers side by side automatically. Set `capacity` explicitly on a Bench that also does other work, to avoid oversubscribing it.
+
+Each Tester Image is published per (OS × Node major) — see the tag-suffix note in the mapping table below and [ADR-0024](adr/0024-node-matrix-tester-images.md) for the full design.
+
 ## OS-to-Image mapping
 
 | `os` value | Image | Runtime | Notes |
 |------------|-------|---------|-------|
-| `linux` | `ghcr.io/open-gsd/gsd-tester-linux` | `docker` | |
-| `windows` | `ghcr.io/open-gsd/gsd-tester-windows` | `docker` | requires Windows host |
-| `macos` | `ghcr.io/open-gsd/gsd-tester-macos` (alias of linux) | `docker` | Mac host running Docker Desktop or colima; tests Linux behavior |
+| `linux` | `ghcr.io/open-gsd/gsd-tester-linux` | `docker` | non-default Node majors are published with a `-node<major>` tag suffix (e.g. `:v1.5.0-node22`); the Active LTS major also gets the plain `:<version>` tag |
+| `windows` | `ghcr.io/open-gsd/gsd-tester-windows` | `docker` | requires Windows host; same `-node<major>` tag suffix convention |
+| `macos` | `ghcr.io/open-gsd/gsd-tester-macos` (alias of linux) | `docker` | Mac host running Docker Desktop or colima; tests Linux behavior; same `-node<major>` tag suffix convention |
 
 ## Probing Bench reachability
 

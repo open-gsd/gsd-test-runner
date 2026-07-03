@@ -20,34 +20,37 @@ func makeSelector(registry []bench.Bench) *bench.Selector {
 	return s
 }
 
-// makeCfg is a test helper that builds a minimal *config.Config.
-func makeCfg(versions map[string]string, registry []bench.Bench) *config.Config {
+// makeCfg is a test helper that builds a minimal *config.Config. node may be
+// nil (then NodeVersionsFor falls back to DefaultNodeLTS()).
+func makeCfg(versions map[string]string, registry []bench.Bench, node map[string][]string) *config.Config {
 	return &config.Config{
 		Registry: registry,
 		Versions: versions,
+		Node:     node,
 	}
 }
 
 func TestBuild_NilConfig(t *testing.T) {
 	sel := makeSelector([]bench.Bench{{Name: "b1", Host: "local", OS: "linux"}})
-	_, err := Build(nil, sel, []string{"linux"})
+	_, err := Build(nil, sel, []string{"linux"}, nil)
 	if err == nil {
 		t.Fatal("expected error for nil cfg, got nil")
 	}
 }
 
 func TestBuild_NilSelector(t *testing.T) {
-	cfg := makeCfg(map[string]string{"linux": "v1.0"}, nil)
-	_, err := Build(cfg, nil, []string{"linux"})
+	cfg := makeCfg(map[string]string{"linux": "v1.0"}, nil, nil)
+	_, err := Build(cfg, nil, []string{"linux"}, nil)
 	if err == nil {
 		t.Fatal("expected error for nil selector, got nil")
 	}
 }
 
 func TestBuild_EmptyTargets(t *testing.T) {
-	cfg := makeCfg(map[string]string{"linux": "v1.0"}, []bench.Bench{{Name: "b1", OS: "linux"}})
-	sel := makeSelector([]bench.Bench{{Name: "b1", OS: "linux"}})
-	p, err := Build(cfg, sel, []string{})
+	registry := []bench.Bench{{Name: "b1", OS: "linux"}}
+	cfg := makeCfg(map[string]string{"linux": "v1.0"}, registry, nil)
+	sel := makeSelector(registry)
+	p, err := Build(cfg, sel, []string{}, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -59,12 +62,14 @@ func TestBuild_EmptyTargets(t *testing.T) {
 	}
 }
 
-func TestBuild_SingleOSHappyPath(t *testing.T) {
+// TestBuild_SingleOSSingleNode exercises the happy path with the Node axis
+// pinned to one major (via override) so exactly one Run is produced.
+func TestBuild_SingleOSSingleNode(t *testing.T) {
 	registry := []bench.Bench{{Name: "bench-linux-1", Host: "local", OS: "linux"}}
-	cfg := makeCfg(map[string]string{"linux": "v1.0"}, registry)
+	cfg := makeCfg(map[string]string{"linux": "v1.0"}, registry, nil)
 	sel := makeSelector(registry)
 
-	p, err := Build(cfg, sel, []string{"linux"})
+	p, err := Build(cfg, sel, []string{"linux"}, []string{"22"})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -79,15 +84,99 @@ func TestBuild_SingleOSHappyPath(t *testing.T) {
 	if r.OS != "linux" {
 		t.Errorf("Run.OS: got %q, want %q", r.OS, "linux")
 	}
-	wantImageID := images.ImageID("ghcr.io/open-gsd/gsd-tester-linux")
+	if r.NodeMajor != "22" {
+		t.Errorf("Run.NodeMajor: got %q, want %q", r.NodeMajor, "22")
+	}
+	// ImageID is the node-suffixed, fully-qualified tag.
+	wantImageID := images.ImageID("ghcr.io/open-gsd/gsd-tester-linux:v1.0-node22")
 	if r.ImageID != wantImageID {
 		t.Errorf("Run.ImageID: got %q, want %q", r.ImageID, wantImageID)
 	}
+	// Version stays the un-suffixed image-version sentinel.
 	if r.Version != "v1.0" {
 		t.Errorf("Run.Version: got %q, want %q", r.Version, "v1.0")
 	}
-	if r.Bench.Name != "bench-linux-1" {
-		t.Errorf("Run.Bench.Name: got %q, want %q", r.Bench.Name, "bench-linux-1")
+}
+
+// TestBuild_NodeCrossProduct: with two configured Node majors and no override,
+// Build emits one Run per (OS × Node) cell.
+func TestBuild_NodeCrossProduct(t *testing.T) {
+	registry := []bench.Bench{{Name: "bench-linux-1", OS: "linux"}}
+	cfg := makeCfg(map[string]string{"linux": "v1.0"}, registry, map[string][]string{"linux": {"22", "24"}})
+	sel := makeSelector(registry)
+
+	p, err := Build(cfg, sel, []string{"linux"}, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(p.Runs) != 2 {
+		t.Fatalf("expected 2 Runs (linux×{22,24}), got %d", len(p.Runs))
+	}
+	got := map[string]images.ImageID{}
+	for _, r := range p.Runs {
+		if r.OS != "linux" {
+			t.Errorf("Run.OS = %q, want linux", r.OS)
+		}
+		got[r.NodeMajor] = r.ImageID
+	}
+	want := map[string]images.ImageID{
+		"22": "ghcr.io/open-gsd/gsd-tester-linux:v1.0-node22",
+		"24": "ghcr.io/open-gsd/gsd-tester-linux:v1.0-node24",
+	}
+	for major, wantID := range want {
+		if got[major] != wantID {
+			t.Errorf("major %s: ImageID = %q, want %q", major, got[major], wantID)
+		}
+	}
+}
+
+// TestBuild_NodeOverrideAppliesToAllOSes: the --node override replaces the
+// per-OS configured majors for every target OS.
+func TestBuild_NodeOverrideAppliesToAllOSes(t *testing.T) {
+	registry := []bench.Bench{
+		{Name: "bench-linux-1", OS: "linux"},
+		{Name: "bench-windows-1", OS: "windows"},
+	}
+	cfg := makeCfg(map[string]string{"linux": "v1.0", "windows": "v2.0"}, registry,
+		map[string][]string{"linux": {"18", "20", "22"}}) // override must win over this
+	sel := makeSelector(registry)
+
+	p, err := Build(cfg, sel, []string{"linux", "windows"}, []string{"22"})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(p.Runs) != 2 {
+		t.Fatalf("expected 2 Runs (2 OSes × 1 override major), got %d", len(p.Runs))
+	}
+	for _, r := range p.Runs {
+		if r.NodeMajor != "22" {
+			t.Errorf("Run[%s].NodeMajor = %q, want 22 (override)", r.OS, r.NodeMajor)
+		}
+	}
+}
+
+// TestBuild_DefaultLTSWhenNodeAbsent: no [node] config and no override →
+// Build uses config.DefaultNodeLTS().
+func TestBuild_DefaultLTSWhenNodeAbsent(t *testing.T) {
+	registry := []bench.Bench{{Name: "bench-linux-1", OS: "linux"}}
+	cfg := makeCfg(map[string]string{"linux": "v1.0"}, registry, nil)
+	sel := makeSelector(registry)
+
+	p, err := Build(cfg, sel, []string{"linux"}, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(p.Runs) != len(config.DefaultNodeLTS()) {
+		t.Fatalf("expected %d Runs (default LTS), got %d", len(config.DefaultNodeLTS()), len(p.Runs))
+	}
+	wantMajors := map[string]bool{}
+	for _, m := range config.DefaultNodeLTS() {
+		wantMajors[m] = true
+	}
+	for _, r := range p.Runs {
+		if !wantMajors[r.NodeMajor] {
+			t.Errorf("unexpected NodeMajor %q not in DefaultNodeLTS()", r.NodeMajor)
+		}
 	}
 }
 
@@ -102,11 +191,12 @@ func TestBuild_MultipleOSes(t *testing.T) {
 		"windows": "v2.0",
 		"macos":   "v3.0",
 	}
-	cfg := makeCfg(versions, registry)
+	cfg := makeCfg(versions, registry, nil)
 	sel := makeSelector(registry)
 	targets := []string{"linux", "windows", "macos"}
 
-	p, err := Build(cfg, sel, targets)
+	// Pin one major so we get exactly one Run per OS.
+	p, err := Build(cfg, sel, targets, []string{"22"})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -133,10 +223,10 @@ func TestBuild_MultipleOSes(t *testing.T) {
 func TestBuild_OSMissingFromVersions(t *testing.T) {
 	registry := []bench.Bench{{Name: "b1", OS: "linux"}}
 	// No "linux" in versions
-	cfg := makeCfg(map[string]string{}, registry)
+	cfg := makeCfg(map[string]string{}, registry, nil)
 	sel := makeSelector(registry)
 
-	p, err := Build(cfg, sel, []string{"linux"})
+	p, err := Build(cfg, sel, []string{"linux"}, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -158,10 +248,10 @@ func TestBuild_OSMissingFromVersions(t *testing.T) {
 func TestBuild_NoBenchForOS(t *testing.T) {
 	// Selector has no bench for "windows"
 	registry := []bench.Bench{{Name: "b1", OS: "linux"}}
-	cfg := makeCfg(map[string]string{"windows": "v1.0"}, registry)
+	cfg := makeCfg(map[string]string{"windows": "v1.0"}, registry, nil)
 	sel := makeSelector(registry)
 
-	p, err := Build(cfg, sel, []string{"windows"})
+	p, err := Build(cfg, sel, []string{"windows"}, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -180,63 +270,33 @@ func TestBuild_NoBenchForOS(t *testing.T) {
 	}
 }
 
-// erringSelectorStub is a Selector whose Pick always returns a non-NoBenchForOSError.
-// We can't use bench.Selector directly for this since Pick is a method.
-// Instead we test via a custom error returned by Pick on a real Selector
-// wrapped in a thin shim.
-//
-// Because bench.Selector.Pick is a method on a concrete type, we need a
-// different mechanism. We'll test by constructing a PinExcludeConflictError
-// scenario that we inject via a wrapper. Since we can't substitute the
-// selector, we test via an indirect path: Build must propagate unknown
-// selector errors up. We achieve this by patching the Pick function variable
-// approach — but bench.Selector is concrete. Instead, we accept that the
-// test exercises the error-propagation path by using a minimal fake.
+// TestBuild_NoBenchSkipsBeforeCrossProduct: an OS with no bench produces exactly
+// one skip regardless of how many Node majors are configured (the bench check
+// precedes the Node cross-product).
+func TestBuild_NoBenchSkipsBeforeCrossProduct(t *testing.T) {
+	registry := []bench.Bench{{Name: "b1", OS: "linux"}}
+	cfg := makeCfg(map[string]string{"windows": "v1.0"}, registry, map[string][]string{"windows": {"22", "24"}})
+	sel := makeSelector(registry)
 
-// fakeSelector wraps the interface of bench.Selector for test injection.
-// plan.Build takes *bench.Selector, so to test the "other error" path we
-// need to trigger it through the real Selector. We rely on the fact that
-// PinnedBenchNotInRegistryError is never returned by Pick — only
-// PinExcludeConflictError from NewSelector and PinnedBenchNotInRegistryError
-// from NewSelector. Pick only returns NoBenchForOSError.
-//
-// To cover the "unexpected error" branch we refactor the test to use a
-// different strategy: we verify that for a NoBenchForOSError, the error
-// IS classified; the "other error" path in Build handles any error that
-// is NOT *bench.NoBenchForOSError. Since bench.Selector.Pick only ever
-// returns *bench.NoBenchForOSError, we test that branch exists via code
-// review; we mark it with a compile-time reachability guard below.
-
-func TestBuild_SelectorOtherError(t *testing.T) {
-	// To exercise the "unexpected error" branch we need a selector that
-	// returns a non-NoBenchForOSError from Pick. bench.Selector.Pick only
-	// returns NoBenchForOSError, so we use the buildWithPickFn test hook
-	// instead — but Build takes a *bench.Selector.
-	//
-	// Strategy: we expose buildWithPickFn as an internal test helper that
-	// accepts a pick function. We call it directly since we're in the same package.
-	cfg := makeCfg(map[string]string{"linux": "v1.0"}, nil)
-	unexpectedErr := errors.New("unexpected infrastructure failure")
-	pickFn := func(os string) (bench.Bench, error) {
-		return bench.Bench{}, unexpectedErr
+	p, err := Build(cfg, sel, []string{"windows"}, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
 	}
-
-	_, err := buildWithPickFn(cfg, pickFn, []string{"linux"})
-	if err == nil {
-		t.Fatal("expected error for unexpected selector error, got nil")
+	if len(p.Runs) != 0 {
+		t.Errorf("expected 0 Runs, got %d", len(p.Runs))
 	}
-	if !errors.Is(err, unexpectedErr) {
-		t.Errorf("expected error to wrap unexpectedErr, got: %v", err)
+	if len(p.Skipped) != 1 {
+		t.Fatalf("expected exactly 1 Skipped (not one per node major), got %d", len(p.Skipped))
 	}
 }
 
 func TestBuild_MixedSuccessAndSkip(t *testing.T) {
 	registry := []bench.Bench{{Name: "bench-linux-1", OS: "linux"}}
 	// "macos" has no version entry
-	cfg := makeCfg(map[string]string{"linux": "v1.0"}, registry)
+	cfg := makeCfg(map[string]string{"linux": "v1.0"}, registry, nil)
 	sel := makeSelector(registry)
 
-	p, err := Build(cfg, sel, []string{"linux", "macos"})
+	p, err := Build(cfg, sel, []string{"linux", "macos"}, []string{"22"})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -261,7 +321,7 @@ func TestAddUnreachable_AddsSkipReasonsForUnreachableOSes(t *testing.T) {
 	// Plan: linux is ok (1 Run), macos has a NoBenchForOS skip
 	p := &Plan{
 		Runs: []Run{
-			{OS: "linux", Bench: bench.Bench{Name: "bench-linux-1", OS: "linux"}},
+			{OS: "linux", NodeMajor: "22"},
 		},
 		Skipped: []SkipReason{
 			{OS: "macos", Reason: SkipReasonNoBenchForOS, Detail: "no bench"},

@@ -23,9 +23,14 @@ type Config struct {
 	Unreachable []UnreachableBench // populated only when --probe-benches
 	Targets     []string           // default target OSes from config
 	Versions    map[string]string  // OS -> expected image version
-	Defaults    Defaults
-	Testing     Testing
-	Storage     Storage
+
+	// Node maps OS -> the Node major versions to test against, e.g.
+	// {"linux": ["22","24"]}. Empty/absent for an OS -> DefaultNodeLTS().
+	Node map[string][]string
+
+	Defaults Defaults
+	Testing  Testing
+	Storage  Storage
 }
 
 // Storage controls run-artifact retention (#102 Option C).
@@ -40,6 +45,23 @@ type Storage struct {
 type UnreachableBench struct {
 	Bench bench.Bench
 	Cause error
+}
+
+// DefaultNodeLTS returns the Node major versions tested when an OS has no
+// explicit [node] entry. These are the currently-supported Node LTS lines
+// (see https://github.com/nodejs/Release); bump as the schedule moves.
+func DefaultNodeLTS() []string { return []string{"22", "24"} }
+
+// NodeVersionsFor returns the configured Node majors for os, or
+// DefaultNodeLTS() when none are configured.
+func (c *Config) NodeVersionsFor(os string) []string {
+	majors := c.Node[os]
+	if len(majors) == 0 {
+		return DefaultNodeLTS()
+	}
+	out := make([]string, len(majors))
+	copy(out, majors)
+	return out
 }
 
 // Defaults are CLI flag defaults parsed from the config file.
@@ -68,16 +90,17 @@ type LoadOptions struct {
 // rawConfig is the on-disk TOML shape, distinct from the validated Config.
 // Lets us validate + transform after parsing.
 type rawConfig struct {
-	Defaults rawDefaults       `toml:"defaults"`
-	Benches  []rawBench        `toml:"benches"`
-	Versions map[string]string `toml:"versions"`
-	Testing  rawTesting        `toml:"testing"`
-	Storage  rawStorage        `toml:"storage"`
+	Defaults rawDefaults         `toml:"defaults"`
+	Benches  []rawBench          `toml:"benches"`
+	Versions map[string]string   `toml:"versions"`
+	Node     map[string][]string `toml:"node"`
+	Testing  rawTesting          `toml:"testing"`
+	Storage  rawStorage          `toml:"storage"`
 }
 
 type rawStorage struct {
 	KeepArtifacts bool   `toml:"keep_artifacts"`
-	ArtifactTTL   string `toml:"artifact_ttl"`  // Go duration string, e.g. "24h"; "" = default, "0" = disabled
+	ArtifactTTL   string `toml:"artifact_ttl"`   // Go duration string, e.g. "24h"; "" = default, "0" = disabled
 	KeepLastRuns  int    `toml:"keep_last_runs"` // 0 = disabled (use default 10)
 }
 
@@ -93,6 +116,7 @@ type rawBench struct {
 	OS       string `toml:"os"`
 	Runtime  string `toml:"runtime,omitempty"`  // "docker" (default; all benches today) | "container" (reserved for future Apple Containers)
 	Platform string `toml:"platform,omitempty"` // optional OCI platform override, e.g. "linux/amd64"
+	Capacity int    `toml:"capacity,omitempty"` // max concurrent Tester containers; 0 = unset (runner defaults to the Bench's NCPU, floored to 1)
 }
 
 type rawTesting struct {
@@ -188,12 +212,20 @@ func validateAndTransform(raw rawConfig) (*Config, error) {
 		// We don't constrain OS values here; future config-schema validation
 		// can add an allowlist when the supported set is finalized.
 
+		if rb.Capacity < 0 {
+			return nil, &InvalidConfigError{
+				Section: fmt.Sprintf("benches[%d]", i),
+				Reason:  fmt.Sprintf("bench %q: capacity must be >= 0", rb.Name),
+			}
+		}
+
 		registry = append(registry, bench.Bench{
 			Name:     rb.Name,
 			Host:     rb.Host, // empty is fine — means local
 			OS:       rb.OS,
 			Runtime:  rb.Runtime, // empty defaults to "docker" via bench.RuntimeBin()
 			Platform: rb.Platform,
+			Capacity: rb.Capacity, // 0 = unset; the scheduler defaults it to the Bench's NCPU (floored to 1)
 		})
 	}
 	command, err := parseTestingCommand(raw.Testing.Command)
@@ -202,6 +234,10 @@ func validateAndTransform(raw rawConfig) (*Config, error) {
 			Section: "testing.command",
 			Reason:  err.Error(),
 		}
+	}
+
+	if err := validateNode(raw.Node); err != nil {
+		return nil, err
 	}
 
 	storage, err := transformStorage(raw.Storage)
@@ -213,6 +249,7 @@ func validateAndTransform(raw rawConfig) (*Config, error) {
 		Registry: registry,
 		Targets:  raw.Defaults.Targets,
 		Versions: raw.Versions,
+		Node:     raw.Node,
 		Defaults: Defaults{
 			Targets: raw.Defaults.Targets,
 			Pin:     raw.Defaults.Pin,
@@ -260,6 +297,41 @@ func transformStorage(raw rawStorage) (Storage, error) {
 		ArtifactTTL:   ttl,
 		KeepLastRuns:  keepLastRuns,
 	}, nil
+}
+
+// validateNode validates the [node] table: OS keys must be one of the
+// supported OS families, majors must be all-digit strings, and majors must
+// not repeat within a single OS's list.
+func validateNode(node map[string][]string) error {
+	for os, majors := range node {
+		switch os {
+		case "linux", "windows", "macos":
+			// ok
+		default:
+			return &InvalidConfigError{
+				Section: "node",
+				Reason:  fmt.Sprintf("[node]: unknown OS key %q", os),
+			}
+		}
+
+		seen := make(map[string]bool, len(majors))
+		for _, major := range majors {
+			if major == "" || strings.IndexFunc(major, func(r rune) bool { return r < '0' || r > '9' }) != -1 {
+				return &InvalidConfigError{
+					Section: "node",
+					Reason:  fmt.Sprintf("[node] %s: invalid Node major %q (must be digits)", os, major),
+				}
+			}
+			if seen[major] {
+				return &InvalidConfigError{
+					Section: "node",
+					Reason:  fmt.Sprintf("[node] %s: duplicate Node major %q", os, major),
+				}
+			}
+			seen[major] = true
+		}
+	}
+	return nil
 }
 
 func parseTestingCommand(raw any) ([]string, error) {

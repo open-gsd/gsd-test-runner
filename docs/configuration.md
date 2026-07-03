@@ -23,6 +23,7 @@ mkdir -p ~/.config/gsd-test
 | `[defaults]` | Table | Default values for CLI flags |
 | `[[benches]]` | Table-array | One entry per Bench |
 | `[versions]` | Table | OS-to-image-version mapping |
+| `[node]` | Table | OS-to-Node-major-versions mapping |
 | `[testing]` | Table | Optional test command override for RunTests leg |
 | `[storage]` | Table | Run-artifact retention policy |
 
@@ -76,6 +77,7 @@ Each `[[benches]]` block declares one Bench. All fields in a single block descri
 | `os` | `string` | **Yes** | — | Target OS this Bench provides. One of `"linux"`, `"windows"`, `"macos"`. |
 | `runtime` | `string` | No | `"docker"` | Container runtime. `"docker"` is the default for all Benches today (Linux, Windows, and macOS). `"container"` is reserved for future Apple Containers support (requires macOS 26; not usable today — see ADR-0020). |
 | `platform` | `string` | No | `""` | Optional OCI platform pin for `docker run`, e.g. `"linux/amd64"` or `"linux/arm64"`. |
+| `capacity` | `int` | No | `0` | Max number of Tester containers this Bench runs concurrently. `0` means unset; when unset, `gsd-test` probes the Bench's own daemon (`docker info -f '{{.NCPU}}'`) once per run and uses its CPU count, floored to `1` if the probe fails. Set explicitly on Benches doing other work, to avoid oversubscribing them; set higher on dedicated Benches with more cores/RAM to run several containers at once. |
 
 ### `name`
 
@@ -139,6 +141,24 @@ windows = "v1.0.0"
 ```
 
 You must add a `[versions]` entry for every OS in `defaults.targets`. If an OS has no version entry, `plan.Build` skips it with reason `no_image_version`.
+
+## `[node]`
+
+A map from OS name to the list of Node.js major versions to test against on that OS.
+
+| Key | Type | Required | Default |
+|-----|------|----------|---------|
+| `<os>` | `[]string` | No | supported Node LTS majors (currently `["22", "24"]`) |
+
+```toml
+[node]
+linux   = ["22", "24"]
+windows = ["22"]
+```
+
+If an OS is absent from `[node]` (or `[node]` is omitted entirely), `gsd-test` falls back to `config.DefaultNodeLTS()` — the currently-supported Node LTS lines. Each entry must be one of `"linux"`, `"windows"`, or `"macos"`; each version must be digits only (e.g. `"22"`, not `"v22"` or `"latest"`); and a version may not repeat within one OS's list. The `--node` CLI flag overrides this table (and the LTS default) for every target OS in that invocation — see [CLI flags](#cli-flags) below.
+
+`gsd-test` runs one Tester Image per (OS × Node major) cell; each cell uses the Tester Image published for that OS and Node major (tag suffix `-node<major>`, e.g. `gsd-tester-linux:v1.5.0-node22`). See [Setting up Benches](benches.md#nodejs-version-matrix-and-fan-out) for how cells are dispatched across Benches.
 
 ## `[testing]`
 
@@ -213,6 +233,7 @@ CLI flags override the corresponding config values. Flags always take precedence
 |------|-----------|-------------|
 | `--config <path>` | — | Explicit config file path |
 | `--targets <os,...>` | `defaults.targets` | Comma-separated OS list |
+| `--node <majors>` | `[node]` (per OS) | Comma-separated Node.js majors (e.g. `22,24`); overrides `[node]` and the LTS default for every target OS in this invocation |
 | `--bench <name>` | `defaults.pin` | Pin to a specific Bench |
 | `--exclude <name,...>` | `defaults.exclude` | Comma-separated Bench names to exclude |
 | `--probe-benches` | — | Probe each Bench for reachability at startup |

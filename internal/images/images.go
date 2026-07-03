@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 
 	"github.com/open-gsd/gsd-test-runner/internal/bench"
@@ -25,6 +26,12 @@ type EnsurePresentOptions struct {
 	// FallbackContextDir is the build context directory passed to
 	// docker build. Required when FallbackDockerfile is set.
 	FallbackContextDir string
+	// FallbackBuildArgs are passed as `--build-arg K=V` to the fallback
+	// build. The Node matrix (enhancement #108) uses this to pass
+	// NODE_VERSION so a locally-built fallback image bakes the SAME Node
+	// major the pulled image would have — otherwise the fallback silently
+	// builds the Dockerfile's default major. Empty adds no build args.
+	FallbackBuildArgs map[string]string
 }
 
 // EnsurePresent guarantees that the named Tester Image is present on
@@ -116,7 +123,7 @@ func imagePresent(ctx context.Context, b bench.Bench, image string) (bool, error
 }
 
 func tryFallbackBuild(ctx context.Context, b bench.Bench, image ImageID, opts EnsurePresentOptions) error {
-	_, buildErr := dockerBuild(ctx, b, opts.FallbackDockerfile, opts.FallbackContextDir, string(image))
+	_, buildErr := dockerBuild(ctx, b, opts.FallbackDockerfile, opts.FallbackContextDir, string(image), opts.FallbackBuildArgs)
 	if buildErr == nil {
 		return nil
 	}
@@ -162,8 +169,20 @@ var (
 	dockerPull = func(ctx context.Context, b bench.Bench, image string) (string, error) {
 		return dockerexec.Run(ctx, b, []string{"pull", image})
 	}
-	dockerBuild = func(ctx context.Context, b bench.Bench, dockerfile, contextDir, tag string) (string, error) {
-		return dockerexec.Run(ctx, b, []string{"build", "-t", tag, "-f", dockerfile, contextDir})
+	dockerBuild = func(ctx context.Context, b bench.Bench, dockerfile, contextDir, tag string, buildArgs map[string]string) (string, error) {
+		args := []string{"build", "-t", tag, "-f", dockerfile}
+		// Deterministic --build-arg ordering (sorted keys) so the command is
+		// stable across runs and reproducible in logs/tests.
+		keys := make([]string, 0, len(buildArgs))
+		for k := range buildArgs {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
+			args = append(args, "--build-arg", k+"="+buildArgs[k])
+		}
+		args = append(args, contextDir)
+		return dockerexec.Run(ctx, b, args)
 	}
 )
 

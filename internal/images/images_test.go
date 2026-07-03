@@ -15,7 +15,7 @@ import (
 func stubAll(t *testing.T,
 	inspect func(ctx context.Context, b bench.Bench, image string) (string, error),
 	pull func(ctx context.Context, b bench.Bench, image string) (string, error),
-	build func(ctx context.Context, b bench.Bench, dockerfile, contextDir, tag string) (string, error),
+	build func(ctx context.Context, b bench.Bench, dockerfile, contextDir, tag string, buildArgs map[string]string) (string, error),
 ) {
 	t.Helper()
 	origI, origP, origB := dockerInspect, dockerPull, dockerBuild
@@ -81,7 +81,7 @@ func TestEnsurePresent_NotPresent_PullSucceeds(t *testing.T) {
 		func(_ context.Context, _ bench.Bench, _ string) (string, error) {
 			return "", nil
 		},
-		func(_ context.Context, _ bench.Bench, _, _, _ string) (string, error) {
+		func(_ context.Context, _ bench.Bench, _, _, _ string, _ map[string]string) (string, error) {
 			buildCalled = true
 			return "", nil
 		},
@@ -188,7 +188,7 @@ func TestEnsurePresent_PullNotFound_NoFallback_ReturnsPullNotFoundError(t *testi
 		func(_ context.Context, _ bench.Bench, _ string) (string, error) {
 			return "", &dockerexec.ExecError{Stderr: "manifest unknown", ExitCode: 1}
 		},
-		func(_ context.Context, _ bench.Bench, _, _, _ string) (string, error) {
+		func(_ context.Context, _ bench.Bench, _, _, _ string, _ map[string]string) (string, error) {
 			buildCalled = true
 			return "", nil
 		},
@@ -238,7 +238,7 @@ func TestEnsurePresent_PullNotFound_FallbackBuildSucceeds(t *testing.T) {
 		func(_ context.Context, _ bench.Bench, _ string) (string, error) {
 			return "", &dockerexec.ExecError{Stderr: "manifest unknown", ExitCode: 1}
 		},
-		func(_ context.Context, _ bench.Bench, dockerfile, contextDir, _ string) (string, error) {
+		func(_ context.Context, _ bench.Bench, dockerfile, contextDir, _ string, _ map[string]string) (string, error) {
 			capturedDockerfile = dockerfile
 			capturedContextDir = contextDir
 			return "", nil
@@ -274,7 +274,7 @@ func TestEnsurePresent_PullNotFound_FallbackBuildFails(t *testing.T) {
 		func(_ context.Context, _ bench.Bench, _ string) (string, error) {
 			return "", &dockerexec.ExecError{Stderr: "manifest unknown", ExitCode: 1}
 		},
-		func(_ context.Context, _ bench.Bench, _, _, _ string) (string, error) {
+		func(_ context.Context, _ bench.Bench, _, _, _ string, _ map[string]string) (string, error) {
 			return "", &dockerexec.ExecError{Stderr: buildStderr, ExitCode: 1}
 		},
 	)
