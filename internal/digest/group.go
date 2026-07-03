@@ -108,8 +108,11 @@ func GroupFailures(reps []report.Report) []Group {
 				}
 			}
 			a.g.Count++
-			if rep.OS != "" {
-				a.platforms[rep.OS] = true
+			// Attribute the failure to its (OS, NodeMajor) cell so a matrix run
+			// distinguishes linux-node22 vs linux-node24 (enhancement #108).
+			// StreamKey == rep.OS when NodeMajor is empty (legacy-compatible).
+			if plat := report.StreamKey(rep.OS, rep.NodeMajor); plat != "" {
+				a.platforms[plat] = true
 			}
 		}
 	}

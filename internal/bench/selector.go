@@ -104,6 +104,24 @@ func (s *Selector) Pick(os string) (Bench, error) {
 	return candidates[idx], nil
 }
 
+// BenchesForOS returns the post-filter (Pin + Exclude already applied)
+// candidate Benches matching os, without advancing any round-robin cursor.
+// Used by the capacity-aware scheduler (enhancement #108), which assigns
+// (OS×Node) jobs to Benches dynamically rather than one-Bench-per-OS via Pick.
+// Returns a fresh slice (safe for the caller to retain); nil when none match.
+func (s *Selector) BenchesForOS(os string) []Bench {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	var candidates []Bench
+	for _, b := range s.registry {
+		if b.OS == os {
+			candidates = append(candidates, b)
+		}
+	}
+	return candidates
+}
+
 // --- Errors ---
 
 // NoBenchForOSError is returned by Pick when no Bench in the post-filter

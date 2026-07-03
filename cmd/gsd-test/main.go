@@ -1,11 +1,14 @@
 // Command gsd-test is the Dev Workstation entry point for the Local Engine.
 //
-// It implements the 5-phase orchestration per ADR-0018 decision 5:
+// It implements the orchestration per ADR-0018 decision 5, extended for the
+// Node matrix (enhancement #108):
 //
 //  1. Load     — config.Load reads ~/.config/gsd-test/config.toml
-//  2. Plan     — plan.Build resolves target OSes to (Bench, ImageID) Runs
-//  3. EnsureImages — parallel images.EnsurePresent for each unique (Bench, ImageID)
-//  4. RunPipelines — one goroutine per Run; renderer subscribes to Event channels
+//  2. Plan     — plan.Build resolves targets to (OS × Node) Runs (Bench-agnostic)
+//     3+4. Fan-out — schedule.Run dispatches Runs across Benches with per-Bench
+//     capacity (least-loaded, pull-based); each worker ensures its node-specific
+//     image on the assigned Bench, then runs the Pipeline. Renderer subscribes
+//     one Event stream per (OS, Node) cell.
 //  5. Aggregate+Render — collect Reports; map to exit code 0/1/2
 //
 // Exit codes per ADR-0009:
@@ -27,6 +30,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -48,6 +52,7 @@ import (
 	"github.com/open-gsd/gsd-test-runner/internal/runrender"
 	"github.com/open-gsd/gsd-test-runner/internal/runspec"
 	"github.com/open-gsd/gsd-test-runner/internal/runstate"
+	"github.com/open-gsd/gsd-test-runner/internal/schedule"
 	"github.com/open-gsd/gsd-test-runner/internal/telemetry"
 	"github.com/open-gsd/gsd-test-runner/internal/worktree"
 )
@@ -83,6 +88,7 @@ type cliFlags struct {
 	configPath   string
 	probeBenches bool
 	targets      string
+	node         string
 	pin          string
 	exclude      string
 	jsonEvents   bool
@@ -104,6 +110,7 @@ func parseFlags(args []string) (cliFlags, error) {
 	fs.StringVar(&f.configPath, "config", "", "path to config.toml (default: $XDG_CONFIG_HOME/gsd-test/config.toml or ~/.config/gsd-test/config.toml)")
 	fs.BoolVar(&f.probeBenches, "probe-benches", false, "probe each Bench for reachability during config.Load")
 	fs.StringVar(&f.targets, "targets", "", "comma-separated OS targets (default: from config defaults.targets)")
+	fs.StringVar(&f.node, "node", "", "comma-separated Node major versions to test, applied to every target OS (default: per-OS [node] config, else the supported LTS lines)")
 	fs.StringVar(&f.pin, "bench", "", "pin to a specific Bench by name (default: from config defaults.pin)")
 	fs.StringVar(&f.exclude, "exclude", "", "comma-separated Bench names to exclude (default: from config defaults.exclude)")
 	fs.BoolVar(&f.jsonEvents, "json-events", false, "emit events as JSON Lines instead of human-readable TTY output")
@@ -222,7 +229,7 @@ func run(args []string, stdout, stderr *os.File) int {
 		return exitInconclusive
 	}
 
-	p, err := plan.Build(cfg, selector, targets)
+	p, err := plan.Build(cfg, selector, targets, commaSplit(flags.node))
 	if err != nil {
 		fmt.Fprintf(stderr, "plan.Build: %v\n", err)
 		writeInconclusiveVerdict(stdout, stderr) // B-4
@@ -268,13 +275,11 @@ func run(args []string, stdout, stderr *os.File) int {
 	}
 	defer wt.Close()
 
-	// ── Phase 3: EnsureImages (parallel) ──────────────────────────────────────
-	if ensureErr := ensureImagesParallel(ctx, p.Runs, stderr); ensureErr != nil {
-		writeInconclusiveVerdict(stdout, stderr) // B-4
-		return exitInconclusive
-	}
-
-	// ── Phase 4: RunPipelines (parallel) + renderer subscription ──────────────
+	// ── Phase 3+4: Fan out (OS × Node) Runs across Benches ─────────────────────
+	// Bench assignment is dynamic (capacity-aware, least-loaded pull; enhancement
+	// #108, see internal/schedule), so image presence can't be ensured per bench
+	// up front — it folds into each worker below. This replaces the former
+	// separate EnsureImages phase + one-goroutine-per-OS RunPipelines phase.
 	mode := renderer.ModeTTY
 	if flags.jsonEvents {
 		mode = renderer.ModeJSONEvents
@@ -291,46 +296,93 @@ func run(args []string, stdout, stderr *os.File) int {
 	}
 	r.SetVerbosity(verbosity)
 
-	type pipelineResult struct {
-		os      string
-		rep     report.Report
-		err     error
-		drained string // local JSONL capture path (Option B persistence)
+	// One schedulable Unit per (OS, Node) Run, each pre-wired with its own events
+	// channel subscribed by the (OS, Node) stream key. Streams are keyed by cell
+	// identity (not bench) because dispatch is dynamic.
+	type jobPayload struct {
+		run       plan.Run
+		streamKey string
+		events    chan pipeline.Event
 	}
-	results := make(chan pipelineResult, len(p.Runs))
-	var pwg sync.WaitGroup
+	units := make([]schedule.Unit, 0, len(p.Runs))
 	for _, run := range p.Runs {
-		run := run
-		pwg.Add(1)
+		streamKey := report.StreamKey(run.OS, run.NodeMajor)
 		// Buffer generously to absorb burst test events (ADR-0017 dec 4).
 		events := make(chan pipeline.Event, 128)
-		r.Subscribe(run.OS, events)
-		go func() {
-			defer pwg.Done()
-			pl := pipeline.New(run.Bench, run.ImageID, run.Version, wt.Path(), cfg.Testing.Command, events)
-			rep, err := pl.RunAll(ctx)
-			// The pipeline's pump goroutine owns closing events (it flushes the
-			// unbounded queue first), so we must NOT close it here (#84).
-			results <- pipelineResult{os: run.OS, rep: rep, err: err, drained: pl.DrainedPath()}
-		}()
+		r.Subscribe(streamKey, events)
+		units = append(units, schedule.Unit{
+			OS:      run.OS,
+			Payload: &jobPayload{run: run, streamKey: streamKey, events: events},
+		})
 	}
-	pwg.Wait()
-	close(results)
+
+	// Candidate benches per target OS (post pin/exclude) for the scheduler.
+	benchesByOS := make(map[string][]bench.Bench, len(targets))
+	for _, osName := range targets {
+		benchesByOS[osName] = selector.BenchesForOS(osName)
+	}
+	capResolver := newCapacityResolver(ctx)
+
+	type pipelineResult struct {
+		streamKey string
+		rep       report.Report
+		err       error
+		drained   string // local JSONL capture path (Option B persistence)
+	}
+	work := func(ctx context.Context, b bench.Bench, u schedule.Unit) any {
+		jp := u.Payload.(*jobPayload)
+		// Ensure this cell's node-specific image is present on the assigned
+		// bench (folds the old EnsureImages phase in). A local fallback build
+		// gets NODE_VERSION so it bakes the right major (enhancement #108).
+		if err := images.EnsurePresent(ctx, b, jp.run.ImageID, images.EnsurePresentOptions{
+			FallbackDockerfile: "dockerfiles/" + jp.run.OS + ".Dockerfile",
+			FallbackContextDir: ".",
+			FallbackBuildArgs:  map[string]string{"NODE_VERSION": jp.run.NodeMajor},
+		}); err != nil {
+			fmt.Fprintf(stderr, "EnsurePresent(bench=%s, image=%s): %v\n", b.Name, jp.run.ImageID, err)
+			return pipelineResult{streamKey: jp.streamKey, err: err}
+		}
+		pl := pipeline.New(b, jp.run.ImageID, jp.run.Version, wt.Path(), cfg.Testing.Command, jp.events)
+		rep, err := pl.RunAll(ctx)
+		// The pipeline's pump goroutine owns closing events (it flushes the
+		// unbounded queue first), so we must NOT close it here (#84).
+		rep.NodeMajor = jp.run.NodeMajor // stamp the cell's node major onto the report
+		return pipelineResult{streamKey: jp.streamKey, rep: rep, err: err, drained: pl.DrainedPath()}
+	}
+
+	schedResults := schedule.Run(ctx, units, benchesByOS, capResolver.capacity, work)
 
 	// ── Phase 5: Aggregate + Render ────────────────────────────────────────────
 	var sawLegError, sawFail bool
 	reps := make([]report.Report, 0, len(p.Runs))
 	osJSONL := make(map[string]string, len(p.Runs))
-	for res := range results {
-		r.AddResult(res.os, res.rep, res.err)
-		osJSONL[res.os] = res.drained
+	for _, sr := range schedResults {
+		jp := sr.Unit.Payload.(*jobPayload)
+		res, ok := sr.Value.(pipelineResult)
+		if !ok {
+			// The unit never ran (ErrNoBench — plan should have skipped it — or
+			// ctx cancellation). No pump exists to close this stream, so close it
+			// ourselves or r.Wait() would block forever. Record it as infra_error.
+			close(jp.events)
+			fmt.Fprintf(stderr, "%s: not run: %v\n", jp.streamKey, sr.Value)
+			sawLegError = true
+			infra := report.New(jp.run.OS, "", string(jp.run.ImageID), jp.run.Version, time.Now().UTC())
+			infra.NodeMajor = jp.run.NodeMajor
+			infra.Outcome = report.OutcomeInfraError
+			r.AddResult(jp.streamKey, infra, fmt.Errorf("not run: %v", sr.Value))
+			reps = append(reps, infra)
+			continue
+		}
+		r.AddResult(res.streamKey, res.rep, res.err)
+		osJSONL[res.streamKey] = res.drained
 		if res.err != nil {
 			sawLegError = true
 			// A leg error means the suite did not run as designed; record it as
-			// an infra_error per-OS report so the digest/verdict still account
-			// for this OS (RunAll returns a zero Report on error).
+			// an infra_error per-cell report so the digest/verdict still account
+			// for this (OS, Node) cell (RunAll returns a zero Report on error).
 			infra := res.rep
-			infra.OS = res.os
+			infra.OS = jp.run.OS
+			infra.NodeMajor = jp.run.NodeMajor
 			infra.Outcome = report.OutcomeInfraError
 			reps = append(reps, infra)
 			continue
@@ -1152,59 +1204,54 @@ func executeSpec(spec runspec.Spec, configPath string, stdout, stderr *os.File) 
 	return exitSomeFailed
 }
 
-// ensureImagesParallel runs images.EnsurePresent for each unique (Bench, ImageID)
-// pair from the Plan.Runs concurrently. Returns non-nil if any EnsurePresent
-// failed — caller treats this as exit-2 inconclusive.
-func ensureImagesParallel(ctx context.Context, runs []plan.Run, stderr *os.File) error {
-	type pair struct {
-		b       bench.Bench
-		imageID images.ImageID
-		os      string
-	}
-	// Dedup by (bench.Name, imageID) so we do not pull the same image twice.
-	seen := make(map[string]bool, len(runs))
-	var pairs []pair
-	for _, r := range runs {
-		key := r.Bench.Name + "|" + string(r.ImageID)
-		if seen[key] {
-			continue
-		}
-		seen[key] = true
-		pairs = append(pairs, pair{b: r.Bench, imageID: r.ImageID, os: r.OS})
-	}
+// capacityResolver resolves a Bench's per-run container concurrency: the
+// configured capacity when set (> 0), else the Bench's own CPU count (probed
+// via `docker info -f {{.NCPU}}` against that Bench's daemon), else 1. Results
+// are cached per Bench name so the NCPU probe runs at most once per Bench per
+// invocation (enhancement #108). Safe for concurrent use by the scheduler.
+type capacityResolver struct {
+	ctx   context.Context
+	mu    sync.Mutex
+	cache map[string]int
+}
 
-	type result struct {
-		p   pair
-		err error
-	}
-	results := make(chan result, len(pairs))
-	var wg sync.WaitGroup
-	for _, pp := range pairs {
-		pp := pp
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			err := images.EnsurePresent(ctx, pp.b, pp.imageID, images.EnsurePresentOptions{
-				FallbackDockerfile: "dockerfiles/" + pp.os + ".Dockerfile",
-				FallbackContextDir: ".",
-			})
-			results <- result{p: pp, err: err}
-		}()
-	}
-	wg.Wait()
-	close(results)
+func newCapacityResolver(ctx context.Context) *capacityResolver {
+	return &capacityResolver{ctx: ctx, cache: make(map[string]int)}
+}
 
-	var firstErr error
-	for res := range results {
-		if res.err != nil {
-			fmt.Fprintf(stderr, "EnsurePresent(bench=%s, image=%s): %v\n",
-				res.p.b.Name, res.p.imageID, res.err)
-			if firstErr == nil {
-				firstErr = res.err
-			}
-		}
+// capacity returns the max concurrent Tester containers to run on b. Configured
+// capacity wins; otherwise the Bench's NCPU (auto-parallel), floored at 1.
+func (c *capacityResolver) capacity(b bench.Bench) int {
+	if b.Capacity > 0 {
+		return b.Capacity
 	}
-	return firstErr
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if v, ok := c.cache[b.Name]; ok {
+		return v
+	}
+	n := queryNCPU(c.ctx, b)
+	if n < 1 {
+		n = 1
+	}
+	c.cache[b.Name] = n
+	return n
+}
+
+// queryNCPU returns the Bench daemon's CPU count via `docker info -f {{.NCPU}}`.
+// Returns 0 on any error (the caller floors to 1) — a probe failure must never
+// abort the run, only fall back to serial for that Bench. Package var so tests
+// can stub it without a Docker daemon.
+var queryNCPU = func(ctx context.Context, b bench.Bench) int {
+	out, err := dockerexec.Run(ctx, b, []string{"info", "-f", "{{.NCPU}}"})
+	if err != nil {
+		return 0
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(out))
+	if err != nil {
+		return 0
+	}
+	return n
 }
 
 // commaSplit splits s on commas and trims whitespace from each part.

@@ -116,7 +116,11 @@ func Summarize(reps []report.Report, groups []Group, now time.Time) Summary {
 		GeneratedAt: now.UTC(),
 	}
 	for _, rep := range reps {
-		key := rep.OS
+		// Key per (OS, NodeMajor) cell so a Node matrix run reports separate
+		// linux-node22 / linux-node24 lines (enhancement #108). StreamKey is
+		// exactly rep.OS when NodeMajor is empty, so legacy single-Node reports
+		// are unchanged.
+		key := report.StreamKey(rep.OS, rep.NodeMajor)
 		if key == "" {
 			key = rep.Bench
 		}

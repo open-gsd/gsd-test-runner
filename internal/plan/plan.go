@@ -27,13 +27,15 @@ type Plan struct {
 	Skipped []SkipReason
 }
 
-// Run is one per-OS pipeline invocation. The orchestrator constructs a
-// pipeline.New(Run.Bench, Run.ImageID, ..., Run.OS, ...) per Run.
+// Run is one (OS × Node major) pipeline invocation — the unit the
+// capacity-aware scheduler fans out across Benches (enhancement #108). Bench
+// is intentionally absent: assignment is dynamic (least-loaded, pull-based) at
+// dispatch time, not fixed at plan time, so a Run is Bench-agnostic.
 type Run struct {
-	Bench   bench.Bench
-	ImageID images.ImageID
-	Version string // expected Tester Image version from config.Versions
-	OS      string
+	OS        string
+	NodeMajor string         // Node.js major, e.g. "22" (the second matrix axis)
+	ImageID   images.ImageID // fully-qualified, node-suffixed tag: gsd-tester-<os>:<version>-node<major>
+	Version   string         // image-version sentinel from config.Versions (NOT node-suffixed)
 }
 
 // SkipReason explains why a target OS doesn't appear in Plan.Runs. The
@@ -54,22 +56,27 @@ const (
 )
 
 // Build constructs a Plan from a loaded Config, a pre-constructed Selector,
-// and the list of target OSes. Pure: no I/O, deterministic given inputs.
+// the target OSes, and an optional Node-major override. Pure: no I/O,
+// deterministic given inputs.
 //
 // For each target OS:
 //   - if Config.Versions has no entry → SkipReason{Reason: SkipReasonNoImageVersion}
-//   - else call selector.Pick(os):
-//   - if *bench.NoBenchForOSError → SkipReason{Reason: SkipReasonNoBenchForOS}
-//   - if any other error → Build returns error (doesn't classify)
-//   - on success → Run{Bench, ImageID derived from OS, Version from Config.Versions, OS}
+//   - else if the Selector has no candidate Bench for the OS →
+//     SkipReason{Reason: SkipReasonNoBenchForOS}
+//   - else emit one Run per Node major (the OS × Node cross-product): the majors
+//     come from nodeOverride when non-empty (the --node flag, applied uniformly
+//     to every OS), otherwise Config.NodeVersionsFor(os).
 //
-// images.ImageID for each OS is derived per ADR-0005 conventions:
+// Bench selection is NOT done here — Runs are Bench-agnostic and the scheduler
+// assigns Benches dynamically (enhancement #108). The image reference is the
+// node-suffixed tag per ADR-0005 + the #108 tag convention:
 //
-//	ghcr.io/open-gsd/gsd-tester-<os>
+//	ghcr.io/open-gsd/gsd-tester-<os>:<version>-node<major>
 //
-// The version comes from Config.Versions[os]; Pipeline.New then takes
-// ImageID + version separately (per existing pipeline signature).
-func Build(cfg *config.Config, selector *bench.Selector, targets []string) (*Plan, error) {
+// Version (the un-suffixed image-version sentinel) is carried separately so the
+// Pipeline's CheckImageVersion leg still verifies the sh.gsd-test.image-version
+// label (which is the un-suffixed version, per ADR-0011).
+func Build(cfg *config.Config, selector *bench.Selector, targets []string, nodeOverride []string) (*Plan, error) {
 	if cfg == nil {
 		return nil, errors.New("plan.Build: cfg is nil")
 	}
@@ -89,69 +96,27 @@ func Build(cfg *config.Config, selector *bench.Selector, targets []string) (*Pla
 			continue
 		}
 
-		b, err := selector.Pick(os)
-		if err != nil {
-			var nbf *bench.NoBenchForOSError
-			if errors.As(err, &nbf) {
-				p.Skipped = append(p.Skipped, SkipReason{
-					OS:     os,
-					Reason: SkipReasonNoBenchForOS,
-					Detail: fmt.Sprintf("no Bench available for OS=%s in registry", os),
-				})
-				continue
-			}
-			// Unexpected error type — bubble it up rather than masking.
-			return nil, fmt.Errorf("plan.Build: selector.Pick(%q): %w", os, err)
-		}
-
-		p.Runs = append(p.Runs, Run{
-			Bench:   b,
-			ImageID: images.ImageID(fmt.Sprintf("ghcr.io/open-gsd/gsd-tester-%s", os)),
-			Version: version,
-			OS:      os,
-		})
-	}
-	return p, nil
-}
-
-// buildWithPickFn is an internal test helper that allows the test package
-// (same package — package plan) to inject an arbitrary pick function,
-// exercising the error-propagation path for non-NoBenchForOSError errors.
-// Not exported; only reachable within this package.
-func buildWithPickFn(cfg *config.Config, pick func(os string) (bench.Bench, error), targets []string) (*Plan, error) {
-	if cfg == nil {
-		return nil, errors.New("plan.Build: cfg is nil")
-	}
-	p := &Plan{}
-	for _, os := range targets {
-		version, ok := cfg.Versions[os]
-		if !ok || version == "" {
+		if len(selector.BenchesForOS(os)) == 0 {
 			p.Skipped = append(p.Skipped, SkipReason{
 				OS:     os,
-				Reason: SkipReasonNoImageVersion,
-				Detail: fmt.Sprintf("Config.Versions has no entry for OS %q (add to [versions] in config.toml)", os),
+				Reason: SkipReasonNoBenchForOS,
+				Detail: fmt.Sprintf("no Bench available for OS=%s in registry", os),
 			})
 			continue
 		}
-		b, err := pick(os)
-		if err != nil {
-			var nbf *bench.NoBenchForOSError
-			if errors.As(err, &nbf) {
-				p.Skipped = append(p.Skipped, SkipReason{
-					OS:     os,
-					Reason: SkipReasonNoBenchForOS,
-					Detail: fmt.Sprintf("no Bench available for OS=%s in registry", os),
-				})
-				continue
-			}
-			return nil, fmt.Errorf("plan.Build: selector.Pick(%q): %w", os, err)
+
+		majors := nodeOverride
+		if len(majors) == 0 {
+			majors = cfg.NodeVersionsFor(os)
 		}
-		p.Runs = append(p.Runs, Run{
-			Bench:   b,
-			ImageID: images.ImageID(fmt.Sprintf("ghcr.io/open-gsd/gsd-tester-%s", os)),
-			Version: version,
-			OS:      os,
-		})
+		for _, major := range majors {
+			p.Runs = append(p.Runs, Run{
+				OS:        os,
+				NodeMajor: major,
+				ImageID:   images.ImageID(fmt.Sprintf("ghcr.io/open-gsd/gsd-tester-%s:%s-node%s", os, version, major)),
+				Version:   version,
+			})
+		}
 	}
 	return p, nil
 }
