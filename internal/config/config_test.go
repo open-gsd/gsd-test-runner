@@ -515,6 +515,34 @@ func TestValidateAndTransform_Errors(t *testing.T) {
 			},
 			wantErr: "os is required",
 		},
+		{
+			name: "negative bench capacity",
+			raw: rawConfig{
+				Benches: []rawBench{{Name: "b", Host: "h", OS: "linux", Capacity: -1}},
+			},
+			wantErr: "capacity must be >= 0",
+		},
+		{
+			name: "node unknown OS key",
+			raw: rawConfig{
+				Node: map[string][]string{"solaris": {"22"}},
+			},
+			wantErr: "unknown OS key",
+		},
+		{
+			name: "node non-digit major",
+			raw: rawConfig{
+				Node: map[string][]string{"linux": {"latest"}},
+			},
+			wantErr: "invalid Node major",
+		},
+		{
+			name: "node duplicate major",
+			raw: rawConfig{
+				Node: map[string][]string{"linux": {"22", "22"}},
+			},
+			wantErr: "duplicate Node major",
+		},
 	}
 
 	for _, tt := range tests {
@@ -634,5 +662,199 @@ keep_last_runs = -1
 	}
 	if !strings.Contains(err.Error(), "storage.keep_last_runs") {
 		t.Errorf("error = %q, want 'storage.keep_last_runs' in message", err.Error())
+	}
+}
+
+// --- [node] section tests ---
+
+// TestLoad_Node_ParsedForOS verifies [node] entries parse and are returned
+// verbatim by NodeVersionsFor.
+func TestLoad_Node_ParsedForOS(t *testing.T) {
+	path := writeTOML(t, `
+[node]
+linux = ["22", "24"]
+windows = ["22"]
+`)
+
+	cfg, err := Load(path, LoadOptions{})
+	if err != nil {
+		t.Fatalf("Load returned error: %v", err)
+	}
+
+	wantLinux := []string{"22", "24"}
+	if !reflect.DeepEqual(cfg.Node["linux"], wantLinux) {
+		t.Errorf("Node[linux] = %v, want %v", cfg.Node["linux"], wantLinux)
+	}
+
+	got := cfg.NodeVersionsFor("linux")
+	if !reflect.DeepEqual(got, wantLinux) {
+		t.Errorf("NodeVersionsFor(linux) = %v, want %v", got, wantLinux)
+	}
+
+	wantWindows := []string{"22"}
+	if got := cfg.NodeVersionsFor("windows"); !reflect.DeepEqual(got, wantWindows) {
+		t.Errorf("NodeVersionsFor(windows) = %v, want %v", got, wantWindows)
+	}
+}
+
+// TestNodeVersionsFor_FallsBackToDefaultLTS verifies the fallback when an OS
+// has no [node] entry, and that the default's slice contents match
+// DefaultNodeLTS().
+func TestNodeVersionsFor_FallsBackToDefaultLTS(t *testing.T) {
+	path := writeTOML(t, `
+[node]
+linux = ["22"]
+`)
+
+	cfg, err := Load(path, LoadOptions{})
+	if err != nil {
+		t.Fatalf("Load returned error: %v", err)
+	}
+
+	got := cfg.NodeVersionsFor("windows")
+	want := DefaultNodeLTS()
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("NodeVersionsFor(windows) = %v, want %v (DefaultNodeLTS)", got, want)
+	}
+}
+
+// TestNodeVersionsFor_ReturnsCopyNotSharedSlice verifies that mutating the
+// slice returned by NodeVersionsFor does not affect a subsequent call (i.e.
+// it's not aliasing the shared default or the config's own slice).
+func TestNodeVersionsFor_ReturnsCopyNotSharedSlice(t *testing.T) {
+	path := writeTOML(t, `
+[node]
+linux = ["22", "24"]
+`)
+
+	cfg, err := Load(path, LoadOptions{})
+	if err != nil {
+		t.Fatalf("Load returned error: %v", err)
+	}
+
+	// Case 1: configured entry — mutate the returned slice, verify a second
+	// call is unaffected.
+	first := cfg.NodeVersionsFor("linux")
+	first[0] = "MUTATED"
+	second := cfg.NodeVersionsFor("linux")
+	if second[0] == "MUTATED" {
+		t.Errorf("NodeVersionsFor(linux) second call = %v, mutation of first call leaked through", second)
+	}
+
+	// Case 2: fallback default — mutate the returned slice, verify a second
+	// call (and DefaultNodeLTS itself) is unaffected.
+	firstDefault := cfg.NodeVersionsFor("macos")
+	firstDefault[0] = "MUTATED"
+	secondDefault := cfg.NodeVersionsFor("macos")
+	if secondDefault[0] == "MUTATED" {
+		t.Errorf("NodeVersionsFor(macos) second call = %v, mutation of first call leaked through", secondDefault)
+	}
+	if DefaultNodeLTS()[0] == "MUTATED" {
+		t.Errorf("DefaultNodeLTS() = %v, mutation leaked into shared default", DefaultNodeLTS())
+	}
+}
+
+// TestLoad_Node_UnknownOSKey verifies an unknown OS key in [node] is rejected.
+func TestLoad_Node_UnknownOSKey(t *testing.T) {
+	path := writeTOML(t, `
+[node]
+solaris = ["22"]
+`)
+
+	_, err := Load(path, LoadOptions{})
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !strings.Contains(err.Error(), "unknown OS key") {
+		t.Errorf("error = %q, want 'unknown OS key' mention", err.Error())
+	}
+}
+
+// TestLoad_Node_NonDigitMajor verifies a non-digit Node major is rejected.
+func TestLoad_Node_NonDigitMajor(t *testing.T) {
+	path := writeTOML(t, `
+[node]
+linux = ["latest"]
+`)
+
+	_, err := Load(path, LoadOptions{})
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !strings.Contains(err.Error(), "invalid Node major") {
+		t.Errorf("error = %q, want 'invalid Node major' mention", err.Error())
+	}
+}
+
+// TestLoad_Node_DuplicateMajor verifies a duplicate Node major within one
+// OS's list is rejected.
+func TestLoad_Node_DuplicateMajor(t *testing.T) {
+	path := writeTOML(t, `
+[node]
+linux = ["22", "22"]
+`)
+
+	_, err := Load(path, LoadOptions{})
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !strings.Contains(err.Error(), "duplicate Node major") {
+		t.Errorf("error = %q, want 'duplicate Node major' mention", err.Error())
+	}
+}
+
+// --- Bench capacity tests ---
+
+// TestLoad_BenchCapacity_Parsed verifies capacity parses from TOML into
+// bench.Bench.Capacity.
+func TestLoad_BenchCapacity_Parsed(t *testing.T) {
+	path := writeTOML(t, `
+[[benches]]
+name = "bench-a"
+host = "host-a"
+os = "linux"
+capacity = 4
+
+[[benches]]
+name = "bench-b"
+host = "host-b"
+os = "windows"
+`)
+
+	cfg, err := Load(path, LoadOptions{})
+	if err != nil {
+		t.Fatalf("Load returned error: %v", err)
+	}
+	if len(cfg.Registry) != 2 {
+		t.Fatalf("Registry len = %d, want 2", len(cfg.Registry))
+	}
+	if cfg.Registry[0].Capacity != 4 {
+		t.Errorf("Registry[0].Capacity = %d, want 4", cfg.Registry[0].Capacity)
+	}
+	if cfg.Registry[1].Capacity != 0 {
+		t.Errorf("Registry[1].Capacity = %d, want 0 (unset)", cfg.Registry[1].Capacity)
+	}
+}
+
+// TestLoad_BenchCapacity_Negative verifies a negative capacity is rejected.
+func TestLoad_BenchCapacity_Negative(t *testing.T) {
+	path := writeTOML(t, `
+[[benches]]
+name = "bench-a"
+host = "host-a"
+os = "linux"
+capacity = -1
+`)
+
+	_, err := Load(path, LoadOptions{})
+	if err == nil {
+		t.Fatal("expected error for negative capacity, got nil")
+	}
+	if !strings.Contains(err.Error(), "capacity must be >= 0") {
+		t.Errorf("error = %q, want 'capacity must be >= 0' mention", err.Error())
+	}
+	var ice *InvalidConfigError
+	if !errors.As(err, &ice) {
+		t.Errorf("error type = %T, want *InvalidConfigError", err)
 	}
 }

@@ -78,6 +78,20 @@ func TestRuntimeBin_Container(t *testing.T) {
 	}
 }
 
+func TestBench_Capacity_ZeroValueMeansUnset(t *testing.T) {
+	b := Bench{Name: "bench-linux-1", OS: "linux"}
+	if b.Capacity != 0 {
+		t.Errorf("Capacity = %d, want 0 (unset) for zero-value Bench", b.Capacity)
+	}
+}
+
+func TestBench_Capacity_SetValue(t *testing.T) {
+	b := Bench{Name: "bench-linux-1", OS: "linux", Capacity: 4}
+	if b.Capacity != 4 {
+		t.Errorf("Capacity = %d, want 4", b.Capacity)
+	}
+}
+
 func TestDockerHost(t *testing.T) {
 	cases := []struct {
 		name string

@@ -53,6 +53,12 @@ type Bench struct {
 	// "linux/amd64" or "linux/arm64". Empty means runtime default platform
 	// selection.
 	Platform string
+
+	// Capacity is the max number of Tester containers this Bench runs
+	// concurrently. 0 means "unset" -> the runner defaults it to the Bench's
+	// own CPU count (docker info NCPU), floored to 1 (enhancement #108). Set
+	// explicitly to bound a Bench that also does other work.
+	Capacity int
 }
 
 // DockerHost returns the DOCKER_HOST environment variable value for
