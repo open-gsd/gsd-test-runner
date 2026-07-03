@@ -14,12 +14,12 @@ Releases publish on every `v*.*.*` tag (per [ADR-0019](adr/0019-local-engine-bin
 Binaries are named `gsd-test-v<version>-<os>-<arch>` (plus `.exe` for Windows). The commands below pin the version once in a single variable so they run as-is on copy-paste; bump it to the release you want:
 
 ```bash
-GSD_TEST_VERSION=v1.5.0
+GSD_TEST_VERSION=v1.6.0
 ```
 
 > Use the **versioned** download path — `releases/download/<TAG>/…` — not `releases/latest/download/…`. The `latest` redirect resolves to whatever tag is newest, which only matches a version-pinned filename until the next release ships (the cause of [issue #55](https://github.com/open-gsd/gsd-test-runner/issues/55)).
 
-Each binary ships with a `.sha256` sidecar for integrity verification. The sidecar lists the **published asset name** (e.g. `gsd-test-v1.5.0-darwin-arm64`), so after downloading the binary as `./gsd-test` (see your platform below) pair that hash with the local file:
+Each binary ships with a `.sha256` sidecar for integrity verification. The sidecar lists the **published asset name** (e.g. `gsd-test-v1.6.0-darwin-arm64`), so after downloading the binary as `./gsd-test` (see your platform below) pair that hash with the local file:
 
 ```bash
 # darwin-arm64 shown — swap the -<os>-<arch> suffix for your platform.
@@ -41,7 +41,7 @@ gsd-test --version
 Expected output (matching `$GSD_TEST_VERSION`):
 
 ```text
-v1.5.0
+v1.6.0
 ```
 
 ### macOS (Intel / amd64)
@@ -79,7 +79,7 @@ gsd-test --version
 In PowerShell:
 
 ```powershell
-$Version = "v1.5.0"
+$Version = "v1.6.0"
 Invoke-WebRequest `
   -Uri "https://github.com/open-gsd/gsd-test-runner/releases/download/$Version/gsd-test-$Version-windows-amd64.exe" `
   -OutFile gsd-test.exe
