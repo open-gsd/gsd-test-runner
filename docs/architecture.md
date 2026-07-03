@@ -2,19 +2,18 @@
 
 This document is for contributors. It describes how `gsd-test` is built and where to find things. For design rationale, read the ADRs in [docs/adr/](adr/).
 
-## The 5-phase orchestrator
+## The orchestrator
 
-`cmd/gsd-test/main.go` sequences five phases on every invocation (per ADR-0018):
+`cmd/gsd-test/main.go` sequences these phases on every invocation (per ADR-0018, extended for the Node matrix in [ADR-0024](adr/0024-node-matrix-tester-images.md) / [ADR-0025](adr/0025-capacity-aware-fanout-scheduler.md)):
 
 | Phase | Code | Description |
 |-------|------|-------------|
 | 1. **Load** | `config.Load` | Reads `config.toml`. Optionally probes Bench reachability (`--probe-benches`). |
-| 2. **Plan** | `plan.Build` | Pure function. Resolves target OSes to `(Bench, ImageID, Version)` tuples. Produces `Plan{Runs, Skipped}`. |
-| 3. **EnsureImages** | `images.EnsurePresent` (parallel) | Confirms each Tester Image is present on its Bench. Pulls from GHCR; falls back to local build if pull fails. |
-| 4. **RunPipelines** | `pipeline.Pipeline.RunAll` (parallel) | Runs the 8-leg pipeline per OS. Renderer subscribes to event channels for live progress. |
-| 5. **Aggregate+Render** | `renderer.Renderer` | Collects per-OS Reports and LegErrors. Maps to exit code 0/1/2. Prints final summary. |
+| 2. **Plan** | `plan.Build` | Pure function. Resolves targets to one `(OS × Node major)` **cell** `Run` each — Bench-agnostic, with a node-suffixed `ImageID`. Produces `Plan{Runs, Skipped}`. |
+| 3+4. **Fan-out** | `schedule.Run` + `pipeline.Pipeline.RunAll` | Dispatches cells across eligible Benches, per-Bench-capacity-bounded and pull-based (least-loaded). Each worker ensures its node-specific image on the assigned Bench (`images.EnsurePresent`), then runs the 8-leg pipeline. The renderer subscribes one event stream per cell. |
+| 5. **Aggregate+Render** | `renderer.Renderer` + `digest` | Collects per-cell Reports and LegErrors. Maps to exit code 0/1/2. Prints the final summary. |
 
-Phases 3 and 4 do I/O. Phases 1, 2, and 5 are CPU/memory only and are independently testable against synthetic inputs.
+Bench binding is **dynamic** (dispatch-time), so image-ensure folds into the fan-out workers rather than being a separate phase. Phases 1, 2, and 5 are CPU/memory only and are independently testable against synthetic inputs. For the design see [The Node version matrix](node-matrix.md).
 
 ## Package layout
 
@@ -22,17 +21,18 @@ Phases 3 and 4 do I/O. Phases 1, 2, and 5 are CPU/memory only and are independen
 |---------|------|---------|
 | `cmd/gsd-test` | `cmd/gsd-test/` | CLI entry point. Flag parsing, phase sequencing, exit code mapping. |
 | `config` | `internal/config/` | TOML config loading and validation. Bench registry, version map, defaults. |
-| `plan` | `internal/plan/` | Pure resolver. Builds the list of `Run` values from config + selector. |
-| `bench` | `internal/bench/` | `Bench` type (with `Runtime` field; `"docker"` default for all Benches today; `"container"` reserved for future Apple Containers). `Selector` (round-robin + pin/exclude). `BenchDockerError`. |
+| `plan` | `internal/plan/` | Pure resolver. Builds the list of `(OS × Node major)` cell `Run` values — Bench-agnostic, with node-suffixed image tags — from config + selector. |
+| `bench` | `internal/bench/` | `Bench` type (with `Runtime` field; `"docker"` default for all Benches today; `"container"` reserved for future Apple Containers; `Capacity` for fan-out concurrency). `Selector` (pin/exclude filtering; `Pick` for one-per-OS, `BenchesForOS` for the scheduler's candidate set). `BenchDockerError`. |
+| `schedule` | `internal/schedule/` | Pull-based, per-Bench-capacity work-stealing scheduler that fans `(OS × Node)` cells across eligible Benches (ADR-0025). Pure — the pipeline work is an injected callback, so it is unit-testable without Docker. |
 | `refs` | `internal/refs/` | Git ref resolution. Converts `--base` and `--head` string refs to SHAs. |
 | `worktree` | `internal/worktree/` | PR-merged worktree construction. Shallow clone + real `git merge` in a scratch directory. |
-| `images` | `internal/images/` | `EnsurePresent`: pull from GHCR, fall back to `docker build` on the Bench. Typed pull errors. |
+| `images` | `internal/images/` | `EnsurePresent`: pull from GHCR, fall back to `docker build` on the Bench (passing `NODE_VERSION` so a fallback build bakes the right Node major). Typed pull errors. |
 | `dockerexec` | `internal/dockerexec/` | Low-level docker subprocess wrapper. Sets `DOCKER_HOST=ssh://<bench.Host>`. `ExecError` type. `Stream` for line-by-line output. |
 | `pipeline` | `internal/pipeline/` | 8-leg Per-OS Pipeline. `LegError` envelope. Typed Cause errors per leg. Event emission. |
 | `parse` | `internal/pipeline/` (same package) | JSONL parser for test events emitted by the Reporter. Called by the Parse leg. |
-| `report` | `internal/report/` | `Report` type: pass/fail counts, `[]Failure` list. `KindPass` / `KindFail` discriminant. `schema_version: 2` adds `Outcome` and the `Kill` record for reaped runs (ADR-0021). |
+| `report` | `internal/report/` | `Report` type: pass/fail counts, `[]Failure` list. `KindPass` / `KindFail` discriminant. `schema_version: 2` adds `Outcome` and the `Kill` record for reaped runs (ADR-0021). `NodeMajor` + `StreamKey`/`Label` identify each `(OS, Node)` cell (#108). |
 | `renderer` | `internal/renderer/` | Consumes per-OS event channels. TTY mode (human, with `Verbosity` Full/Normal/Quiet) and JSON-events mode (machine). Default is Normal: heartbeat + leg events + loud failures. |
-| `digest` | `internal/digest/` | Failure-first output (ADR-0023). Cross-OS grouping, truncation, the `failures.json` / `FAILURES.md` / `junit.xml` serializers, and the last-line `verdict`. Operates on a slice of `report.Report`, so the standard and run-and-die paths share one contract. |
+| `digest` | `internal/digest/` | Failure-first output (ADR-0023). Cross-cell grouping keyed per `(OS, Node)` via `report.StreamKey` (collapses to plain OS for legacy reports), truncation, the `failures.json` / `FAILURES.md` / `junit.xml` serializers, and the last-line `verdict`. Operates on a slice of `report.Report`, so the standard and run-and-die paths share one contract. |
 | `runspec` | `internal/runspec/` | Run-and-die: parse/validate the agent run spec, defaults, `Budget.EffectiveDeadlineMs`. |
 | `dispatch` | `internal/dispatch/` | Run-and-die: hardened `node --test` / `docker run` arg builders, the copy-in `Exec`/`RunCopyIn` execution, and `VerifyImageVersion`. |
 | `reaper` | `internal/reaper/` | Run-and-die Tier-2: `Overdue` selection and the stale-label `Sweep`. |
@@ -76,13 +76,13 @@ User-facing documentation: [Run-and-die Execution](run-and-die.md) and its tutor
 Each Tester Image (per ADR-0001) provides:
 
 - **Base OS**: Debian Bookworm (Linux), Windows Server Core LTSC 2022 (Windows).
-- **Node 22**: pre-installed.
+- **Node**: the major selected by the `NODE_VERSION` build arg (default 22). Images are published per Node LTS major, tagged `…-node<major>` (ADR-0024).
 - **Build toolchain**: `npm` (bundled with Node), `git`, `tar`.
 - **Reporter** at `/opt/gsd-test/reporter.mjs` (Linux) or `C:\opt\gsd-test\reporter.mjs` (Windows). This path is contractual — `RunTests` passes it as `--test-reporter=`.
 - **Sandbox isolation**: `HOME=/home/test` (Linux) with world-writable permissions. The container is `--rm`; no state persists across runs.
-- **Image-version sentinel**: OCI label `sh.gsd-test.image-version` set at build time via `ARG IMAGE_VERSION`. `CheckImageVersion` reads this label.
+- **Image-version sentinel**: OCI label `sh.gsd-test.image-version` set at build time via `ARG IMAGE_VERSION`. `CheckImageVersion` reads this label. A companion `sh.gsd-test.node-major` label records the Node major (ADR-0024).
 
-Images are published to GHCR on every `v*.*.*` tag by `.github/workflows/publish-tester-images.yml`. The publish workflow verifies the sentinel label before succeeding.
+Images are published to GHCR on every `v*.*.*` tag by `.github/workflows/publish-tester-images.yml`, which builds a Node-major matrix (one image per OS × Node LTS major). The publish workflow verifies both sentinel labels on every architecture before succeeding.
 
 ## Event emission contract
 
@@ -130,3 +130,5 @@ All design decisions live in [docs/adr/](adr/). Read them in numeric order for t
 | 0021 | Run-and-die execution and two-tier reaping |
 | 0022 | Agent test handoff and installer |
 | 0023 | Failure-first run output: artifact dir, verdict, truncation, grouping, lossless emit |
+| 0024 | Node-matrix Tester Images: node-suffixed tags + node-major sentinel |
+| 0025 | Capacity-aware pull scheduler for OS×Node fan-out (extends ADR-0016) |

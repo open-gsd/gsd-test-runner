@@ -158,7 +158,7 @@ windows = ["22"]
 
 If an OS is absent from `[node]` (or `[node]` is omitted entirely), `gsd-test` falls back to `config.DefaultNodeLTS()` — the currently-supported Node LTS lines. Each entry must be one of `"linux"`, `"windows"`, or `"macos"`; each version must be digits only (e.g. `"22"`, not `"v22"` or `"latest"`); and a version may not repeat within one OS's list. The `--node` CLI flag overrides this table (and the LTS default) for every target OS in that invocation — see [CLI flags](#cli-flags) below.
 
-`gsd-test` runs one Tester Image per (OS × Node major) cell; each cell uses the Tester Image published for that OS and Node major (tag suffix `-node<major>`, e.g. `gsd-tester-linux:v1.5.0-node22`). See [Setting up Benches](benches.md#nodejs-version-matrix-and-fan-out) for how cells are dispatched across Benches.
+`gsd-test` runs one Tester Image per (OS × Node major) cell; each cell uses the Tester Image published for that OS and Node major (tag suffix `-node<major>`, e.g. `gsd-tester-linux:v1.6.0-node22`). See [The Node version matrix](node-matrix.md) for the full picture and [Setting up Benches](benches.md#nodejs-version-matrix-and-fan-out) for how cells are dispatched across Benches.
 
 ## `[testing]`
 
