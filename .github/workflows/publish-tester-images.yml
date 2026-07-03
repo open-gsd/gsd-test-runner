@@ -20,10 +20,21 @@ permissions:
 env:
   REGISTRY: ghcr.io
   IMAGE_NAMESPACE: ${{ github.repository_owner }}
+  # Node majors published as Tester Images (Slice 1 of enhancement #108).
+  # Currently-supported LTS lines as of 2026-07 -- see the Node.js release
+  # schedule (https://github.com/nodejs/release#release-schedule) to decide
+  # when to add/drop a line. DEFAULT_NODE_MAJOR is the one that also gets
+  # the plain `:latest` / un-suffixed `:<tag>` aliases.
+  DEFAULT_NODE_MAJOR: "24"
 
 jobs:
   publish-linux:
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        # Keep in sync with DEFAULT_NODE_MAJOR above; add a line here to
+        # publish another major.
+        node: ["22", "24"]
     steps:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
@@ -62,10 +73,12 @@ jobs:
           push: true
           platforms: linux/amd64,linux/arm64
           tags: |
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/gsd-tester-linux:${{ steps.version.outputs.tag }}
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/gsd-tester-linux:latest
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/gsd-tester-linux:${{ steps.version.outputs.tag }}-node${{ matrix.node }}
+            ${{ matrix.node == env.DEFAULT_NODE_MAJOR && format('{0}/{1}/gsd-tester-linux:{2}', env.REGISTRY, env.IMAGE_NAMESPACE, steps.version.outputs.tag) || '' }}
+            ${{ matrix.node == env.DEFAULT_NODE_MAJOR && format('{0}/{1}/gsd-tester-linux:latest', env.REGISTRY, env.IMAGE_NAMESPACE) || '' }}
           build-args: |
             IMAGE_VERSION=${{ steps.version.outputs.tag }}
+            NODE_VERSION=${{ matrix.node }}
           labels: |
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
@@ -76,12 +89,17 @@ jobs:
           # buildx imagetools inspect understands multi-arch manifest lists.
           # 'docker image inspect' on a manifest index returns the index entry,
           # not a single image config -- use imagetools instead.
-          IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/gsd-tester-linux:${{ steps.version.outputs.tag }}"
+          IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/gsd-tester-linux:${{ steps.version.outputs.tag }}-node${{ matrix.node }}"
           OUTPUT=$(docker buildx imagetools inspect "$IMAGE" --format '{{ json .Image }}')
           # Verify amd64
           LABEL=$(echo "$OUTPUT" | jq -r '."linux/amd64".config.Labels."sh.gsd-test.image-version"')
           if [[ "$LABEL" != "${{ steps.version.outputs.tag }}" ]]; then
             echo "::error::Sentinel label mismatch (amd64): expected '${{ steps.version.outputs.tag }}', got '$LABEL'"
+            exit 1
+          fi
+          NODE_LABEL=$(echo "$OUTPUT" | jq -r '."linux/amd64".config.Labels."sh.gsd-test.node-major"')
+          if [[ "$NODE_LABEL" != "${{ matrix.node }}" ]]; then
+            echo "::error::Node-major label mismatch (amd64): expected '${{ matrix.node }}', got '$NODE_LABEL'"
             exit 1
           fi
           # Verify arm64
@@ -90,10 +108,20 @@ jobs:
             echo "::error::Sentinel label mismatch (arm64): expected '${{ steps.version.outputs.tag }}', got '$LABEL_ARM'"
             exit 1
           fi
-          echo "Sentinel label OK on both amd64 + arm64: $LABEL"
+          NODE_LABEL_ARM=$(echo "$OUTPUT" | jq -r '."linux/arm64".config.Labels."sh.gsd-test.node-major"')
+          if [[ "$NODE_LABEL_ARM" != "${{ matrix.node }}" ]]; then
+            echo "::error::Node-major label mismatch (arm64): expected '${{ matrix.node }}', got '$NODE_LABEL_ARM'"
+            exit 1
+          fi
+          echo "Sentinel label OK on both amd64 + arm64: $LABEL (node-major $NODE_LABEL)"
 
   publish-windows:
     runs-on: windows-2022
+    strategy:
+      matrix:
+        # Keep in sync with DEFAULT_NODE_MAJOR above; add a line here to
+        # publish another major.
+        node: ["22", "24"]
     steps:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
@@ -148,29 +176,43 @@ jobs:
         shell: pwsh
         run: |
           $tag = "${{ steps.version.outputs.tag }}"
-          $image = "${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/gsd-tester-windows:$tag"
-          $latest = "${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/gsd-tester-windows:latest"
+          $node = "${{ matrix.node }}"
+          $image = "${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/gsd-tester-windows:$tag-node$node"
+          # Only the default major also gets the plain (un-suffixed) tag and
+          # :latest, so existing consumers keep working.
+          $images = @($image)
+          if ($node -eq "${{ env.DEFAULT_NODE_MAJOR }}") {
+            $images += "${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/gsd-tester-windows:$tag"
+            $images += "${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/gsd-tester-windows:latest"
+          }
+          $tagArgs = $images | ForEach-Object { '-t', $_ }
           docker build `
             -f dockerfiles/windows.Dockerfile `
             --build-arg "IMAGE_VERSION=$tag" `
+            --build-arg "NODE_VERSION=$node" `
             --label "org.opencontainers.image.source=https://github.com/${{ github.repository }}" `
             --label "org.opencontainers.image.revision=${{ github.sha }}" `
             --label "org.opencontainers.image.version=$tag" `
-            -t $image -t $latest .
-          docker push $image
-          docker push $latest
+            @tagArgs .
+          foreach ($i in $images) { docker push $i }
 
       - name: Verify sentinel label
         shell: pwsh
         run: |
           $tag = "${{ steps.version.outputs.tag }}"
-          $image = "${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/gsd-tester-windows:$tag"
+          $node = "${{ matrix.node }}"
+          $image = "${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/gsd-tester-windows:$tag-node$node"
           $label = docker image inspect $image --format '{{ index .Config.Labels "sh.gsd-test.image-version" }}'
           if ($label -ne $tag) {
             Write-Host "::error::Sentinel label mismatch: expected '$tag', got '$label'"
             exit 1
           }
-          Write-Host "Sentinel label OK: $label"
+          $nodeLabel = docker image inspect $image --format '{{ index .Config.Labels "sh.gsd-test.node-major" }}'
+          if ($nodeLabel -ne $node) {
+            Write-Host "::error::Node-major label mismatch: expected '$node', got '$nodeLabel'"
+            exit 1
+          }
+          Write-Host "Sentinel label OK: $label (node-major $nodeLabel)"
 
   tag-macos-alias:
     # Per ADR-0020 (amended 2026-05-24): the macOS Tester Image is a re-tagged
@@ -179,6 +221,11 @@ jobs:
     # image as content. Pure manifest operation; no rebuild.
     needs: publish-linux
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        # Keep in sync with DEFAULT_NODE_MAJOR above; add a line here to
+        # publish another major.
+        node: ["22", "24"]
     steps:
       - name: Resolve version
         id: version
@@ -207,12 +254,20 @@ jobs:
           # silently drops the other architectures from the manifest. imagetools
           # operates on the registry index directly, preserving all platforms.
           TAG="${{ steps.version.outputs.tag }}"
-          LINUX_IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/gsd-tester-linux:$TAG"
-          MACOS_IMAGE_VERSIONED="${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/gsd-tester-macos:$TAG"
-          MACOS_IMAGE_LATEST="${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/gsd-tester-macos:latest"
+          NODE="${{ matrix.node }}"
+          LINUX_IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/gsd-tester-linux:$TAG-node$NODE"
+          MACOS_IMAGE_VERSIONED="${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/gsd-tester-macos:$TAG-node$NODE"
 
           docker buildx imagetools create --tag "$MACOS_IMAGE_VERSIONED" "$LINUX_IMAGE"
-          docker buildx imagetools create --tag "$MACOS_IMAGE_LATEST" "$LINUX_IMAGE"
+
+          # Only the default major also gets the plain (un-suffixed) tag and
+          # :latest, so existing consumers keep working.
+          if [[ "$NODE" == "${{ env.DEFAULT_NODE_MAJOR }}" ]]; then
+            MACOS_IMAGE_PLAIN="${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/gsd-tester-macos:$TAG"
+            MACOS_IMAGE_LATEST="${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/gsd-tester-macos:latest"
+            docker buildx imagetools create --tag "$MACOS_IMAGE_PLAIN" "$LINUX_IMAGE"
+            docker buildx imagetools create --tag "$MACOS_IMAGE_LATEST" "$LINUX_IMAGE"
+          fi
 
       - name: Verify sentinel label on alias (multi-arch aware)
         run: |
@@ -220,11 +275,17 @@ jobs:
           # buildx imagetools inspect works on multi-arch manifests; docker image
           # inspect would return the index entry rather than a platform image config.
           TAG="${{ steps.version.outputs.tag }}"
-          IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/gsd-tester-macos:$TAG"
+          NODE="${{ matrix.node }}"
+          IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/gsd-tester-macos:$TAG-node$NODE"
           OUTPUT=$(docker buildx imagetools inspect "$IMAGE" --format '{{ json .Image }}')
           LABEL=$(echo "$OUTPUT" | jq -r '."linux/amd64".config.Labels."sh.gsd-test.image-version"')
           if [[ "$LABEL" != "$TAG" ]]; then
             echo "::error::Sentinel label mismatch on macOS alias (amd64): expected '$TAG', got '$LABEL'"
             exit 1
           fi
-          echo "Sentinel label OK on macOS alias: $LABEL"
+          NODE_LABEL=$(echo "$OUTPUT" | jq -r '."linux/amd64".config.Labels."sh.gsd-test.node-major"')
+          if [[ "$NODE_LABEL" != "$NODE" ]]; then
+            echo "::error::Node-major label mismatch on macOS alias (amd64): expected '$NODE', got '$NODE_LABEL'"
+            exit 1
+          fi
+          echo "Sentinel label OK on macOS alias: $LABEL (node-major $NODE_LABEL)"
