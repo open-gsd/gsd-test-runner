@@ -18,22 +18,28 @@ LABEL org.opencontainers.image.description="gsd-test Tester Image (Windows)"
 # for NODE_VERSION's major at build time. PowerShell-based fetch.
 SHELL ["powershell", "-Command", "$ErrorActionPreference = 'Stop'; $ProgressPreference = 'SilentlyContinue';"]
 
-# Re-declare NODE_VERSION here: ARG scope doesn't cross the intervening
-# SHELL instruction implicitly for this RUN's $env: lookup, and RUN needs
-# the ARG in-scope to expose it as an environment variable.
+# Re-declare NODE_VERSION here so it is in scope for Docker's ${NODE_VERSION}
+# substitution in the RUN below (ARG scope resets after the FROM/SHELL layers).
 ARG NODE_VERSION
-# NOTE: brace the env var as ${env:NODE_VERSION} inside the wildcard string.
-# A bare "$env:NODE_VERSION.*" makes PowerShell's tokenizer fail to bound the
-# variable name before the '.', throwing `Unexpected token` / ExpectedValue-
-# Expression and aborting the whole image build (regression: publish-windows
-# failed on every tag through v1.6.0). The braces delimit the name so '.*' is
-# literal. Other $env:NODE_VERSION uses below are fine — none are followed by '.'.
+# IMPORTANT — Windows RUN quoting: this is a shell-form RUN under an exec-form
+# `SHELL ["powershell","-Command",...]`. Docker appends the RUN command to that
+# argv, and Windows' CommandLineToArgvW strips *double* quotes before PowerShell
+# ever parses the script — so a double-quoted string like "v...*" arrives as a
+# bare word and the build dies with `Unexpected token` / ExpectedValueExpression
+# (regression: publish-windows failed on every tag through v1.6.1). Single quotes
+# survive transport untouched, which is why the git RUN below always worked.
+# Rules for this block:
+#   1. Use ONLY single-quoted strings (never double quotes).
+#   2. Inject the Node major via Docker's ${NODE_VERSION} ARG substitution
+#      (baked in at build time), NOT PowerShell's $env:NODE_VERSION — an ARG is
+#      not exposed to the process environment, so $env:NODE_VERSION is empty.
+#   3. Splice runtime values ($ver) with string concatenation, not interpolation.
 RUN $index = Invoke-RestMethod -UseBasicParsing -Uri 'https://nodejs.org/dist/index.json'; \
-    $match = $index | Where-Object { $_.version -like "v${env:NODE_VERSION}.*" } | Select-Object -First 1; \
-    if (-not $match) { Write-Error "No Node release found for major version $env:NODE_VERSION"; exit 1 }; \
+    $match = $index | Where-Object { $_.version -like 'v${NODE_VERSION}.*' } | Select-Object -First 1; \
+    if (-not $match) { Write-Error 'No Node release found for major version ${NODE_VERSION}'; exit 1 }; \
     $ver = $match.version; \
-    Write-Host "Resolved Node $env:NODE_VERSION -> $ver"; \
-    $url = "https://nodejs.org/dist/$ver/node-$ver-x64.msi"; \
+    Write-Host ('Resolved Node ${NODE_VERSION} -> ' + $ver); \
+    $url = 'https://nodejs.org/dist/' + $ver + '/node-' + $ver + '-x64.msi'; \
     Invoke-WebRequest -UseBasicParsing -Uri $url -OutFile node.msi; \
     Start-Process msiexec.exe -ArgumentList '/i', 'node.msi', '/quiet', '/norestart' -Wait; \
     Remove-Item node.msi
