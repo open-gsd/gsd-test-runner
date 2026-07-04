@@ -1,8 +1,12 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
+import { spawn } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 
-import { ActiveTracker, runWithWatchdog } from './watchdog.mjs';
+import { ActiveTracker, runWithWatchdog, main } from './watchdog.mjs';
+
+const WATCHDOG_CLI = fileURLToPath(new URL('./watchdog.mjs', import.meta.url));
 
 // ── ActiveTracker — feeds kill.lastActiveTest / inFlightTests (ADR-0021 §C) ──
 
@@ -217,4 +221,78 @@ test('collectSamples is empty without a dir, and skips malformed lines', () => {
   const got = collectSamples(dir);
   assert.equal(got.length, 1);
   assert.equal(got[0].samples.length, 1, 'malformed line skipped, good line kept');
+});
+
+// ── main: drain contract (regression for "parse watchdog envelope: unexpected
+//    end of JSON input") ──────────────────────────────────────────────────────
+//
+// main() must exit from the stdout.write *callback*, not synchronously after
+// it. A large envelope (multi-MB, tens of thousands of perTest entries) exceeds
+// the kernel pipe buffer (~64KB); write queues the remainder and process.exit()
+// would truncate the unflushed tail, leaving the dispatcher with empty/partial
+// stdout. The two tests below pin the contract: the unit test proves exit is
+// deferred until the write drains under simulated backpressure; the subprocess
+// test proves a real large envelope survives end-to-end.
+
+test('main defers exit until stdout drains (no exit-before-flush under backpressure)', async () => {
+  // Simulate a slow pipe: write() accepts the chunk but holds its callback
+  // (the kernel has not drained yet). exit must NOT fire until the callback runs.
+  let exitCalled = false;
+  let exitCode = null;
+  let drainCb = null;
+  let written = '';
+  const stdout = {
+    write(chunk, cb) { written += chunk; drainCb = cb; },
+  };
+  const exit = (c) => { exitCalled = true; exitCode = c; };
+
+  const runP = main(
+    ['--deadline-ms', '30000', '--', process.execPath, '-e', 'process.exit(0)'],
+    { stdout, exit },
+  );
+  const code = await runP;
+
+  // While backpressure holds the drain callback, exit must still be pending.
+  assert.equal(exitCalled, false, 'exit must wait for stdout to drain, not fire on write');
+  assert.ok(typeof drainCb === 'function', 'write was issued with a drain callback');
+
+  // Release the held callback (pipe drains) → exit fires from within it.
+  drainCb();
+  await new Promise((r) => setImmediate(r));
+  assert.equal(exitCalled, true, 'exit fires once stdout has drained');
+  assert.equal(exitCode, code, 'exit code matches the run result');
+
+  const env = JSON.parse(written);
+  assert.equal(env.outcome, 'completed', 'envelope is complete, parseable JSON');
+});
+
+test('main CLI drains a large envelope before exit (no truncation of a multi-MB payload)', async () => {
+  // A wrapped command emitting 5000 reporter test pairs → ~500KB envelope, far
+  // beyond the ~64KB pipe buffer. Before the drain fix, process.exit() truncated
+  // the unflushed tail and the parent read empty/partial stdout, surfacing as
+  // "dispatch: parse watchdog envelope: unexpected end of JSON input".
+  const childScript =
+    "let s='';" +
+    "for(let i=0;i<5000;i++){" +
+    "s+=JSON.stringify({type:'test:start',data:{file:'f.test.js',name:'t'+i}})+'\\n';" +
+    "s+=JSON.stringify({type:'test_event',kind:'pass',file:'f.test.js',name:'t'+i,duration_ms:1})+'\\n';" +
+    "}" +
+    "process.stdout.write(s);";
+
+  const out = await new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, [
+      WATCHDOG_CLI, '--deadline-ms', '60000', '--', process.execPath, '-e', childScript,
+    ]);
+    let stdout = '';
+    child.stdout.on('data', (c) => { stdout += c; });
+    child.on('error', reject);
+    child.on('close', () => resolve(stdout));
+  });
+
+  // The envelope is the last non-empty line; it must be complete + parseable
+  // and carry every perTest entry (no truncation).
+  const lines = out.split('\n').filter(Boolean);
+  const env = JSON.parse(lines[lines.length - 1]);
+  assert.equal(env.outcome, 'completed');
+  assert.equal(env.perTest.length, 5000, 'full envelope survived the pipe — no truncation');
 });

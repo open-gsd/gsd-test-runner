@@ -341,16 +341,29 @@ export function parseWatchdogArgs(argv) {
  * main is the container entrypoint: parse args, run the wrapped command under
  * the watchdog, print the result envelope as JSON on stdout, and exit with
  * EXIT_REAPED when reaped (distinct from a test failure).
+ *
+ * Drain contract: the envelope is written and `exit` is invoked from the
+ * `stdout.write` *callback*, not synchronously after it. A large envelope
+ * (tens of thousands of perTest entries — multi-MB) exceeds the kernel pipe
+ * buffer (~64KB) and `stdout.write` queues the remainder; calling `exit`
+ * synchronously would truncate the unflushed tail, leaving the dispatcher
+ * with empty/partial stdout (`dispatch: parse watchdog envelope: unexpected
+ * end of JSON input`). Exiting from the write callback guarantees the full
+ * payload has been accepted by the kernel pipe first. `stdout`/`exit` are
+ * injectable for tests so they don't have to drive the real process exit.
  */
-export async function main(argv) {
+export async function main(argv, { stdout = process.stdout, exit = (c) => process.exit(c) } = {}) {
   const { deadlineMs, graceMs, reason, granularity, command, args } = parseWatchdogArgs(argv);
   const res = await runWithWatchdog({ command, args, deadlineMs, graceMs, reason, granularity });
-  process.stdout.write(JSON.stringify(res) + '\n');
-  if (res.outcome === 'reaped') return EXIT_REAPED;
-  return res.exitCode ?? 0;
+  const code = res.outcome === 'reaped' ? EXIT_REAPED : (res.exitCode ?? 0);
+  stdout.write(JSON.stringify(res) + '\n', () => exit(code));
+  return code;
 }
 
 // Run as a CLI when invoked directly (node watchdog.mjs ...), not when imported.
+// main() writes the envelope and exits itself once stdout drains — do NOT add a
+// `.then(process.exit)` here: that would race the flush and re-introduce the
+// truncation bug the drain contract above exists to prevent.
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
-  main(process.argv.slice(2)).then((code) => process.exit(code));
+  main(process.argv.slice(2));
 }
