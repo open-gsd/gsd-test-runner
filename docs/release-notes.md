@@ -10,10 +10,21 @@ This page summarizes the recent releases so you can quickly decide what to adopt
 - `v1.4.0`: run-and-die for coding agents — the `gsd-test run` handoff, a one-command installer, and non-blocking `--async`/`wait`/`status`
 - `v1.5.0`: failure-first output — a quiet-by-default stream, a loud machine-readable verdict, and saved `FAILURES.md` / `failures.json` / `junit.xml` artifacts; plus ephemeral run storage you opt out of with `--keep` or `[storage]`
 - `v1.6.0`: Node LTS matrix — test your project on every supported Node LTS line at once, fanned out across your Benches with per-Bench concurrency
+- `v1.6.1`: fixes `run`/`wait`/`submit` reporting `infra_error` on large suites — the watchdog now drains its result envelope to the dispatcher before exiting
 
 ## Unreleased
 
 _Nothing yet — changes land here before the next tagged release._
+
+## v1.6.1
+
+### Fixed
+
+- **Large suites no longer fail with `infra_error`.** Every run-and-die dispatch (`gsd-test run` / `wait`, `submit --execute`) could return `outcome:"infra_error"` (exit 2) with `parse watchdog envelope: unexpected end of JSON input` on a large suite — the container ran the whole suite green, but the dispatcher received a truncated result. The in-container watchdog wrote its multi-MB JSON envelope to stdout and exited before the kernel pipe (~64 KB buffer) had drained, so the tail was lost. The watchdog now defers its exit until stdout has fully drained, so the complete envelope always reaches the dispatcher (issue #111). The legacy synchronous `gsd-test` path was never affected — it streams events rather than relying on the envelope.
+
+### Why it matters
+
+The truncation scaled with suite size, so it hit exactly the large suites that most need unattended run-and-die dispatch — and because the run-and-die verdict gates the gsd-core push gate, an affected suite silently blocked pushes despite passing. Upgrade to v1.6.1 (binary **and** Tester Images) to clear it.
 
 ## v1.6.0
 
