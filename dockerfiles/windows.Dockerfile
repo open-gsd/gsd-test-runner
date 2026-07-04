@@ -22,8 +22,14 @@ SHELL ["powershell", "-Command", "$ErrorActionPreference = 'Stop'; $ProgressPref
 # SHELL instruction implicitly for this RUN's $env: lookup, and RUN needs
 # the ARG in-scope to expose it as an environment variable.
 ARG NODE_VERSION
+# NOTE: brace the env var as ${env:NODE_VERSION} inside the wildcard string.
+# A bare "$env:NODE_VERSION.*" makes PowerShell's tokenizer fail to bound the
+# variable name before the '.', throwing `Unexpected token` / ExpectedValue-
+# Expression and aborting the whole image build (regression: publish-windows
+# failed on every tag through v1.6.0). The braces delimit the name so '.*' is
+# literal. Other $env:NODE_VERSION uses below are fine — none are followed by '.'.
 RUN $index = Invoke-RestMethod -UseBasicParsing -Uri 'https://nodejs.org/dist/index.json'; \
-    $match = $index | Where-Object { $_.version -like "v$env:NODE_VERSION.*" } | Select-Object -First 1; \
+    $match = $index | Where-Object { $_.version -like "v${env:NODE_VERSION}.*" } | Select-Object -First 1; \
     if (-not $match) { Write-Error "No Node release found for major version $env:NODE_VERSION"; exit 1 }; \
     $ver = $match.version; \
     Write-Host "Resolved Node $env:NODE_VERSION -> $ver"; \
