@@ -18,9 +18,14 @@ LABEL org.opencontainers.image.description="gsd-test Tester Image (Windows)"
 # for NODE_VERSION's major at build time. PowerShell-based fetch.
 SHELL ["powershell", "-Command", "$ErrorActionPreference = 'Stop'; $ProgressPreference = 'SilentlyContinue';"]
 
-# Re-declare NODE_VERSION here so it is in scope for Docker's ${NODE_VERSION}
-# substitution in the RUN below (ARG scope resets after the FROM/SHELL layers).
+# Re-declare NODE_VERSION here, then promote it to a real environment variable
+# so PowerShell can read it at RUN time via $env:NODE_VERSION. An ARG alone is
+# NOT exposed to the process environment; and Docker's in-RUN ${NODE_VERSION}
+# substitution — which works on Linux — does NOT fire for this shell-form RUN on
+# the Windows builder (the literal `${NODE_VERSION}` reached PowerShell and
+# matched no Node release). ENV promotion is the builder-agnostic channel.
 ARG NODE_VERSION
+ENV NODE_VERSION=$NODE_VERSION
 # IMPORTANT — Windows RUN quoting: this is a shell-form RUN under an exec-form
 # `SHELL ["powershell","-Command",...]`. Docker appends the RUN command to that
 # argv, and Windows' CommandLineToArgvW strips *double* quotes before PowerShell
@@ -30,15 +35,15 @@ ARG NODE_VERSION
 # survive transport untouched, which is why the git RUN below always worked.
 # Rules for this block:
 #   1. Use ONLY single-quoted strings (never double quotes).
-#   2. Inject the Node major via Docker's ${NODE_VERSION} ARG substitution
-#      (baked in at build time), NOT PowerShell's $env:NODE_VERSION — an ARG is
-#      not exposed to the process environment, so $env:NODE_VERSION is empty.
-#   3. Splice runtime values ($ver) with string concatenation, not interpolation.
+#   2. Read the Node major from $env:NODE_VERSION (set by the ENV above) as a
+#      bare expression — never inside a double-quoted string.
+#   3. Splice values ($env:NODE_VERSION, $ver) with string concatenation, so no
+#      variable is ever adjacent to a '.' inside a quoted string.
 RUN $index = Invoke-RestMethod -UseBasicParsing -Uri 'https://nodejs.org/dist/index.json'; \
-    $match = $index | Where-Object { $_.version -like 'v${NODE_VERSION}.*' } | Select-Object -First 1; \
-    if (-not $match) { Write-Error 'No Node release found for major version ${NODE_VERSION}'; exit 1 }; \
+    $match = $index | Where-Object { $_.version -like ('v' + $env:NODE_VERSION + '.*') } | Select-Object -First 1; \
+    if (-not $match) { Write-Error ('No Node release found for major version ' + $env:NODE_VERSION); exit 1 }; \
     $ver = $match.version; \
-    Write-Host ('Resolved Node ${NODE_VERSION} -> ' + $ver); \
+    Write-Host ('Resolved Node ' + $env:NODE_VERSION + ' -> ' + $ver); \
     $url = 'https://nodejs.org/dist/' + $ver + '/node-' + $ver + '-x64.msi'; \
     Invoke-WebRequest -UseBasicParsing -Uri $url -OutFile node.msi; \
     Start-Process msiexec.exe -ArgumentList '/i', 'node.msi', '/quiet', '/norestart' -Wait; \
