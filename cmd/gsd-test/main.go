@@ -131,7 +131,7 @@ func main() {
 
 // run is the testable entry point. stdout receives renderer output; stderr
 // receives diagnostic errors from each phase. Returns an exit code (0/1/2).
-func run(args []string, stdout, stderr *os.File) int {
+func run(args []string, stdout, stderr io.Writer) int {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
@@ -218,7 +218,7 @@ func run(args []string, stdout, stderr *os.File) int {
 // Exit codes: 0 = accepted / all passed; 1 = the run failed or was reaped;
 // 2 = the spec could not be read/validated or the run could not be started
 // (inconclusive), consistent with the fail-loud contract.
-func runSubmit(args []string, stdout, stderr *os.File) int {
+func runSubmit(args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("gsd-test submit", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	specFile := fs.String("spec-file", "-", `path to the JSON run spec, or "-" for stdin`)
@@ -286,7 +286,7 @@ func runSubmit(args []string, stdout, stderr *os.File) int {
 // When --async is set, delegation is immediate: a detached worker process is
 // spawned and the function returns exit 0 after printing a dispatched-notice
 // (ADR-0022 Decision 3, issue #70).
-func runRun(args []string, stdout, stderr *os.File) int {
+func runRun(args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("gsd-test run", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	target := fs.String("target", "linux", "target OS: linux | windows | macos-container")
@@ -372,7 +372,7 @@ func runRun(args []string, stdout, stderr *os.File) int {
 // dispatched-notice to stdout, and returns exit 0 immediately. The run
 // continues in the worker process; use `gsd-test wait <run-id>` to collect
 // the result.
-func runAsync(spec runspec.Spec, configPath string, keep bool, stdout, stderr *os.File, spawn spawnFunc) int {
+func runAsync(spec runspec.Spec, configPath string, keep bool, stdout, stderr io.Writer, spawn spawnFunc) int {
 	now := time.Now().UTC()
 	st := runstate.State{
 		RunID:     spec.RunID,
@@ -418,7 +418,7 @@ func runAsync(spec runspec.Spec, configPath string, keep bool, stdout, stderr *o
 // (ADR-0022 Decision 3, issue #70). It is invoked exclusively by realSpawn
 // as a detached process. It loads the runstate, calls dispatchRun, and writes
 // the final state (done + Report or done + Err) before exiting.
-func runWorker(args []string, stdout, stderr *os.File) int {
+func runWorker(args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("gsd-test __run-worker", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	runID := fs.String("run-id", "", "run id (required)")
@@ -480,7 +480,7 @@ func runWorker(args []string, stdout, stderr *os.File) int {
 // waitRun implements `gsd-test wait <run-id>` (ADR-0022 Decision 3, issue #70).
 // It polls until the run reaches Status=done, then renders the verdict identically
 // to a blocking `gsd-test run`. It never renders a partial result.
-func waitRun(args []string, stdout, stderr *os.File) int {
+func waitRun(args []string, stdout, stderr io.Writer) int {
 	if len(args) == 0 {
 		fmt.Fprintln(stderr, "wait: usage: gsd-test wait <run-id>")
 		return exitInconclusive
@@ -598,7 +598,7 @@ func waitRun(args []string, stdout, stderr *os.File) int {
 // It reports in-flight vs done WITHOUT blocking. Exit is always 0 when the run-id
 // is found — status is a pure reporter and must not itself fail because the run
 // failed.
-func statusRun(args []string, stdout, stderr *os.File) int {
+func statusRun(args []string, stdout, stderr io.Writer) int {
 	if len(args) == 0 {
 		fmt.Fprintln(stderr, "status: usage: gsd-test status <run-id>")
 		return exitInconclusive
@@ -657,7 +657,7 @@ func repoRoot() (string, error) {
 // runInstallHooks implements `gsd-test install-agent-hooks` (issue #71,
 // ADR-0022 D5): a one-command, idempotent, reversible installer for the agent
 // integration. Defaults to both runtimes and project scope.
-func runInstallHooks(args []string, stdout, stderr *os.File) int {
+func runInstallHooks(args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("gsd-test install-agent-hooks", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	claude := fs.Bool("claude", false, "install the Claude Code hook + skill (default: both runtimes)")
@@ -734,7 +734,7 @@ func runInstallHooks(args []string, stdout, stderr *os.File) int {
 // Report's Outcome, not signalled by ok — so reaps surface as a loud
 // OutcomeReaped Report, never a silent hang. label prefixes diagnostics so the
 // caller's command name (`submit --execute` / `run`) shows in errors.
-func dispatchRun(spec runspec.Spec, configPath, label string, stderr *os.File) (report.Report, bool) {
+func dispatchRun(spec runspec.Spec, configPath, label string, stderr io.Writer) (report.Report, bool) {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
@@ -843,7 +843,7 @@ func dispatchRun(spec runspec.Spec, configPath, label string, stderr *os.File) (
 // executeSpec dispatches a validated run spec to a Bench (via dispatchRun) and
 // emits the per-OS Report as JSON followed by the ADR-0023 compact verdict line
 // as the final stdout line — the `submit --execute` front door.
-func executeSpec(spec runspec.Spec, configPath string, stdout, stderr *os.File) int {
+func executeSpec(spec runspec.Spec, configPath string, stdout, stderr io.Writer) int {
 	rep, ok := dispatchRun(spec, configPath, "submit --execute", stderr)
 	if !ok {
 		// B-12: emit inconclusive verdict even when dispatch fails so every
