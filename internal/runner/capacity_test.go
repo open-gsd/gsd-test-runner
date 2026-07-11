@@ -1,4 +1,4 @@
-package main
+package runner
 
 import (
 	"context"
@@ -8,7 +8,6 @@ import (
 	"github.com/open-gsd/gsd-test-runner/internal/bench"
 )
 
-// stubNCPU swaps the queryNCPU package var for the duration of a test.
 func stubNCPU(t *testing.T, fn func(ctx context.Context, b bench.Bench) int) {
 	t.Helper()
 	orig := queryNCPU
@@ -16,7 +15,6 @@ func stubNCPU(t *testing.T, fn func(ctx context.Context, b bench.Bench) int) {
 	t.Cleanup(func() { queryNCPU = orig })
 }
 
-// Configured capacity (> 0) wins and the NCPU probe is never consulted.
 func TestCapacity_ConfiguredWins(t *testing.T) {
 	probed := false
 	stubNCPU(t, func(context.Context, bench.Bench) int { probed = true; return 99 })
@@ -31,20 +29,18 @@ func TestCapacity_ConfiguredWins(t *testing.T) {
 	}
 }
 
-// Unset capacity (0) falls back to the Bench's NCPU.
 func TestCapacity_FallsBackToNCPU(t *testing.T) {
 	stubNCPU(t, func(context.Context, bench.Bench) int { return 8 })
 
 	c := newCapacityResolver(context.Background())
-	got := c.capacity(bench.Bench{Name: "b1", OS: "linux"}) // Capacity 0 = unset
+	got := c.capacity(bench.Bench{Name: "b1", OS: "linux"})
 	if got != 8 {
 		t.Errorf("capacity = %d, want 8 (NCPU)", got)
 	}
 }
 
-// A failed/zero NCPU probe floors to serial (1) — never 0.
 func TestCapacity_ProbeFailureFloorsToOne(t *testing.T) {
-	stubNCPU(t, func(context.Context, bench.Bench) int { return 0 }) // 0 == probe error
+	stubNCPU(t, func(context.Context, bench.Bench) int { return 0 })
 
 	c := newCapacityResolver(context.Background())
 	got := c.capacity(bench.Bench{Name: "b1", OS: "linux"})
@@ -53,7 +49,6 @@ func TestCapacity_ProbeFailureFloorsToOne(t *testing.T) {
 	}
 }
 
-// The NCPU probe runs at most once per Bench name (cached).
 func TestCapacity_CachesPerBench(t *testing.T) {
 	var mu sync.Mutex
 	calls := map[string]int{}
