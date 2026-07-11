@@ -11,10 +11,31 @@ This page summarizes the recent releases so you can quickly decide what to adopt
 - `v1.5.0`: failure-first output — a quiet-by-default stream, a loud machine-readable verdict, and saved `FAILURES.md` / `failures.json` / `junit.xml` artifacts; plus ephemeral run storage you opt out of with `--keep` or `[storage]`
 - `v1.6.0`: Node LTS matrix — test your project on every supported Node LTS line at once, fanned out across your Benches with per-Bench concurrency
 - `v1.6.1`: fixes `run`/`wait`/`submit` reporting `infra_error` on large suites — the watchdog now drains its result envelope to the dispatcher before exiting
+- `v1.6.2`: internal architecture cleanup (ADRs 0027/0028) — consolidated image/worktree prep, testable runner policy, pipeline god-file split, streaming-leg dedup; run-and-die now pulls the explicit `:<version>` Tester Image tag
 
 ## Unreleased
 
 _Nothing yet — changes land here before the next tagged release._
+
+## v1.6.2
+
+### Changed (internal)
+
+Architecture-deepening refactors behind [ADR-0027](adr/0027-two-execution-engines-behind-shared-preparation-primitives.md) and [ADR-0028](adr/0028-runner-policy-tested-via-extraction-not-dependency-injection.md). No user-facing API change; the full test suite stayed green throughout.
+
+- **Consolidated Tester Image + worktree preparation** ([ADR-0027](adr/0027-two-execution-engines-behind-shared-preparation-primitives.md)). The standard multi-OS path and the run-and-die path now share one image-policy module — `images.Ref` encodes the [ADR-0024](adr/0024-node-matrix-tester-images.md) tag convention; `images.VerifyImageVersion` is the single version-sentinel check — and one `worktree.Prepare` (resolve + conditional construct). The two execution engines (Pipeline + Watchdog) stay separate; they're a real seam, not duplication.
+- **Runner policy is now tested via extraction, not dependency injection** ([ADR-0028](adr/0028-runner-policy-tested-via-extraction-not-dependency-injection.md)). `runner.Aggregate` (verdict/exit-code classification) and `runner.ResolveEffective` (flag→config precedence) are pure, directly-tested modules; `Run` keeps its effects. The `workerPIDAlive` liveness guard is now an injectable test seam.
+- **Split the pipeline god file** into `pipeline.go` (legs), `events.go`, `queue.go`, and `errors.go`.
+- **Deduped the streaming legs.** One `streamAndCapture` helper and one `streamError` type replace the copy-pasted NpmCI/Build/RunTests streaming blocks and the three near-identical typed errors.
+- **cmd handlers take `io.Writer`** instead of `*os.File`, so tests can use a `bytes.Buffer`.
+
+### Fixed
+
+- **Run-and-die now pulls the explicit `:<version>` Tester Image tag** instead of untagged (`:latest`). Semantically equivalent per [ADR-0024](adr/0024-node-matrix-tester-images.md) (the plain tag resolves to the Active-LTS build) and the version was already verified via the OCI sentinel label — but the explicit tag is more correct and removes a latent drift risk. A Bench holding only an untagged image will now fall back to building from the in-repo Dockerfile.
+
+### Why it matters
+
+No change to the common path. The cleanup concentrates the policies that were drifting (image tag/version, streaming capture) so the next fix applies once; the tag-pin removes a silent-drift risk where `:latest` could move under a pinned config.
 
 ## v1.6.1
 
