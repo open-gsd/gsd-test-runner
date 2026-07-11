@@ -9,6 +9,7 @@ import (
 
 	"github.com/open-gsd/gsd-test-runner/internal/bench"
 	"github.com/open-gsd/gsd-test-runner/internal/dockerexec"
+	"github.com/open-gsd/gsd-test-runner/internal/reaper"
 )
 
 // ImageID is a fully-qualified Tester Image reference, typically
@@ -235,3 +236,74 @@ func (e *BuildError) Error() string {
 // BenchDockerError is an alias kept for package-local convenience; the
 // canonical definition lives in internal/bench.
 type BenchDockerError = bench.BenchDockerError
+
+// ImageVersionLabel is the OCI sentinel label carrying the Tester Image's
+// release version (ADR-0011). Reverse-DNS, matching the run-container labels.
+// The Node major is a separate label (ADR-0024); this one stays un-suffixed.
+const ImageVersionLabel = "sh.gsd-test.image-version"
+
+// ImageVersionMismatch is returned when the image's sentinel label does not
+// match the version expected for this repo checkout — the "stale image silently
+// produces wrong results" failure class, surfaced loud (ADR-0011/ADR-0004).
+// Bench is optional, carried for diagnostics when a Bench context is known.
+type ImageVersionMismatch struct {
+	Bench string // optional, for diagnostics
+	Image string
+	Want  string
+	Got   string // "" when the label is absent
+}
+
+func (e *ImageVersionMismatch) Error() string {
+	loc := ""
+	if e.Bench != "" {
+		loc = " on bench " + e.Bench
+	}
+	if e.Got == "" {
+		return fmt.Sprintf("image %s%s: expected version %q but image has no %s label", e.Image, loc, e.Want, ImageVersionLabel)
+	}
+	return fmt.Sprintf("image %s%s: expected version %q, got %q", e.Image, loc, e.Want, e.Got)
+}
+
+// VerifyImageVersion reads the image-version sentinel label via
+// `docker image inspect` and checks it equals want. An empty want skips the
+// check (no expected version configured). runner is the docker-execution seam
+// (reaper.Runner — dockerexec over SSH in production, faked in tests).
+//
+// This is the single version-sentinel check used by both execution engines:
+// the Pipeline engine's CheckImageVersion leg and the Watchdog engine's
+// pre-run check (ADR-0027). It closes the open question noted in this
+// package's doc.go.
+func VerifyImageVersion(ctx context.Context, runner reaper.Runner, imageID, want string) error {
+	if want == "" {
+		return nil
+	}
+	out, err := runner(ctx, "image", "inspect", imageID,
+		"--format", fmt.Sprintf(`{{ index .Config.Labels %q }}`, ImageVersionLabel))
+	if err != nil {
+		return fmt.Errorf("images: inspect image version: %w", err)
+	}
+	got := strings.TrimSpace(string(out))
+	if got != want {
+		return &ImageVersionMismatch{Image: imageID, Want: want, Got: got}
+	}
+	return nil
+}
+
+// Ref constructs a Tester Image reference for osName at version, encoding the
+// ADR-0024 tag convention in one place. When nodeMajor is empty the plain
+// :<version> tag is used (Active-LTS back-compat — the single-Node run-and-die
+// path); otherwise the :<version>-node<major> suffix selects a specific Node
+// matrix image. When version is also empty the reference is untagged (resolves
+// to :latest; version is then verified via the OCI sentinel label rather than
+// the tag). This is the single source of truth for the Tester Image tag policy.
+func Ref(osName, version, nodeMajor string) ImageID {
+	base := fmt.Sprintf("ghcr.io/open-gsd/gsd-tester-%s", osName)
+	if version == "" {
+		return ImageID(base)
+	}
+	tag := version
+	if nodeMajor != "" {
+		tag = version + "-node" + nodeMajor
+	}
+	return ImageID(base + ":" + tag)
+}

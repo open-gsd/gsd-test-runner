@@ -55,11 +55,12 @@ func realSpawn(runID, configPath string) (int, error) {
 	return pid, nil
 }
 
-// workerPIDAlive reports whether a process with the given pid is still alive.
-// It uses kill(pid, 0) which does not send a signal but checks reachability.
-// ESRCH means the process does not exist; treat any other error conservatively
-// as alive (e.g. EPERM — process exists but we lack permission to signal it).
-func workerPIDAlive(pid int) bool {
+// realWorkerPIDAlive reports whether a process with the given pid is still
+// alive. It uses kill(pid, 0) which does not send a signal but checks
+// reachability. ESRCH means the process does not exist; treat any other error
+// conservatively as alive (e.g. EPERM — process exists but we lack permission
+// to signal it). Exposed via the package-level workerPIDAlive seam (ADR-0028).
+func realWorkerPIDAlive(pid int) bool {
 	if pid <= 0 {
 		return false
 	}

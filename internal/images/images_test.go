@@ -497,3 +497,74 @@ func TestIsNotFoundError(t *testing.T) {
 		}
 	}
 }
+
+// TestVerifyImageVersion_Match verifies that a matching sentinel label returns
+// nil and that the inspect command reads the sh.gsd-test.image-version label.
+func TestVerifyImageVersion_Match(t *testing.T) {
+	var got []string
+	runner := func(_ context.Context, args ...string) ([]byte, error) {
+		got = args
+		return []byte("v1.4.0\n"), nil
+	}
+	if err := VerifyImageVersion(context.Background(), runner, "img:v2", "v1.4.0"); err != nil {
+		t.Fatalf("VerifyImageVersion: %v", err)
+	}
+	joined := strings.Join(got, " ")
+	if !strings.Contains(joined, "image inspect") || !strings.Contains(joined, "sh.gsd-test.image-version") {
+		t.Errorf("inspect command missing sentinel label read: %v", got)
+	}
+}
+
+// TestVerifyImageVersion_Mismatch verifies a label mismatch returns
+// *ImageVersionMismatch carrying Want/Got.
+func TestVerifyImageVersion_Mismatch(t *testing.T) {
+	runner := func(_ context.Context, _ ...string) ([]byte, error) {
+		return []byte("v1.3.0"), nil
+	}
+	err := VerifyImageVersion(context.Background(), runner, "img:v2", "v1.4.0")
+	var mm *ImageVersionMismatch
+	if !errors.As(err, &mm) {
+		t.Fatalf("err = %v, want *ImageVersionMismatch", err)
+	}
+	if mm.Want != "v1.4.0" || mm.Got != "v1.3.0" {
+		t.Errorf("mismatch = %+v, want Want=v1.4.0 Got=v1.3.0", mm)
+	}
+}
+
+// TestVerifyImageVersion_EmptyWantSkips verifies an empty want skips the
+// inspect call entirely (no expected version configured).
+func TestVerifyImageVersion_EmptyWantSkips(t *testing.T) {
+	called := false
+	runner := func(_ context.Context, _ ...string) ([]byte, error) {
+		called = true
+		return nil, nil
+	}
+	if err := VerifyImageVersion(context.Background(), runner, "img:v2", ""); err != nil {
+		t.Fatalf("VerifyImageVersion with empty want: %v", err)
+	}
+	if called {
+		t.Error("empty want should skip the inspect call entirely")
+	}
+}
+
+// TestRef encodes the ADR-0024 tag convention: plain tag for the single-Node
+// path, -node<major> suffix for the matrix path, untagged when no version.
+func TestRef(t *testing.T) {
+	cases := []struct {
+		name              string
+		os, ver, node     string
+		want              ImageID
+	}{
+		{"matrix tag", "linux", "v1.5.0", "22", "ghcr.io/open-gsd/gsd-tester-linux:v1.5.0-node22"},
+		{"plain tag (single node)", "windows", "v1.5.0", "", "ghcr.io/open-gsd/gsd-tester-windows:v1.5.0"},
+		{"untagged (no version)", "linux", "", "", "ghcr.io/open-gsd/gsd-tester-linux"},
+		{"untagged (no version, node ignored)", "linux", "", "22", "ghcr.io/open-gsd/gsd-tester-linux"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := Ref(tc.os, tc.ver, tc.node); got != tc.want {
+				t.Errorf("Ref(%q,%q,%q) = %q, want %q", tc.os, tc.ver, tc.node, got, tc.want)
+			}
+		})
+	}
+}

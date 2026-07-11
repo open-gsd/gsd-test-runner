@@ -10,6 +10,8 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+
+	"github.com/open-gsd/gsd-test-runner/internal/refs"
 )
 
 // Options configures a PR-merged worktree construction. All fields except
@@ -38,17 +40,22 @@ type Options struct {
 }
 
 // Worktree is a handle to a constructed PR-merged worktree. Callers must
-// Close it when done to remove the scratch directory.
+// Close it when done to remove the scratch directory. A Worktree backed by a
+// repo directly (Prepare with an empty base ref) has managed=false and Close
+// is a no-op — the user's repo is never removed.
 type Worktree struct {
-	path   string
-	mu     sync.Mutex
-	closed bool
+	path    string
+	managed bool // true if Close should RemoveAll the path (a scratch clone); false for repo-as-is
+	mu      sync.Mutex
+	closed  bool
 }
 
 // Path returns the absolute path to the worktree on disk.
 func (w *Worktree) Path() string { return w.path }
 
-// Close removes the scratch directory. Idempotent.
+// Close removes the scratch directory when the worktree is managed (i.e. a
+// scratch clone built by Construct/Prepare). It is a no-op for an unmanaged
+// worktree backed by the user's repo directly. Idempotent.
 func (w *Worktree) Close() error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -56,7 +63,7 @@ func (w *Worktree) Close() error {
 		return nil
 	}
 	w.closed = true
-	if w.path == "" {
+	if w.path == "" || !w.managed {
 		return nil
 	}
 	return os.RemoveAll(w.path)
@@ -373,7 +380,42 @@ func Construct(ctx context.Context, opts Options) (*Worktree, error) {
 	}
 
 	// 6. Success.
-	return &Worktree{path: cloneTarget}, nil
+	return &Worktree{path: cloneTarget, managed: true}, nil
+}
+
+// Prepare resolves a ready-to-run worktree for either execution engine
+// (ADR-0027). It is the shared entry point for "give me a worktree to run tests
+// in", folding ref resolution (internal/refs) and the conditional construct:
+//
+//   - When baseRef is empty, the repo is used as-is. The returned Worktree's
+//     Path is repo and Close is a no-op (the repo is NOT removed — managed is
+//     false). This is the run-and-die "run the working tree directly" path.
+//   - When baseRef is non-empty, both refs are resolved to SHAs and a
+//     PR-merged worktree is constructed (via Construct) under scratchDir (or
+//     os.TempDir() when empty); Close removes it.
+//
+// The standard multi-OS path always passes non-empty refs; the run-and-die
+// path passes spec.Base (possibly empty) so "no base" means "run the working
+// tree directly". This unifies the conditional that previously lived inline in
+// cmd/gsd-test/main.go.
+func Prepare(ctx context.Context, repo, baseRef, prRef, scratchDir string) (*Worktree, error) {
+	if baseRef == "" {
+		return &Worktree{path: repo}, nil // managed=false: Close is a no-op
+	}
+	baseSHA, err := refs.Resolve(ctx, repo, baseRef)
+	if err != nil {
+		return nil, err
+	}
+	prSHA, err := refs.Resolve(ctx, repo, prRef)
+	if err != nil {
+		return nil, err
+	}
+	return Construct(ctx, Options{
+		SourceRepo: repo,
+		BaseSHA:    baseSHA,
+		PRSHA:      prSHA,
+		ScratchDir: scratchDir,
+	})
 }
 
 // parseLines splits s on newlines and returns non-empty trimmed lines.

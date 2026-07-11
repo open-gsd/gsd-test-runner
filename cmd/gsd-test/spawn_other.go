@@ -10,5 +10,6 @@ func realSpawn(runID, configPath string) (int, error) {
 	return 0, errors.New("gsd-test: async mode requires a unix workstation")
 }
 
-// workerPIDAlive always returns false on non-unix platforms.
-func workerPIDAlive(pid int) bool { return false }
+// realWorkerPIDAlive always returns false on non-unix platforms. Exposed via
+// the package-level workerPIDAlive seam (ADR-0028).
+func realWorkerPIDAlive(pid int) bool { return false }

@@ -113,7 +113,7 @@ func Build(cfg *config.Config, selector *bench.Selector, targets []string, nodeO
 			p.Runs = append(p.Runs, Run{
 				OS:        os,
 				NodeMajor: major,
-				ImageID:   images.ImageID(fmt.Sprintf("ghcr.io/open-gsd/gsd-tester-%s:%s-node%s", os, version, major)),
+				ImageID:   images.Ref(os, version, major),
 				Version:   version,
 			})
 		}

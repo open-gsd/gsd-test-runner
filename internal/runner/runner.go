@@ -13,7 +13,6 @@ import (
 	"github.com/open-gsd/gsd-test-runner/internal/images"
 	"github.com/open-gsd/gsd-test-runner/internal/plan"
 	"github.com/open-gsd/gsd-test-runner/internal/pipeline"
-	"github.com/open-gsd/gsd-test-runner/internal/refs"
 	"github.com/open-gsd/gsd-test-runner/internal/renderer"
 	"github.com/open-gsd/gsd-test-runner/internal/report"
 	"github.com/open-gsd/gsd-test-runner/internal/schedule"
@@ -65,23 +64,11 @@ func Run(ctx context.Context, opts Options) int {
 		return ExitInconclusive
 	}
 
-	targets := commaSplit(opts.Targets)
-	if len(targets) == 0 {
-		targets = cfg.Defaults.Targets
-	}
-	if len(targets) == 0 {
-		fmt.Fprintln(stderr, "no target OSes specified (use --targets or set defaults.targets in config)")
+	targets, pin, exclude, tgtErr := ResolveEffective(cfg, opts)
+	if tgtErr != nil {
+		fmt.Fprintln(stderr, tgtErr)
 		WriteInconclusiveVerdict(stdout, stderr)
 		return ExitInconclusive
-	}
-
-	pin := opts.Pin
-	if pin == "" {
-		pin = cfg.Defaults.Pin
-	}
-	exclude := commaSplit(opts.Exclude)
-	if len(exclude) == 0 {
-		exclude = cfg.Defaults.Exclude
 	}
 
 	// ── Phase 2: Plan ──────────────────────────────────────────────────────
@@ -103,37 +90,9 @@ func Run(ctx context.Context, opts Options) int {
 	p.AddUnreachable(cfg.Unreachable, targets)
 
 	// ── Construct PR-merged worktree (ADR-0010: refs.Resolve first) ────────
-	baseSHA, rErr := refs.Resolve(ctx, opts.Source, opts.Base)
-	if rErr != nil {
-		fmt.Fprintf(stderr, "refs.Resolve(%q): %v\n", opts.Base, rErr)
-		WriteInconclusiveVerdict(stdout, stderr)
-		return ExitInconclusive
-	}
-	headSHA, rErr := refs.Resolve(ctx, opts.Source, opts.Head)
-	if rErr != nil {
-		fmt.Fprintf(stderr, "refs.Resolve(%q): %v\n", opts.Head, rErr)
-		WriteInconclusiveVerdict(stdout, stderr)
-		return ExitInconclusive
-	}
-
-	scratchDir := opts.Scratch
-	if scratchDir == "" {
-		scratchDir, rErr = os.MkdirTemp("", "gsd-test-")
-		if rErr != nil {
-			fmt.Fprintf(stderr, "create scratch dir: %v\n", rErr)
-			WriteInconclusiveVerdict(stdout, stderr)
-			return ExitInconclusive
-		}
-	}
-
-	wt, wErr := worktree.Construct(ctx, worktree.Options{
-		SourceRepo: opts.Source,
-		BaseSHA:    baseSHA,
-		PRSHA:      headSHA,
-		ScratchDir: scratchDir,
-	})
+	wt, wErr := worktree.Prepare(ctx, opts.Source, opts.Base, opts.Head, opts.Scratch)
 	if wErr != nil {
-		fmt.Fprintf(stderr, "worktree.Construct: %v\n", wErr)
+		fmt.Fprintf(stderr, "worktree.Prepare: %v\n", wErr)
 		WriteInconclusiveVerdict(stdout, stderr)
 		return ExitInconclusive
 	}
@@ -200,50 +159,42 @@ func Run(ctx context.Context, opts Options) int {
 	schedResults := schedule.Run(ctx, units, benchesByOS, capResolver.capacity, work)
 
 	// ── Aggregate + Render ─────────────────────────────────────────────────
-	var sawLegError, sawFail bool
-	reps := make([]report.Report, 0, len(p.Runs))
-	osJSONL := make(map[string]string, len(p.Runs))
+	// Run performs the renderer/artifact side effects (it owns effects; ADR-0028)
+	// while collecting the pure Result inputs for Aggregate (which owns the
+	// classification + exit-code policy). The renderer is fed the ORIGINAL
+	// reports; Aggregate produces the infra-marked reports + exit code for the
+	// verdict/artifacts.
+	policyInputs := make([]Result, 0, len(schedResults))
+	osJSONL := make(map[string]string, len(schedResults))
 	for _, sr := range schedResults {
 		jp := sr.Unit.Payload.(*jobPayload)
 		res, ok := sr.Value.(pipelineResult)
 		if !ok {
 			close(jp.events)
 			fmt.Fprintf(stderr, "%s: not run: %v\n", jp.streamKey, sr.Value)
-			sawLegError = true
-			infra := report.New(jp.run.OS, "", string(jp.run.ImageID), jp.run.Version, time.Now().UTC())
-			infra.NodeMajor = jp.run.NodeMajor
-			infra.Outcome = report.OutcomeInfraError
-			r.AddResult(jp.streamKey, infra, fmt.Errorf("not run: %v", sr.Value))
-			reps = append(reps, infra)
+			orig := report.New(jp.run.OS, "", string(jp.run.ImageID), jp.run.Version, time.Now().UTC())
+			orig.NodeMajor = jp.run.NodeMajor
+			r.AddResult(jp.streamKey, orig, fmt.Errorf("not run: %v", sr.Value))
+			policyInputs = append(policyInputs, Result{
+				OS: jp.run.OS, NodeMajor: jp.run.NodeMajor,
+				ImageID: string(jp.run.ImageID), Version: jp.run.Version,
+				NotRun: fmt.Errorf("not run: %v", sr.Value),
+			})
 			continue
 		}
 		r.AddResult(res.streamKey, res.rep, res.err)
 		osJSONL[res.streamKey] = res.drained
-		if res.err != nil {
-			sawLegError = true
-			infra := res.rep
-			infra.OS = jp.run.OS
-			infra.NodeMajor = jp.run.NodeMajor
-			infra.Outcome = report.OutcomeInfraError
-			reps = append(reps, infra)
-			continue
-		}
-		reps = append(reps, res.rep)
-		if res.rep.Kind == report.KindFail {
-			sawFail = true
-		}
+		policyInputs = append(policyInputs, Result{
+			OS: jp.run.OS, NodeMajor: jp.run.NodeMajor,
+			ImageID: string(jp.run.ImageID), Version: jp.run.Version,
+			Report: res.rep, Err: res.err,
+		})
 	}
 	r.Wait()
 
-	emitRunArtifacts(reps, osJSONL, stdout, stderr)
-
-	if sawLegError || len(p.Skipped) > 0 {
-		return ExitInconclusive
-	}
-	if sawFail {
-		return ExitSomeFailed
-	}
-	return ExitAllPass
+	agg := Aggregate(policyInputs, len(p.Skipped))
+	emitRunArtifacts(agg.Reports, osJSONL, stdout, stderr)
+	return agg.ExitCode
 }
 
 // commaSplit splits s on commas and trims whitespace from each part.

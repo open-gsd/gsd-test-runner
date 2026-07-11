@@ -291,15 +291,15 @@ func TestCheckImageVersion_MismatchedLabel_ReturnsImageVersionMismatch(t *testin
 	if !errors.As(err, &legErr) {
 		t.Fatalf("expected *LegError, got %T", err)
 	}
-	var mismatch *ImageVersionMismatch
+	var mismatch *images.ImageVersionMismatch
 	if !errors.As(legErr.Cause, &mismatch) {
-		t.Fatalf("expected Cause=*ImageVersionMismatch, got %T: %v", legErr.Cause, legErr.Cause)
+		t.Fatalf("expected Cause=*images.ImageVersionMismatch, got %T: %v", legErr.Cause, legErr.Cause)
 	}
-	if mismatch.Expected != "v1.2.3" {
-		t.Errorf("expected Expected=%q, got %q", "v1.2.3", mismatch.Expected)
+	if mismatch.Want != "v1.2.3" {
+		t.Errorf("expected Want=%q, got %q", "v1.2.3", mismatch.Want)
 	}
-	if mismatch.Actual != "v1.2.2" {
-		t.Errorf("expected Actual=%q, got %q", "v1.2.2", mismatch.Actual)
+	if mismatch.Got != "v1.2.2" {
+		t.Errorf("expected Got=%q, got %q", "v1.2.2", mismatch.Got)
 	}
 }
 
@@ -320,12 +320,12 @@ func TestCheckImageVersion_EmptyLabel_ReturnsImageVersionMismatchWithEmptyActual
 	if !errors.As(err, &legErr) {
 		t.Fatalf("expected *LegError, got %T", err)
 	}
-	var mismatch *ImageVersionMismatch
+	var mismatch *images.ImageVersionMismatch
 	if !errors.As(legErr.Cause, &mismatch) {
-		t.Fatalf("expected Cause=*ImageVersionMismatch, got %T", legErr.Cause)
+		t.Fatalf("expected Cause=*images.ImageVersionMismatch, got %T", legErr.Cause)
 	}
-	if mismatch.Actual != "" {
-		t.Errorf("expected Actual=%q (empty), got %q", "", mismatch.Actual)
+	if mismatch.Got != "" {
+		t.Errorf("expected Got=%q (empty), got %q", "", mismatch.Got)
 	}
 }
 
