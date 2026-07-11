@@ -33,7 +33,7 @@ func ensureTesterImage(t *testing.T) {
 		cmd := exec.Command("docker", "build",
 			"-f", filepath.Join(root, "dockerfiles", "linux.Dockerfile"),
 			"--build-arg", "IMAGE_VERSION=e2e",
-			"-t", "ghcr.io/open-gsd/gsd-tester-linux", root)
+			"-t", "ghcr.io/open-gsd/gsd-tester-linux:e2e", root)
 		if out, berr := cmd.CombinedOutput(); berr != nil {
 			t.Fatalf("build tester image: %v\n%s", berr, out)
 		}

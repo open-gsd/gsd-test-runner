@@ -36,7 +36,6 @@ import (
 	"github.com/open-gsd/gsd-test-runner/internal/images"
 	"github.com/open-gsd/gsd-test-runner/internal/installhooks"
 	"github.com/open-gsd/gsd-test-runner/internal/reaper"
-	"github.com/open-gsd/gsd-test-runner/internal/refs"
 	"github.com/open-gsd/gsd-test-runner/internal/report"
 	"github.com/open-gsd/gsd-test-runner/internal/runner"
 	"github.com/open-gsd/gsd-test-runner/internal/runrender"
@@ -70,6 +69,16 @@ type spawnFunc func(runID, configPath string) (pid int, err error)
 // with defer. The real value is set to realSpawn (defined in spawn_unix.go or
 // spawn_other.go depending on build tags).
 var defaultSpawn spawnFunc = realSpawn
+
+// pidAliveFunc reports whether a worker process is still alive. The real
+// implementation uses kill(pid, 0); tests inject a fake to test the waitRun
+// liveness guard without real PIDs or timing tricks (ADR-0028).
+type pidAliveFunc func(pid int) bool
+
+// workerPIDAlive is the package-level liveness seam, matching defaultSpawn's
+// pattern. The real value is set to realWorkerPIDAlive (per-platform). Tests
+// override and restore it with defer.
+var workerPIDAlive pidAliveFunc = realWorkerPIDAlive
 
 // cliFlags holds the parsed CLI flag values.
 type cliFlags struct {
@@ -745,11 +754,11 @@ func dispatchRun(spec runspec.Spec, configPath, label string, stderr *os.File) (
 		return report.Report{}, false
 	}
 
-	// ImageID matches the plan/pipeline convention (untagged ghcr path); the
-	// expected version is verified via the OCI sentinel label, not the docker
-	// tag (sentinel verification for the run-and-die path is a follow-up, like
-	// the pipeline's CheckImageVersion leg).
-	imageID := images.ImageID(fmt.Sprintf("ghcr.io/open-gsd/gsd-tester-%s", spec.Target))
+	// Tester Image reference per the ADR-0024 tag convention (ADR-0027): plain
+	// :<version> tag for the single-Node run-and-die path. When no version is
+	// configured the reference is untagged (resolves to :latest); the version is
+	// then verified via the OCI sentinel label, not the tag.
+	imageID := images.Ref(spec.Target, cfg.Versions[spec.Target], "")
 	if err := images.EnsurePresent(ctx, b, imageID, images.EnsurePresentOptions{
 		FallbackDockerfile: "dockerfiles/" + spec.Target + ".Dockerfile",
 		FallbackContextDir: ".",
@@ -778,7 +787,7 @@ func dispatchRun(spec runspec.Spec, configPath, label string, stderr *os.File) (
 
 	// Verify the Tester Image's version sentinel before running, so a stale
 	// image can't silently produce wrong results (ADR-0011, fail-loud).
-	if err := dispatch.VerifyImageVersion(ctx, runner, string(imageID), cfg.Versions[spec.Target]); err != nil {
+	if err := images.VerifyImageVersion(ctx, runner, string(imageID), cfg.Versions[spec.Target]); err != nil {
 		fmt.Fprintf(stderr, "%s: %v\n", label, err)
 		return report.Report{}, false
 	}
@@ -790,34 +799,15 @@ func dispatchRun(spec runspec.Spec, configPath, label string, stderr *os.File) (
 	median := telemetry.MedianDurationMs(history, spec.Target)
 
 	// Worktree: run Repo as-is, unless base+prBranch ask for a PR-merged
-	// worktree built from Repo (ADR-0021 §A, reusing refs.Resolve + worktree).
-	worktreeDir := spec.Repo
-	if spec.Base != "" {
-		baseSHA, rerr := refs.Resolve(ctx, spec.Repo, spec.Base)
-		if rerr != nil {
-			fmt.Fprintf(stderr, "%s: resolve base %q: %v\n", label, spec.Base, rerr)
-			return report.Report{}, false
-		}
-		headSHA, rerr := refs.Resolve(ctx, spec.Repo, spec.PRBranch)
-		if rerr != nil {
-			fmt.Fprintf(stderr, "%s: resolve prBranch %q: %v\n", label, spec.PRBranch, rerr)
-			return report.Report{}, false
-		}
-		scratch, mkErr := os.MkdirTemp("", "gsd-submit-")
-		if mkErr != nil {
-			fmt.Fprintf(stderr, "%s: scratch dir: %v\n", label, mkErr)
-			return report.Report{}, false
-		}
-		wt, wErr := worktree.Construct(ctx, worktree.Options{
-			SourceRepo: spec.Repo, BaseSHA: baseSHA, PRSHA: headSHA, ScratchDir: scratch,
-		})
-		if wErr != nil {
-			fmt.Fprintf(stderr, "%s: worktree.Construct: %v\n", label, wErr)
-			return report.Report{}, false
-		}
-		defer wt.Close()
-		worktreeDir = wt.Path()
+	// worktree (ADR-0021 §A). The conditional now lives in worktree.Prepare
+	// (ADR-0027): empty baseRef means "run the working tree directly".
+	wt, wErr := worktree.Prepare(ctx, spec.Repo, spec.Base, spec.PRBranch, "")
+	if wErr != nil {
+		fmt.Fprintf(stderr, "%s: worktree.Prepare: %v\n", label, wErr)
+		return report.Report{}, false
 	}
+	defer wt.Close()
+	worktreeDir := wt.Path()
 
 	now := time.Now()
 	eff := spec.Budget.EffectiveDeadlineMs(median)

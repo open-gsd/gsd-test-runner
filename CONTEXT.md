@@ -38,6 +38,22 @@ The per-run payload. Constructed by the Local Engine in a scratch clone: base br
 
 The developer-side launcher, distributed as a single static Go binary per Dev Workstation OS (see ADR-0006). Per OS: (1) constructs the PR-merged worktree on the Dev Workstation, (2) selects a Bench for the target OS and verifies the right Tester Image is present on that Bench (pulls from GHCR if not, or builds from the in-repo Dockerfile as fallback), (3) checks the Image-version sentinel, (4) copies the worktree into a fresh container on the Bench, (5) runs npm ci + build + the full test suite, (6) drains JSON Lines output, (7) emits a Per-OS report. Each target OS runs independently on its assigned Bench; there is no cross-OS comparison.
 
+### Execution engine
+
+The Local Engine's execution step — the thing that actually runs the test suite on a Bench once a PR-merged worktree and a verified Tester Image are ready. There are **two execution engines** (two adapters over the execution seam); they are deliberately **not** unified (ADR-0027). Each composes the shared Preparation primitives in a different order.
+
+### Pipeline engine
+
+The execution engine used by the standard multi-OS path. Runs the 8-leg Pipeline (CheckImageVersion → StartContainer → CopyWorktree → NpmCI → Build → RunTests → Drain → Parse) against an idle `sleep infinity` container, with `docker exec` per leg and live JSONL streaming via a tail goroutine + event channel. Owned by `internal/pipeline`; orchestrated for multi-OS fan-out by `internal/runner` via the capacity scheduler (ADRs 0025, 0026). Provides leg-granular, fail-loud control and live output. Does **not** provide in-container deadline reaping.
+
+### Watchdog engine
+
+The execution engine used by the run-and-die single-OS path (ADR-0021). Runs a single-shot container (`docker create` → `cp` → `start -a`) whose PID 1 is a Node watchdog that does npm ci + build + test in one process, bounded by an estimate-aware deadline, with two-tier reaping (in-container watchdog + Local Engine as remote reaper) and telemetry append. Owned by `internal/dispatch`; invoked from `cmd/gsd-test` (`submit`/`run`/`wait`). Provides deadline-bounded reaping and runaway-test telemetry. Does **not** provide live streaming or multi-OS fan-out.
+
+### Preparation primitives
+
+The shared, engine-agnostic steps both execution engines compose (in different orders): config load, bench selection, Tester Image acquisition + version-sentinel verification, and PR-merged worktree construction. Owned by small deep modules — `internal/images` (`images.Ref`, `images.VerifyImageVersion`) and `internal/worktree` (`worktree.Prepare`) — that both paths call. The preamble is intentionally **not** a single linear spine: the Pipeline engine defers bench selection + image-ensure to the capacity scheduler (ADR-0026), while the Watchdog engine is single-shot and resolves its bench up front. Both orders are correct for their shape (ADR-0027).
+
 ### Per-OS report
 
 The output shape for one OS run. Either `pass x/y` (with x == y) or a structured fail report listing failed tests with file, name, and captured output. Replaces the old cross-platform Diff entirely — if Linux passes and Windows fails, the user reads two reports rather than a divergence summary.

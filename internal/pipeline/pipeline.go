@@ -14,6 +14,7 @@ import (
 	"github.com/open-gsd/gsd-test-runner/internal/bench"
 	"github.com/open-gsd/gsd-test-runner/internal/dockerexec"
 	"github.com/open-gsd/gsd-test-runner/internal/images"
+	"github.com/open-gsd/gsd-test-runner/internal/reaper"
 	"github.com/open-gsd/gsd-test-runner/internal/report"
 )
 
@@ -101,23 +102,6 @@ func (e *LegError) Error() string {
 }
 
 func (e *LegError) Unwrap() error { return e.Cause }
-
-// ImageVersionMismatch reports that the Tester Image's
-// sh.gsd-test.image-version label does not match the expected version
-// (or the label is missing entirely — Actual is "").
-type ImageVersionMismatch struct {
-	Bench    string // Bench.Name
-	Image    string // ImageID
-	Expected string
-	Actual   string // "" when the label is absent
-}
-
-func (e *ImageVersionMismatch) Error() string {
-	if e.Actual == "" {
-		return fmt.Sprintf("image %s on bench %s: expected version %q but image has no sh.gsd-test.image-version label", e.Image, e.Bench, e.Expected)
-	}
-	return fmt.Sprintf("image %s on bench %s: expected version %q, got %q", e.Image, e.Bench, e.Expected, e.Actual)
-}
 
 // ImageNotPresentError reports that the Tester Image is not present
 // on the Bench. Distinguished from BenchDockerError by docker's
@@ -428,36 +412,42 @@ func (p *Pipeline) CheckImageVersion(ctx context.Context) error {
 
 func (p *Pipeline) checkImageVersionWork(ctx context.Context) func(context.Context) (string, error) {
 	return func(_ context.Context) (string, error) {
-		out, err := dockerInspect(ctx, p.bench, string(p.image))
-		if err != nil {
-			var de *dockerexec.ExecError
-			if errors.As(err, &de) {
-				if strings.Contains(de.Stderr, "No such image") {
-					return "", &ImageNotPresentError{
-						Bench:  p.bench.Name,
-						Image:  string(p.image),
-						Stderr: de.Stderr,
-					}
-				}
-				return "", &bench.BenchDockerError{
-					Bench:    p.bench.Name,
-					Args:     de.Args,
-					Stderr:   de.Stderr,
-					ExitCode: de.ExitCode,
+		// Adapter over the package-level dockerInspect test seam. images.VerifyImageVersion
+		// passes its own --format (which extracts the version label), but we reuse
+		// dockerInspect's already-formatted result so the existing stubDocker test seam
+		// keeps working — both extract the same sh.gsd-test.image-version label.
+		runner := reaper.Runner(func(ctx context.Context, _ ...string) ([]byte, error) {
+			out, err := dockerInspect(ctx, p.bench, string(p.image))
+			return []byte(out), err
+		})
+		err := images.VerifyImageVersion(ctx, runner, string(p.image), p.expectedVersion)
+		if err == nil {
+			return "", nil
+		}
+		// Version mismatch — attach bench context for diagnostics and pass through.
+		var mm *images.ImageVersionMismatch
+		if errors.As(err, &mm) {
+			mm.Bench = p.bench.Name
+			return "", mm
+		}
+		// Inspect failure — classify into typed errors (fail-loud, ADR-0004).
+		var de *dockerexec.ExecError
+		if errors.As(err, &de) {
+			if strings.Contains(de.Stderr, "No such image") {
+				return "", &ImageNotPresentError{
+					Bench:  p.bench.Name,
+					Image:  string(p.image),
+					Stderr: de.Stderr,
 				}
 			}
-			return "", err
-		}
-		actual := strings.TrimSpace(out)
-		if actual != p.expectedVersion {
-			return "", &ImageVersionMismatch{
+			return "", &bench.BenchDockerError{
 				Bench:    p.bench.Name,
-				Image:    string(p.image),
-				Expected: p.expectedVersion,
-				Actual:   actual,
+				Args:     de.Args,
+				Stderr:   de.Stderr,
+				ExitCode: de.ExitCode,
 			}
 		}
-		return "", nil
+		return "", err
 	}
 }
 
