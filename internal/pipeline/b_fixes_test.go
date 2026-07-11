@@ -302,7 +302,7 @@ func TestNew_NilEvents_NoPumpStarted(t *testing.T) {
 
 // TestNpmCI_StdoutCrashDiagnosticInError verifies that when the NpmCI leg
 // runner crashes and its fatal diagnostic is emitted to STDOUT (not stderr),
-// the resulting *NpmCIError.Stdout field contains the diagnostic — so the
+// the resulting *streamError.Stdout field contains the diagnostic — so the
 // error message shown at Normal verbosity (which suppresses EventChildOutput)
 // still carries the root cause.
 func TestNpmCI_StdoutCrashDiagnosticInError(t *testing.T) {
@@ -323,9 +323,9 @@ func TestNpmCI_StdoutCrashDiagnosticInError(t *testing.T) {
 	if !errors.As(err, &legErr) {
 		t.Fatalf("expected *LegError, got %T", err)
 	}
-	var npmErr *NpmCIError
+	var npmErr *streamError
 	if !errors.As(legErr.Cause, &npmErr) {
-		t.Fatalf("expected Cause=*NpmCIError, got %T: %v", legErr.Cause, legErr.Cause)
+		t.Fatalf("expected Cause=*streamError, got %T: %v", legErr.Cause, legErr.Cause)
 	}
 	if !strings.Contains(npmErr.Error(), stdoutDiag) {
 		t.Errorf("NpmCIError.Error() must include stdout diagnostic %q, got: %q", stdoutDiag, npmErr.Error())
@@ -333,7 +333,7 @@ func TestNpmCI_StdoutCrashDiagnosticInError(t *testing.T) {
 }
 
 // TestBuild_StdoutCrashDiagnosticInError verifies the same contract for the
-// Build leg: a stdout-only fatal message must surface in *BuildError.
+// Build leg: a stdout-only fatal message must surface in *streamError.
 func TestBuild_StdoutCrashDiagnosticInError(t *testing.T) {
 	const stdoutDiag = "FATAL: webpack config is invalid — cannot read property"
 
@@ -362,9 +362,9 @@ func TestBuild_StdoutCrashDiagnosticInError(t *testing.T) {
 	if !errors.As(err, &legErr) {
 		t.Fatalf("expected *LegError, got %T", err)
 	}
-	var buildErr *BuildError
+	var buildErr *streamError
 	if !errors.As(legErr.Cause, &buildErr) {
-		t.Fatalf("expected Cause=*BuildError, got %T: %v", legErr.Cause, legErr.Cause)
+		t.Fatalf("expected Cause=*streamError, got %T: %v", legErr.Cause, legErr.Cause)
 	}
 	if !strings.Contains(buildErr.Error(), stdoutDiag) {
 		t.Errorf("BuildError.Error() must include stdout diagnostic %q, got: %q", stdoutDiag, buildErr.Error())
@@ -411,9 +411,9 @@ func TestRunTests_StdoutCrashDiagnosticInError(t *testing.T) {
 	if !errors.As(err, &legErr) {
 		t.Fatalf("expected *LegError, got %T", err)
 	}
-	var testErr *TestRunError
+	var testErr *streamError
 	if !errors.As(legErr.Cause, &testErr) {
-		t.Fatalf("expected Cause=*TestRunError, got %T: %v", legErr.Cause, legErr.Cause)
+		t.Fatalf("expected Cause=*streamError, got %T: %v", legErr.Cause, legErr.Cause)
 	}
 	if !strings.Contains(testErr.Error(), stdoutDiag) {
 		t.Errorf("TestRunError.Error() must include stdout diagnostic %q, got: %q", stdoutDiag, testErr.Error())

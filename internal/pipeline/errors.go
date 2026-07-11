@@ -148,77 +148,38 @@ func (e *ParseError) Error() string {
 
 func (e *ParseError) Unwrap() error { return e.Cause }
 
-// NpmCIError is the typed Cause for LegError when the NpmCI leg fails.
-type NpmCIError struct {
+// streamError is the typed Cause for LegError when a streaming leg (NpmCI,
+// Build, RunTests) fails. It carries the captured stdout/stderr (B-14: so a
+// crash that writes its fatal diagnostic to stdout is visible at Normal
+// verbosity), the subprocess exit code, and a Cause for non-exec errors
+// (ctx canceled, etc.). Verb identifies the step ("npm ci" / "npm run build" /
+// "test runner"); which step failed is also recoverable from the wrapping
+// LegError.Leg.
+//
+// This unified type replaces the former per-leg NpmCIError/BuildError/
+// TestRunError, which were structurally identical except for the verb string.
+// The 3-way stdout/stderr Error() logic now lives in one place, so the next
+// B-14-style capture fix applies once instead of three times.
+type streamError struct {
+	Verb     string // "npm ci" | "npm run build" | "test runner"
 	Stderr   string
-	Stdout   string // B-14 fix: captured stdout so crash diagnostics are visible at Normal verbosity
+	Stdout   string
 	ExitCode int
 	Cause    error // non-nil for non-exec errors (ctx canceled, etc.)
 }
 
-func (e *NpmCIError) Error() string {
+func (e *streamError) Error() string {
 	if e.Cause != nil {
-		return fmt.Sprintf("npm ci failed: %v", e.Cause)
-	}
-	// B-14 fix: include stdout in the error message when it carries diagnostic
-	// content that wouldn't otherwise be visible at Normal/Quiet verbosity.
-	if e.Stdout != "" && e.Stderr != "" {
-		return fmt.Sprintf("npm ci failed (exit=%d): %s\n%s", e.ExitCode, strings.TrimSpace(e.Stderr), strings.TrimSpace(e.Stdout))
-	}
-	if e.Stdout != "" {
-		return fmt.Sprintf("npm ci failed (exit=%d): %s", e.ExitCode, strings.TrimSpace(e.Stdout))
-	}
-	return fmt.Sprintf("npm ci failed (exit=%d): %s", e.ExitCode, strings.TrimSpace(e.Stderr))
-}
-
-func (e *NpmCIError) Unwrap() error { return e.Cause }
-
-// BuildError is the typed Cause for LegError when the Build leg fails.
-type BuildError struct {
-	Stderr   string
-	Stdout   string // B-14 fix: captured stdout so crash diagnostics are visible at Normal verbosity
-	ExitCode int
-	Cause    error // non-nil for non-exec errors (ctx canceled, etc.)
-}
-
-func (e *BuildError) Error() string {
-	if e.Cause != nil {
-		return fmt.Sprintf("npm run build failed: %v", e.Cause)
+		return fmt.Sprintf("%s failed: %v", e.Verb, e.Cause)
 	}
 	// B-14 fix: include stdout when it carries diagnostic content.
 	if e.Stdout != "" && e.Stderr != "" {
-		return fmt.Sprintf("npm run build failed (exit=%d): %s\n%s", e.ExitCode, strings.TrimSpace(e.Stderr), strings.TrimSpace(e.Stdout))
+		return fmt.Sprintf("%s failed (exit=%d): %s\n%s", e.Verb, e.ExitCode, strings.TrimSpace(e.Stderr), strings.TrimSpace(e.Stdout))
 	}
 	if e.Stdout != "" {
-		return fmt.Sprintf("npm run build failed (exit=%d): %s", e.ExitCode, strings.TrimSpace(e.Stdout))
+		return fmt.Sprintf("%s failed (exit=%d): %s", e.Verb, e.ExitCode, strings.TrimSpace(e.Stdout))
 	}
-	return fmt.Sprintf("npm run build failed (exit=%d): %s", e.ExitCode, strings.TrimSpace(e.Stderr))
+	return fmt.Sprintf("%s failed (exit=%d): %s", e.Verb, e.ExitCode, strings.TrimSpace(e.Stderr))
 }
 
-func (e *BuildError) Unwrap() error { return e.Cause }
-
-// TestRunError is the typed Cause for LegError when the RunTests leg fails
-// due to a runner crash (not merely test failures — exit 1 is intentionally
-// not a leg error per ADR-0017).
-type TestRunError struct {
-	Stderr   string
-	Stdout   string // B-14 fix: captured stdout so crash diagnostics are visible at Normal verbosity
-	ExitCode int
-	Cause    error // non-nil for non-exec errors (ctx canceled, etc.)
-}
-
-func (e *TestRunError) Error() string {
-	if e.Cause != nil {
-		return fmt.Sprintf("test runner failed: %v", e.Cause)
-	}
-	// B-14 fix: include stdout when it carries diagnostic content.
-	if e.Stdout != "" && e.Stderr != "" {
-		return fmt.Sprintf("test runner crashed (exit=%d): %s\n%s", e.ExitCode, strings.TrimSpace(e.Stderr), strings.TrimSpace(e.Stdout))
-	}
-	if e.Stdout != "" {
-		return fmt.Sprintf("test runner crashed (exit=%d): %s", e.ExitCode, strings.TrimSpace(e.Stdout))
-	}
-	return fmt.Sprintf("test runner crashed (exit=%d): %s", e.ExitCode, strings.TrimSpace(e.Stderr))
-}
-
-func (e *TestRunError) Unwrap() error { return e.Cause }
+func (e *streamError) Unwrap() error { return e.Cause }
