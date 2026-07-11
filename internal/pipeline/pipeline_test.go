@@ -1293,7 +1293,7 @@ func filterEvents(events []Event, kind EventKind) []Event {
 // --- NpmCI tests ---
 
 // TestNpmCI_NoContainerID verifies that NpmCI with no containerID returns a
-// *LegError wrapping *NpmCIError with a non-nil Cause about the missing ID.
+// *LegError wrapping *streamError with a non-nil Cause about the missing ID.
 func TestNpmCI_NoContainerID(t *testing.T) {
 	p, _ := newTestPipeline(t, 16)
 	// containerID is empty — StartContainer was not called.
@@ -1309,9 +1309,9 @@ func TestNpmCI_NoContainerID(t *testing.T) {
 	if legErr.Leg != LegNpmCI {
 		t.Errorf("expected Leg=LegNpmCI, got %v", legErr.Leg)
 	}
-	var npmErr *NpmCIError
+	var npmErr *streamError
 	if !errors.As(legErr.Cause, &npmErr) {
-		t.Fatalf("expected Cause=*NpmCIError, got %T: %v", legErr.Cause, legErr.Cause)
+		t.Fatalf("expected Cause=*streamError, got %T: %v", legErr.Cause, legErr.Cause)
 	}
 	if npmErr.Cause == nil {
 		t.Error("expected NpmCIError.Cause to be non-nil for missing containerID")
@@ -1365,7 +1365,7 @@ func TestNpmCI_Success(t *testing.T) {
 }
 
 // TestNpmCI_NonZeroExit verifies that when dockerStream returns *ExecError,
-// NpmCI returns a *LegError wrapping *NpmCIError with the stderr captured.
+// NpmCI returns a *LegError wrapping *streamError with the stderr captured.
 func TestNpmCI_NonZeroExit(t *testing.T) {
 	stubDockerStream(t, func(ctx context.Context, b bench.Bench, args []string, stdoutLine, stderrLine dockerexec.LineHandler) error {
 		stderrLine("npm ERR! missing peer dep")
@@ -1384,9 +1384,9 @@ func TestNpmCI_NonZeroExit(t *testing.T) {
 	if !errors.As(err, &legErr) {
 		t.Fatalf("expected *LegError, got %T: %v", err, err)
 	}
-	var npmErr *NpmCIError
+	var npmErr *streamError
 	if !errors.As(legErr.Cause, &npmErr) {
-		t.Fatalf("expected Cause=*NpmCIError, got %T: %v", legErr.Cause, legErr.Cause)
+		t.Fatalf("expected Cause=*streamError, got %T: %v", legErr.Cause, legErr.Cause)
 	}
 	if npmErr.ExitCode != 1 {
 		t.Errorf("expected ExitCode=1, got %d", npmErr.ExitCode)
@@ -1401,7 +1401,7 @@ func TestNpmCI_NonZeroExit(t *testing.T) {
 
 // --- Build tests ---
 
-// TestBuild_NoContainerID verifies Build with no containerID returns *BuildError.
+// TestBuild_NoContainerID verifies Build with no containerID returns *streamError.
 func TestBuild_NoContainerID(t *testing.T) {
 	p, _ := newTestPipeline(t, 16)
 
@@ -1416,9 +1416,9 @@ func TestBuild_NoContainerID(t *testing.T) {
 	if legErr.Leg != LegBuild {
 		t.Errorf("expected Leg=LegBuild, got %v", legErr.Leg)
 	}
-	var buildErr *BuildError
+	var buildErr *streamError
 	if !errors.As(legErr.Cause, &buildErr) {
-		t.Fatalf("expected Cause=*BuildError, got %T: %v", legErr.Cause, legErr.Cause)
+		t.Fatalf("expected Cause=*streamError, got %T: %v", legErr.Cause, legErr.Cause)
 	}
 	if buildErr.Cause == nil {
 		t.Error("expected BuildError.Cause to be non-nil for missing containerID")
@@ -1463,7 +1463,7 @@ func TestBuild_Success(t *testing.T) {
 	}
 }
 
-// TestBuild_Failure verifies Build returns *BuildError wrapping stderr on non-zero exit.
+// TestBuild_Failure verifies Build returns *streamError wrapping stderr on non-zero exit.
 func TestBuild_Failure(t *testing.T) {
 	// Stub dockerRun to return package.json with a build script.
 	stubDockerRun(t, `{"name":"x","version":"1.0.0","scripts":{"build":"tsc","test":"node --test"}}`, nil)
@@ -1483,9 +1483,9 @@ func TestBuild_Failure(t *testing.T) {
 	if !errors.As(err, &legErr) {
 		t.Fatalf("expected *LegError, got %T: %v", err, err)
 	}
-	var buildErr *BuildError
+	var buildErr *streamError
 	if !errors.As(legErr.Cause, &buildErr) {
-		t.Fatalf("expected Cause=*BuildError, got %T: %v", legErr.Cause, legErr.Cause)
+		t.Fatalf("expected Cause=*streamError, got %T: %v", legErr.Cause, legErr.Cause)
 	}
 	if buildErr.ExitCode != 2 {
 		t.Errorf("expected ExitCode=2, got %d", buildErr.ExitCode)
@@ -1567,7 +1567,7 @@ func TestBuild_NoBuildScript_Skipped(t *testing.T) {
 }
 
 // TestBuild_PackageJsonReadFailure verifies that when dockerRun (cat package.json)
-// returns an ExecError, Build returns *LegError wrapping *BuildError and never
+// returns an ExecError, Build returns *LegError wrapping *streamError and never
 // calls dockerStream (no npm run build).
 func TestBuild_PackageJsonReadFailure(t *testing.T) {
 	execErr := &dockerexec.ExecError{
@@ -1596,9 +1596,9 @@ func TestBuild_PackageJsonReadFailure(t *testing.T) {
 	if legErr.Leg != LegBuild {
 		t.Errorf("expected Leg=LegBuild, got %v", legErr.Leg)
 	}
-	var buildErr *BuildError
+	var buildErr *streamError
 	if !errors.As(legErr.Cause, &buildErr) {
-		t.Fatalf("expected Cause=*BuildError, got %T: %v", legErr.Cause, legErr.Cause)
+		t.Fatalf("expected Cause=*streamError, got %T: %v", legErr.Cause, legErr.Cause)
 	}
 	if buildErr.Cause == nil {
 		t.Fatal("expected BuildError.Cause to be non-nil")
@@ -1624,7 +1624,7 @@ func TestBuild_PackageJsonReadFailure(t *testing.T) {
 }
 
 // TestBuild_PackageJsonMalformed verifies that when dockerRun returns non-JSON
-// content, Build returns *LegError wrapping *BuildError mentioning "parse package.json".
+// content, Build returns *LegError wrapping *streamError mentioning "parse package.json".
 func TestBuild_PackageJsonMalformed(t *testing.T) {
 	stubDockerRun(t, "not json {{{", nil)
 	stubDockerStream(t, func(ctx context.Context, b bench.Bench, args []string, stdoutLine, stderrLine dockerexec.LineHandler) error {
@@ -1644,9 +1644,9 @@ func TestBuild_PackageJsonMalformed(t *testing.T) {
 	if !errors.As(err, &legErr) {
 		t.Fatalf("expected *LegError, got %T: %v", err, err)
 	}
-	var buildErr *BuildError
+	var buildErr *streamError
 	if !errors.As(legErr.Cause, &buildErr) {
-		t.Fatalf("expected Cause=*BuildError, got %T: %v", legErr.Cause, legErr.Cause)
+		t.Fatalf("expected Cause=*streamError, got %T: %v", legErr.Cause, legErr.Cause)
 	}
 	if buildErr.Cause == nil {
 		t.Fatal("expected BuildError.Cause to be non-nil")
@@ -1777,7 +1777,7 @@ func TestRunLeg_SkipSentinel(t *testing.T) {
 
 // --- RunTests tests ---
 
-// TestRunTests_NoContainerID verifies RunTests with no containerID returns *TestRunError.
+// TestRunTests_NoContainerID verifies RunTests with no containerID returns *streamError.
 func TestRunTests_NoContainerID(t *testing.T) {
 	p, _ := newTestPipeline(t, 16)
 
@@ -1792,9 +1792,9 @@ func TestRunTests_NoContainerID(t *testing.T) {
 	if legErr.Leg != LegRunTests {
 		t.Errorf("expected Leg=LegRunTests, got %v", legErr.Leg)
 	}
-	var runErr *TestRunError
+	var runErr *streamError
 	if !errors.As(legErr.Cause, &runErr) {
-		t.Fatalf("expected Cause=*TestRunError, got %T: %v", legErr.Cause, legErr.Cause)
+		t.Fatalf("expected Cause=*streamError, got %T: %v", legErr.Cause, legErr.Cause)
 	}
 	if runErr.Cause == nil {
 		t.Error("expected TestRunError.Cause to be non-nil for missing containerID")
@@ -1946,7 +1946,7 @@ func TestRunTests_Success_TestsFail(t *testing.T) {
 }
 
 // TestRunTests_RunnerCrash verifies that when the test subprocess exits with
-// code > 1 (OOM, signal, etc.), RunTests returns a *TestRunError.
+// code > 1 (OOM, signal, etc.), RunTests returns a *streamError.
 func TestRunTests_RunnerCrash(t *testing.T) {
 	stubDockerStream(t, func(ctx context.Context, b bench.Bench, args []string, stdoutLine, stderrLine dockerexec.LineHandler) error {
 		for _, a := range args {
@@ -1968,9 +1968,9 @@ func TestRunTests_RunnerCrash(t *testing.T) {
 	if !errors.As(err, &legErr) {
 		t.Fatalf("expected *LegError, got %T: %v", err, err)
 	}
-	var runErr *TestRunError
+	var runErr *streamError
 	if !errors.As(legErr.Cause, &runErr) {
-		t.Fatalf("expected Cause=*TestRunError, got %T: %v", legErr.Cause, legErr.Cause)
+		t.Fatalf("expected Cause=*streamError, got %T: %v", legErr.Cause, legErr.Cause)
 	}
 	if runErr.ExitCode != 137 {
 		t.Errorf("expected ExitCode=137, got %d", runErr.ExitCode)

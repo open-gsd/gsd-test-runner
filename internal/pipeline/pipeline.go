@@ -299,30 +299,10 @@ func (p *Pipeline) StartContainer(ctx context.Context) error {
 func (p *Pipeline) NpmCI(ctx context.Context) error {
 	return p.runLeg(ctx, LegNpmCI, func(ctx context.Context) (string, error) {
 		if p.containerID == "" {
-			return "", &NpmCIError{Cause: errors.New("StartContainer did not run; containerID is empty")}
+			return "", &streamError{Verb: "npm ci", Cause: errors.New("StartContainer did not run; containerID is empty")}
 		}
-		// B-14 fix: capture stdout as well as stderr so a crash that writes its
-		// fatal diagnostic to stdout is visible in the error at Normal verbosity.
-		var stderrBuf, stdoutBuf bytes.Buffer
 		args := []string{"exec", "--workdir", "/work", p.containerID, "npm", "ci"}
-		err := dockerStream(ctx, p.bench, args,
-			func(line string) {
-				p.emit(Event{Kind: EventChildOutput, Leg: LegNpmCI, Line: line, Stream: "stdout"})
-				stdoutBuf.WriteString(line + "\n")
-			},
-			func(line string) {
-				p.emit(Event{Kind: EventChildOutput, Leg: LegNpmCI, Line: line, Stream: "stderr"})
-				stderrBuf.WriteString(line + "\n")
-			},
-		)
-		if err != nil {
-			var execErr *dockerexec.ExecError
-			if errors.As(err, &execErr) {
-				return "", &NpmCIError{Stderr: stderrBuf.String(), Stdout: stdoutBuf.String(), ExitCode: execErr.ExitCode}
-			}
-			return "", &NpmCIError{Cause: err}
-		}
-		return "", nil
+		return "", p.streamAndCapture(ctx, LegNpmCI, "npm ci", args)
 	})
 }
 
@@ -351,37 +331,17 @@ func (p *Pipeline) hasBuildScript(ctx context.Context) (bool, error) {
 func (p *Pipeline) Build(ctx context.Context) error {
 	return p.runLeg(ctx, LegBuild, func(ctx context.Context) (string, error) {
 		if p.containerID == "" {
-			return "", &BuildError{Cause: errors.New("StartContainer did not run; containerID is empty")}
+			return "", &streamError{Verb: "npm run build", Cause: errors.New("StartContainer did not run; containerID is empty")}
 		}
 		hasScript, err := p.hasBuildScript(ctx)
 		if err != nil {
-			return "", &BuildError{Cause: err}
+			return "", &streamError{Verb: "npm run build", Cause: err}
 		}
 		if !hasScript {
 			return "no build script defined in package.json", ErrLegSkipped
 		}
-		// B-14 fix: capture stdout as well as stderr so a crash that writes its
-		// fatal diagnostic to stdout is visible in the error at Normal verbosity.
-		var stderrBuf, stdoutBuf bytes.Buffer
 		args := []string{"exec", "--workdir", "/work", p.containerID, "npm", "run", "build"}
-		err = dockerStream(ctx, p.bench, args,
-			func(line string) {
-				p.emit(Event{Kind: EventChildOutput, Leg: LegBuild, Line: line, Stream: "stdout"})
-				stdoutBuf.WriteString(line + "\n")
-			},
-			func(line string) {
-				p.emit(Event{Kind: EventChildOutput, Leg: LegBuild, Line: line, Stream: "stderr"})
-				stderrBuf.WriteString(line + "\n")
-			},
-		)
-		if err != nil {
-			var execErr *dockerexec.ExecError
-			if errors.As(err, &execErr) {
-				return "", &BuildError{Stderr: stderrBuf.String(), Stdout: stdoutBuf.String(), ExitCode: execErr.ExitCode}
-			}
-			return "", &BuildError{Cause: err}
-		}
-		return "", nil
+		return "", p.streamAndCapture(ctx, LegBuild, "npm run build", args)
 	})
 }
 
@@ -393,7 +353,7 @@ func (p *Pipeline) Build(ctx context.Context) error {
 func (p *Pipeline) RunTests(ctx context.Context) error {
 	return p.runLeg(ctx, LegRunTests, func(ctx context.Context) (string, error) {
 		if p.containerID == "" {
-			return "", &TestRunError{Cause: errors.New("StartContainer did not run; containerID is empty")}
+			return "", &streamError{Verb: "test runner", Cause: errors.New("StartContainer did not run; containerID is empty")}
 		}
 
 		// Start JSONL-tail goroutine. Lives for the duration of RunTests.
@@ -405,40 +365,58 @@ func (p *Pipeline) RunTests(ctx context.Context) error {
 
 		// Run the test subprocess. Reporter writes JSONL to containerJSONLPath
 		// while the JSONL-tail goroutine emits live test events from it.
-		// B-14 fix: capture stdout as well as stderr so a crash that writes its
-		// fatal diagnostic to stdout is visible in the error at Normal verbosity.
-		var stderrBuf, stdoutBuf bytes.Buffer
 		args := append([]string{"exec", "--workdir", "/work", p.containerID}, p.runTestsCommandArgs()...)
-		err := dockerStream(ctx, p.bench, args,
-			func(line string) {
-				p.emit(Event{Kind: EventChildOutput, Leg: LegRunTests, Line: line, Stream: "stdout"})
-				stdoutBuf.WriteString(line + "\n")
-			},
-			func(line string) {
-				p.emit(Event{Kind: EventChildOutput, Leg: LegRunTests, Line: line, Stream: "stderr"})
-				stderrBuf.WriteString(line + "\n")
-			},
-		)
+		runErr := p.streamAndCapture(ctx, LegRunTests, "test runner", args)
 
 		// Cancel and wait for the tail goroutine.
 		cancelTail()
 		tailWG.Wait()
 
-		// exit 1 == "tests failed but runner ran OK" — not a leg error.
-		// Only exit > 1 or non-exec errors indicate a runner crash.
-		if err != nil {
-			var execErr *dockerexec.ExecError
-			if errors.As(err, &execErr) {
-				if execErr.ExitCode > 1 {
-					return "", &TestRunError{Stderr: stderrBuf.String(), Stdout: stdoutBuf.String(), ExitCode: execErr.ExitCode}
-				}
-				// exit 1: tests failed — Parse leg surfaces it via Report.Failures.
+		// exit 1 == "tests failed but runner ran OK" — not a leg error (ADR-0017).
+		// Only exit > 1 or non-exec errors indicate a runner crash. streamAndCapture
+		// wraps any failure into *streamError; downgrade an exit-1 to nil here so
+		// the Parse leg surfaces test failures via Report.Failures instead.
+		if runErr != nil {
+			var se *streamError
+			if errors.As(runErr, &se) && se.ExitCode == 1 {
 				return "", nil
 			}
-			return "", &TestRunError{Cause: err}
+			return "", runErr
 		}
 		return "", nil
 	})
+}
+
+// streamAndCapture runs a streaming docker exec: it emits a live
+// EventChildOutput per stdout/stderr line while buffering both for the error
+// envelope, then returns nil on success or a *streamError on failure. On an
+// ExecError the captured stdout/stderr + exit code are carried (B-14: so a
+// crash that writes its fatal diagnostic to stdout is visible at Normal
+// verbosity); any other error becomes the streamError's Cause.
+//
+// This is the shared streaming+capture+wrap mechanic for the NpmCI, Build, and
+// RunTests legs. RunTests additionally downgrades an exit-1 streamError to nil
+// (tests failed is not a leg error per ADR-0017) at its call site.
+func (p *Pipeline) streamAndCapture(ctx context.Context, leg Leg, verb string, args []string) error {
+	var stderrBuf, stdoutBuf bytes.Buffer
+	err := dockerStream(ctx, p.bench, args,
+		func(line string) {
+			p.emit(Event{Kind: EventChildOutput, Leg: leg, Line: line, Stream: "stdout"})
+			stdoutBuf.WriteString(line + "\n")
+		},
+		func(line string) {
+			p.emit(Event{Kind: EventChildOutput, Leg: leg, Line: line, Stream: "stderr"})
+			stderrBuf.WriteString(line + "\n")
+		},
+	)
+	if err != nil {
+		var execErr *dockerexec.ExecError
+		if errors.As(err, &execErr) {
+			return &streamError{Verb: verb, Stderr: stderrBuf.String(), Stdout: stdoutBuf.String(), ExitCode: execErr.ExitCode}
+		}
+		return &streamError{Verb: verb, Cause: err}
+	}
+	return nil
 }
 
 // tailJSONLForLiveEvents tails containerJSONLPath inside the running container
