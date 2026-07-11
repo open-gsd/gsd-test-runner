@@ -33,11 +33,6 @@ var defaultTestCommandArgs = []string{
 	"--test-reporter-destination={{REPORTER_DEST}}",
 }
 
-// ErrNotImplemented is the Cause of every LegError returned by the
-// skeleton. Real implementations will replace it with typed Cause
-// errors (ImageVersionMismatch, CopyInError, NpmCIError, ...).
-var ErrNotImplemented = errors.New("not implemented")
-
 // Leg names a single step of the Per-OS pipeline. Per ADR-0008 there
 // are 8 legs owned by the Executor (the upstream worktree-construction
 // legs are owned by package worktree, not by the Pipeline).
@@ -76,172 +71,12 @@ func (l Leg) String() string {
 	return fmt.Sprintf("leg(%d)", int(l))
 }
 
-// ErrLegSkipped is returned by a leg work function to signal that the leg
-// was intentionally skipped (not a failure, not a silent success). runLeg
-// recognizes it and emits EventLegSkipped instead of EventLegSuccess. The
-// first return value (diagPath) from work is repurposed as a human-readable
-// skip reason and surfaced as Event.Detail.
-var ErrLegSkipped = errors.New("leg skipped")
-
-// LegError envelopes a per-leg failure. Per ADR-0008, callers use
-// errors.As(err, &legErr) to learn which Leg failed and where to
-// look for diagnostics, then errors.As(legErr.Cause, &specificErr)
-// for leg-specific context.
-type LegError struct {
-	Leg      Leg
-	Cause    error
-	DiagPath string // path to captured stderr/logs for this leg, if any
-	ExitCode int    // distinct per leg per ADR-0004
-}
-
-func (e *LegError) Error() string {
-	if e.DiagPath != "" {
-		return fmt.Sprintf("pipeline leg %s failed (exit %d): %v (diagnostics: %s)", e.Leg, e.ExitCode, e.Cause, e.DiagPath)
-	}
-	return fmt.Sprintf("pipeline leg %s failed (exit %d): %v", e.Leg, e.ExitCode, e.Cause)
-}
-
-func (e *LegError) Unwrap() error { return e.Cause }
-
-// ImageNotPresentError reports that the Tester Image is not present
-// on the Bench. Distinguished from BenchDockerError by docker's
-// "No such image" stderr substring.
-type ImageNotPresentError struct {
-	Bench  string
-	Image  string
-	Stderr string
-}
-
-func (e *ImageNotPresentError) Error() string {
-	return fmt.Sprintf("image %s not present on bench %s: %s", e.Image, e.Bench, strings.TrimSpace(e.Stderr))
-}
-
-// BenchDockerError is an alias kept for package-local convenience; the
-// canonical definition lives in internal/bench.
-type BenchDockerError = bench.BenchDockerError
-
-// Per-leg exit codes returned in LegError.ExitCode. Documented table per
-// ADR-0004. Values start at 10 to leave room for the top-level aggregator's
-// exit codes (0/1/2 per ADR-0009).
-const (
-	ExitCodeCheckImageVersion = 10
-	ExitCodeCopyWorktree      = 11
-	ExitCodeStartContainer    = 12
-	ExitCodeNpmCI             = 13
-	ExitCodeBuild             = 14
-	ExitCodeRunTests          = 15
-	ExitCodeDrain             = 16
-	ExitCodeParse             = 17
-)
-
-// legExitCode returns the documented exit code for a given Leg. Maps the
-// Leg enum to the corresponding ExitCode* constant. Single source of truth
-// for the per-leg exit-code table — wrapper scripts read these values
-// from LegError.ExitCode and must remain stable across leg reorders.
-func legExitCode(leg Leg) int {
-	switch leg {
-	case LegCheckImageVersion:
-		return ExitCodeCheckImageVersion
-	case LegCopyWorktree:
-		return ExitCodeCopyWorktree
-	case LegStartContainer:
-		return ExitCodeStartContainer
-	case LegNpmCI:
-		return ExitCodeNpmCI
-	case LegBuild:
-		return ExitCodeBuild
-	case LegRunTests:
-		return ExitCodeRunTests
-	case LegDrain:
-		return ExitCodeDrain
-	case LegParse:
-		return ExitCodeParse
-	}
-	panic(fmt.Sprintf("legExitCode: unknown Leg %d", leg))
-}
-
 // dockerInspect is a package-level variable per ADR-0011 (decision 4).
 // Tests swap it for a stub via t.Cleanup. Real implementation delegates
 // to dockerexec.Run.
 var dockerInspect = func(ctx context.Context, b bench.Bench, image string) (string, error) {
 	const labelFormat = `{{ index .Config.Labels "sh.gsd-test.image-version" }}`
 	return dockerexec.Run(ctx, b, []string{"image", "inspect", image, "--format", labelFormat})
-}
-
-// EventKind discriminates the variants of Event. Per ADR-0008, the
-// Event struct uses optional fields rather than a sealed-interface
-// hierarchy for ease of JSON serialization (when the renderer adds
-// it).
-type EventKind int
-
-const (
-	EventLegStart EventKind = iota
-	EventLegSuccess
-	EventLegFailure
-	EventLegSkipped  // leg intentionally skipped (not a failure, not a silent success)
-	EventChildOutput // a line of subprocess stdout/stderr
-	EventTestPass
-	EventTestFail
-	// EventDroppedOutput is a synthetic marker emitted once when the bounded
-	// event queue drops old EventChildOutput events to protect memory under a
-	// slow consumer. Detail contains the drop count. Failure events are never
-	// dropped. (B-7 fix.)
-	EventDroppedOutput
-)
-
-func (k EventKind) String() string {
-	switch k {
-	case EventLegStart:
-		return "leg_start"
-	case EventLegSuccess:
-		return "leg_success"
-	case EventLegFailure:
-		return "leg_failure"
-	case EventLegSkipped:
-		return "leg_skipped"
-	case EventChildOutput:
-		return "child_output"
-	case EventTestPass:
-		return "test_pass"
-	case EventTestFail:
-		return "test_fail"
-	case EventDroppedOutput:
-		return "dropped_output"
-	}
-	return fmt.Sprintf("event(%d)", int(k))
-}
-
-// Event is a single emission on the Pipeline's event channel. Per
-// ADR-0008, each event is tagged with its OS (from the Pipeline's
-// Bench.OS) so parallel pipelines' events interleave legibly in the
-// renderer. Unused fields for a given Kind are left zero-valued.
-type Event struct {
-	Kind EventKind
-	OS   string
-	Time time.Time
-
-	// Leg is set for Leg* event kinds.
-	Leg Leg
-
-	// Line is set for ChildOutput (the subprocess line),
-	// TestPass/TestFail (the test name).
-	Line string
-
-	// Stream is set for EventChildOutput: "stdout" or "stderr".
-	// Empty for all other event kinds. Per ADR-0017 dec 4.
-	Stream string
-
-	// Detail is set for LegFailure (error message), TestFail
-	// (one-line error message).
-	Detail string
-
-	// File, ErrorClass, and FailLine are set for EventTestFail to power the
-	// real-time "✗ FAIL <file>:<line> · <class> · <msg>" line (Option I, #84).
-	// All best-effort: FailLine is 0 when it can't be derived. Additive per the
-	// ADR-0017 amendment (like Stream).
-	File       string
-	ErrorClass string
-	FailLine   int
 }
 
 // dockerCp is a package-level variable for testability (matches the
@@ -272,31 +107,6 @@ var dockerStream = func(ctx context.Context, b bench.Bench, args []string, stdou
 	return dockerexec.Stream(ctx, b, args, stdoutLine, stderrLine)
 }
 
-// ContainerStartError is the typed Cause for LegError when StartContainer
-// fails for image-specific reasons (no such image, bad image reference, etc.).
-// Distinct from BenchDockerError which covers transport/daemon failures.
-type ContainerStartError struct {
-	Image    string
-	Stderr   string
-	ExitCode int
-}
-
-func (e *ContainerStartError) Error() string {
-	return fmt.Sprintf("container start failed for image %s (exit=%d): %s",
-		e.Image, e.ExitCode, strings.TrimSpace(e.Stderr))
-}
-
-// CopyInError is the typed Cause for LegError when the CopyWorktree leg fails.
-type CopyInError struct {
-	Cause error
-}
-
-func (e *CopyInError) Error() string {
-	return fmt.Sprintf("copy worktree to container failed: %v", e.Cause)
-}
-
-func (e *CopyInError) Unwrap() error { return e.Cause }
-
 // isBenchInfraFailure returns true when the ExecError's stderr indicates a
 // Bench infrastructure failure (daemon down, SSH refused, permission denied)
 // rather than an image-specific failure (no such image, bad tag, etc.).
@@ -308,32 +118,6 @@ func isBenchInfraFailure(e *dockerexec.ExecError) bool {
 		strings.Contains(s, "permission denied") ||
 		strings.Contains(s, "ssh:") // ssh errors include "ssh: connect to host..."
 }
-
-// DrainError is the typed Cause for LegError when the Drain leg fails.
-// Stage discriminates the failure point within the leg.
-type DrainError struct {
-	// Stage is "create_temp" when os.CreateTemp fails, "docker_cp" when
-	// docker cp fails.
-	Stage string
-	Cause error
-}
-
-func (e *DrainError) Error() string {
-	return fmt.Sprintf("drain failed at stage %q: %v", e.Stage, e.Cause)
-}
-
-func (e *DrainError) Unwrap() error { return e.Cause }
-
-// ParseError is the typed Cause for LegError when the Parse leg fails.
-type ParseError struct {
-	Cause error
-}
-
-func (e *ParseError) Error() string {
-	return fmt.Sprintf("parse failed: %v", e.Cause)
-}
-
-func (e *ParseError) Unwrap() error { return e.Cause }
 
 // Pipeline executes the 8 per-OS legs against one Bench using one
 // Tester Image and one PR-merged worktree. One Pipeline per (Bench,
@@ -511,31 +295,6 @@ func (p *Pipeline) StartContainer(ctx context.Context) error {
 	})
 }
 
-// NpmCIError is the typed Cause for LegError when the NpmCI leg fails.
-type NpmCIError struct {
-	Stderr   string
-	Stdout   string // B-14 fix: captured stdout so crash diagnostics are visible at Normal verbosity
-	ExitCode int
-	Cause    error // non-nil for non-exec errors (ctx canceled, etc.)
-}
-
-func (e *NpmCIError) Error() string {
-	if e.Cause != nil {
-		return fmt.Sprintf("npm ci failed: %v", e.Cause)
-	}
-	// B-14 fix: include stdout in the error message when it carries diagnostic
-	// content that wouldn't otherwise be visible at Normal/Quiet verbosity.
-	if e.Stdout != "" && e.Stderr != "" {
-		return fmt.Sprintf("npm ci failed (exit=%d): %s\n%s", e.ExitCode, strings.TrimSpace(e.Stderr), strings.TrimSpace(e.Stdout))
-	}
-	if e.Stdout != "" {
-		return fmt.Sprintf("npm ci failed (exit=%d): %s", e.ExitCode, strings.TrimSpace(e.Stdout))
-	}
-	return fmt.Sprintf("npm ci failed (exit=%d): %s", e.ExitCode, strings.TrimSpace(e.Stderr))
-}
-
-func (e *NpmCIError) Unwrap() error { return e.Cause }
-
 // NpmCI runs `npm ci` inside the container.
 func (p *Pipeline) NpmCI(ctx context.Context) error {
 	return p.runLeg(ctx, LegNpmCI, func(ctx context.Context) (string, error) {
@@ -566,30 +325,6 @@ func (p *Pipeline) NpmCI(ctx context.Context) error {
 		return "", nil
 	})
 }
-
-// BuildError is the typed Cause for LegError when the Build leg fails.
-type BuildError struct {
-	Stderr   string
-	Stdout   string // B-14 fix: captured stdout so crash diagnostics are visible at Normal verbosity
-	ExitCode int
-	Cause    error // non-nil for non-exec errors (ctx canceled, etc.)
-}
-
-func (e *BuildError) Error() string {
-	if e.Cause != nil {
-		return fmt.Sprintf("npm run build failed: %v", e.Cause)
-	}
-	// B-14 fix: include stdout when it carries diagnostic content.
-	if e.Stdout != "" && e.Stderr != "" {
-		return fmt.Sprintf("npm run build failed (exit=%d): %s\n%s", e.ExitCode, strings.TrimSpace(e.Stderr), strings.TrimSpace(e.Stdout))
-	}
-	if e.Stdout != "" {
-		return fmt.Sprintf("npm run build failed (exit=%d): %s", e.ExitCode, strings.TrimSpace(e.Stdout))
-	}
-	return fmt.Sprintf("npm run build failed (exit=%d): %s", e.ExitCode, strings.TrimSpace(e.Stderr))
-}
-
-func (e *BuildError) Unwrap() error { return e.Cause }
 
 // hasBuildScript probes /work/package.json inside the container and reports
 // whether a "build" script is defined under "scripts". A missing or
@@ -649,32 +384,6 @@ func (p *Pipeline) Build(ctx context.Context) error {
 		return "", nil
 	})
 }
-
-// TestRunError is the typed Cause for LegError when the RunTests leg fails
-// due to a runner crash (not merely test failures — exit 1 is intentionally
-// not a leg error per ADR-0017).
-type TestRunError struct {
-	Stderr   string
-	Stdout   string // B-14 fix: captured stdout so crash diagnostics are visible at Normal verbosity
-	ExitCode int
-	Cause    error // non-nil for non-exec errors (ctx canceled, etc.)
-}
-
-func (e *TestRunError) Error() string {
-	if e.Cause != nil {
-		return fmt.Sprintf("test runner failed: %v", e.Cause)
-	}
-	// B-14 fix: include stdout when it carries diagnostic content.
-	if e.Stdout != "" && e.Stderr != "" {
-		return fmt.Sprintf("test runner crashed (exit=%d): %s\n%s", e.ExitCode, strings.TrimSpace(e.Stderr), strings.TrimSpace(e.Stdout))
-	}
-	if e.Stdout != "" {
-		return fmt.Sprintf("test runner crashed (exit=%d): %s", e.ExitCode, strings.TrimSpace(e.Stdout))
-	}
-	return fmt.Sprintf("test runner crashed (exit=%d): %s", e.ExitCode, strings.TrimSpace(e.Stderr))
-}
-
-func (e *TestRunError) Unwrap() error { return e.Cause }
 
 // RunTests executes the test suite inside the container; the Reporter
 // (ADR-0001) emits JSON Lines to a capture file. A JSONL-tail goroutine
@@ -979,151 +688,4 @@ func (p *Pipeline) pump() {
 		}
 		p.events <- e
 	}
-}
-
-// defaultEventQueueCap is the default high-water mark for the bounded event
-// queue (B-7 fix). When q.items reaches this cap, the oldest EventChildOutput
-// entries are evicted and a single EventDroppedOutput marker is injected so the
-// consumer knows output was dropped. Failure/result events are never evicted.
-// Configurable for tests via newEventQueueWithCap.
-const defaultEventQueueCap = 50_000
-
-// eventQueue is a mutex-guarded, bounded FIFO drained by one pump goroutine.
-// Producers (emit) never block; if the queue exceeds its high-water cap the
-// oldest EventChildOutput events are dropped (bounded-with-marker strategy) and
-// a single synthetic EventDroppedOutput marker is emitted so consumers know.
-// Failure events (EventTestFail, EventLegFailure, EventDroppedOutput) are never
-// dropped — failure-first is lossless. This replaces the prior unbounded queue
-// that could grow to OOM under a stalled consumer (#84 B-7 fix, ADR-0017
-// amendment). The "bounded backpressure" comment in the old code was misleading
-// — producers never actually blocked; this implementation makes the bound real.
-type eventQueue struct {
-	mu        sync.Mutex
-	cond      *sync.Cond
-	items     []Event
-	closed    bool
-	cap       int  // high-water mark; 0 means use defaultEventQueueCap
-	dropped   int  // count of EventChildOutput events evicted since last marker
-	hasMarker bool // true if a marker for this drop episode is already in items
-}
-
-func newEventQueue() *eventQueue {
-	return newEventQueueWithCap(defaultEventQueueCap)
-}
-
-func newEventQueueWithCap(cap int) *eventQueue {
-	q := &eventQueue{cap: cap}
-	q.cond = sync.NewCond(&q.mu)
-	return q
-}
-
-// isLossless reports whether event kind e must never be dropped.
-// EventChildOutput is the only droppable kind; all others are lossless.
-func isLosslessKind(k EventKind) bool {
-	return k != EventChildOutput
-}
-
-// push appends e. It is a no-op once the queue is closed (no producers after
-// close), so a late tail-goroutine emit during shutdown can never panic.
-// B-7 fix: when q.items would exceed the cap, the oldest EventChildOutput
-// events are evicted and a synthetic EventDroppedOutput marker is injected
-// (once per drop episode). Lossless events (non-EventChildOutput) are always
-// appended unconditionally.
-func (q *eventQueue) push(e Event) {
-	q.mu.Lock()
-	if q.closed {
-		q.mu.Unlock()
-		return
-	}
-
-	hwm := q.cap
-	if hwm <= 0 {
-		hwm = defaultEventQueueCap
-	}
-
-	// For droppable events: if we would exceed the cap, evict the oldest
-	// EventChildOutput items to make room for both e and a marker (if needed).
-	if !isLosslessKind(e.Kind) && len(q.items) >= hwm {
-		// Evict from the front: scan for oldest EventChildOutput to remove.
-		// We need at least one free slot; keep removing until we have room.
-		for len(q.items) >= hwm {
-			removed := false
-			for i, item := range q.items {
-				if item.Kind == EventChildOutput {
-					// Shift left.
-					copy(q.items[i:], q.items[i+1:])
-					q.items[len(q.items)-1] = Event{}
-					q.items = q.items[:len(q.items)-1]
-					q.dropped++
-					removed = true
-					break
-				}
-			}
-			if !removed {
-				// No EventChildOutput items to evict; just append (lossless-only
-				// backpressure doesn't apply — failure events are always kept).
-				break
-			}
-		}
-		// Inject a marker if there isn't already one pending.
-		if q.dropped > 0 && !q.hasMarker {
-			marker := Event{
-				Kind:   EventDroppedOutput,
-				Leg:    e.Leg,
-				OS:     e.OS,
-				Detail: fmt.Sprintf("%d output lines dropped due to slow consumer", q.dropped),
-			}
-			q.items = append(q.items, marker)
-			q.hasMarker = true
-		} else if q.dropped > 0 && q.hasMarker {
-			// Update the existing marker's count.
-			for i := len(q.items) - 1; i >= 0; i-- {
-				if q.items[i].Kind == EventDroppedOutput {
-					q.items[i].Detail = fmt.Sprintf("%d output lines dropped due to slow consumer", q.dropped)
-					break
-				}
-			}
-		}
-	}
-
-	q.items = append(q.items, e)
-	q.mu.Unlock()
-	q.cond.Signal()
-}
-
-// close marks the queue closed and wakes the pump so it can drain and exit.
-// Idempotent.
-func (q *eventQueue) close() {
-	q.mu.Lock()
-	if q.closed {
-		q.mu.Unlock()
-		return
-	}
-	q.closed = true
-	q.mu.Unlock()
-	q.cond.Broadcast()
-}
-
-// pop returns the next event, blocking until one is available. It returns
-// ok=false exactly once the queue is both closed and fully drained.
-func (q *eventQueue) pop() (Event, bool) {
-	q.mu.Lock()
-	for len(q.items) == 0 && !q.closed {
-		q.cond.Wait()
-	}
-	if len(q.items) == 0 {
-		q.mu.Unlock()
-		return Event{}, false
-	}
-	e := q.items[0]
-	q.items[0] = Event{} // release the reference so the backing array can shrink
-	q.items = q.items[1:]
-	// When the marker is consumed, reset the drop-episode state so the next
-	// burst of drops gets its own fresh marker with an accurate count.
-	if e.Kind == EventDroppedOutput {
-		q.dropped = 0
-		q.hasMarker = false
-	}
-	q.mu.Unlock()
-	return e, true
 }
