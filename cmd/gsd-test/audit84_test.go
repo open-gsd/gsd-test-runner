@@ -350,49 +350,8 @@ func TestStatus_TraversalRunIDRejected(t *testing.T) {
 
 // ── B-12: submit --execute must emit a verdict as the last stdout line ────────
 
-// ── B-11: copyEventsJSONL must return the persisted path for verdict field ────
-
-// TestCopyEventsJSONL_ReturnsPersistedPath verifies that copyEventsJSONL returns
-// the path of the persisted JSONL file so it can be assigned to paths.EventsJSONL
-// for the verdict (B-11).
-func TestCopyEventsJSONL_ReturnsPersistedPath(t *testing.T) {
-	dir := t.TempDir()
-
-	// Write a tiny JSONL source file.
-	src := dir + "/src.jsonl"
-	if err := os.WriteFile(src, []byte(`{"kind":"pass"}`+"\n"), 0o644); err != nil {
-		t.Fatalf("write src: %v", err)
-	}
-
-	osJSONL := map[string]string{"linux": src}
-	got := copyEventsJSONL(dir, osJSONL, os.Stderr)
-	if got == "" {
-		t.Fatalf("copyEventsJSONL: expected non-empty path, got empty string (B-11)")
-	}
-	if _, err := os.Stat(got); err != nil {
-		t.Errorf("copyEventsJSONL returned path %q but file does not exist: %v", got, err)
-	}
-}
-
-// TestCopyEventsJSONL_EmptySource_ReturnsEmpty verifies that copyEventsJSONL
-// returns "" when no JSONL sources are provided (B-11 edge case).
-func TestCopyEventsJSONL_EmptySource_ReturnsEmpty(t *testing.T) {
-	dir := t.TempDir()
-	got := copyEventsJSONL(dir, map[string]string{}, os.Stderr)
-	if got != "" {
-		t.Errorf("copyEventsJSONL(empty): want empty, got %q", got)
-	}
-}
-
-// TestCopyEventsJSONL_SkipsEmptySrcPaths verifies that entries with an empty
-// src path are skipped without error (B-11 edge case).
-func TestCopyEventsJSONL_SkipsEmptySrcPaths(t *testing.T) {
-	dir := t.TempDir()
-	got := copyEventsJSONL(dir, map[string]string{"linux": ""}, os.Stderr)
-	if got != "" {
-		t.Errorf("copyEventsJSONL(empty src): want empty, got %q", got)
-	}
-}
+// (B-11 copyEventsJSONL tests moved to internal/runner/output_test.go when the
+// function was extracted into the runner package.)
 
 // ── B-12: submit --execute must emit a verdict as the last stdout line ────────
 

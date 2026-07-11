@@ -1,15 +1,10 @@
 // Command gsd-test is the Dev Workstation entry point for the Local Engine.
 //
-// It implements the orchestration per ADR-0018 decision 5, extended for the
-// Node matrix (enhancement #108):
-//
-//  1. Load     — config.Load reads ~/.config/gsd-test/config.toml
-//  2. Plan     — plan.Build resolves targets to (OS × Node) Runs (Bench-agnostic)
-//     3+4. Fan-out — schedule.Run dispatches Runs across Benches with per-Bench
-//     capacity (least-loaded, pull-based); each worker ensures its node-specific
-//     image on the assigned Bench, then runs the Pipeline. Renderer subscribes
-//     one Event stream per (OS, Node) cell.
-//  5. Aggregate+Render — collect Reports; map to exit code 0/1/2
+// The default (no-subcommand) path delegates to internal/runner, which owns the
+// multi-OS test pipeline orchestration (ADR-0018 as amended: Load → Plan →
+// Schedule, with EnsurePresent folded into each scheduler worker per Node
+// matrix enhancement #108). The run-and-die subcommands (submit, run, wait,
+// status, __run-worker) and install-agent-hooks are handled inline below.
 //
 // Exit codes per ADR-0009:
 //
@@ -29,10 +24,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
-	"path/filepath"
-	"strconv"
 	"strings"
-	"sync"
 	"syscall"
 	"time"
 
@@ -43,16 +35,13 @@ import (
 	"github.com/open-gsd/gsd-test-runner/internal/dockerexec"
 	"github.com/open-gsd/gsd-test-runner/internal/images"
 	"github.com/open-gsd/gsd-test-runner/internal/installhooks"
-	"github.com/open-gsd/gsd-test-runner/internal/pipeline"
-	"github.com/open-gsd/gsd-test-runner/internal/plan"
 	"github.com/open-gsd/gsd-test-runner/internal/reaper"
 	"github.com/open-gsd/gsd-test-runner/internal/refs"
-	"github.com/open-gsd/gsd-test-runner/internal/renderer"
 	"github.com/open-gsd/gsd-test-runner/internal/report"
+	"github.com/open-gsd/gsd-test-runner/internal/runner"
 	"github.com/open-gsd/gsd-test-runner/internal/runrender"
 	"github.com/open-gsd/gsd-test-runner/internal/runspec"
 	"github.com/open-gsd/gsd-test-runner/internal/runstate"
-	"github.com/open-gsd/gsd-test-runner/internal/schedule"
 	"github.com/open-gsd/gsd-test-runner/internal/telemetry"
 	"github.com/open-gsd/gsd-test-runner/internal/worktree"
 )
@@ -67,9 +56,9 @@ var version = "dev"
 //	2 = at least one Pipeline returned LegError, or any planning step failed,
 //	    or any Plan.Skipped entry exists (no per-OS Report could be produced)
 const (
-	exitAllPass      = 0
-	exitSomeFailed   = 1
-	exitInconclusive = 2
+	exitAllPass      = runner.ExitAllPass
+	exitSomeFailed   = runner.ExitSomeFailed
+	exitInconclusive = runner.ExitInconclusive
 )
 
 // spawnFunc launches a detached worker process and returns its PID.
@@ -188,340 +177,27 @@ func run(args []string, stdout, stderr *os.File) int {
 		return exitAllPass
 	}
 
-	// ── Phase 1: Load ──────────────────────────────────────────────────────────
-	cfg, err := config.Load(flags.configPath, config.LoadOptions{
-		Probe: flags.probeBenches,
+	// Default path: delegate the multi-OS pipeline orchestration to the runner
+	// module (ADR-0018 as amended). The runner owns config loading, plan
+	// building, worktree construction, scheduling, aggregation, and verdict
+	// emission — the full lifecycle behind one interface.
+	return runner.Run(ctx, runner.Options{
+		ConfigPath:   flags.configPath,
+		ProbeBenches: flags.probeBenches,
+		Targets:      flags.targets,
+		Node:         flags.node,
+		Pin:          flags.pin,
+		Exclude:      flags.exclude,
+		JSONEvents:   flags.jsonEvents,
+		Verbose:      flags.verbose,
+		Quiet:        flags.quiet,
+		Base:         flags.base,
+		Head:         flags.head,
+		Source:       flags.source,
+		Scratch:      flags.scratch,
+		Out:          stdout,
+		Err:          stderr,
 	})
-	if err != nil {
-		fmt.Fprintf(stderr, "config.Load: %v\n", err)
-		// B-4: emit infra_error verdict before every pre-pipeline return so the
-		// last stdout line is always machine-readable (ADR-0023 Decision 2).
-		writeInconclusiveVerdict(stdout, stderr)
-		return exitInconclusive
-	}
-
-	targets := commaSplit(flags.targets)
-	if len(targets) == 0 {
-		targets = cfg.Defaults.Targets
-	}
-	if len(targets) == 0 {
-		fmt.Fprintln(stderr, "no target OSes specified (use --targets or set defaults.targets in config)")
-		writeInconclusiveVerdict(stdout, stderr) // B-4
-		return exitInconclusive
-	}
-
-	pin := flags.pin
-	if pin == "" {
-		pin = cfg.Defaults.Pin
-	}
-	exclude := commaSplit(flags.exclude)
-	if len(exclude) == 0 {
-		exclude = cfg.Defaults.Exclude
-	}
-
-	// ── Phase 2: Plan ──────────────────────────────────────────────────────────
-	selector, err := bench.NewSelector(cfg.Registry, bench.Options{
-		Pin: pin, Exclude: exclude,
-	})
-	if err != nil {
-		fmt.Fprintf(stderr, "bench.NewSelector: %v\n", err)
-		writeInconclusiveVerdict(stdout, stderr) // B-4
-		return exitInconclusive
-	}
-
-	p, err := plan.Build(cfg, selector, targets, commaSplit(flags.node))
-	if err != nil {
-		fmt.Fprintf(stderr, "plan.Build: %v\n", err)
-		writeInconclusiveVerdict(stdout, stderr) // B-4
-		return exitInconclusive
-	}
-	p.AddUnreachable(cfg.Unreachable, targets)
-
-	// ── Construct PR-merged worktree ────────────────────────────────────────────
-	// Per ADR-0010: refs.Resolve before worktree.Construct.
-	baseSHA, err := refs.Resolve(ctx, flags.source, flags.base)
-	if err != nil {
-		fmt.Fprintf(stderr, "refs.Resolve(%q): %v\n", flags.base, err)
-		writeInconclusiveVerdict(stdout, stderr) // B-4
-		return exitInconclusive
-	}
-	headSHA, err := refs.Resolve(ctx, flags.source, flags.head)
-	if err != nil {
-		fmt.Fprintf(stderr, "refs.Resolve(%q): %v\n", flags.head, err)
-		writeInconclusiveVerdict(stdout, stderr) // B-4
-		return exitInconclusive
-	}
-
-	scratchDir := flags.scratch
-	if scratchDir == "" {
-		scratchDir, err = os.MkdirTemp("", "gsd-test-")
-		if err != nil {
-			fmt.Fprintf(stderr, "create scratch dir: %v\n", err)
-			writeInconclusiveVerdict(stdout, stderr) // B-4
-			return exitInconclusive
-		}
-	}
-
-	wt, err := worktree.Construct(ctx, worktree.Options{
-		SourceRepo: flags.source,
-		BaseSHA:    baseSHA,
-		PRSHA:      headSHA,
-		ScratchDir: scratchDir,
-	})
-	if err != nil {
-		fmt.Fprintf(stderr, "worktree.Construct: %v\n", err)
-		writeInconclusiveVerdict(stdout, stderr) // B-4
-		return exitInconclusive
-	}
-	defer wt.Close()
-
-	// ── Phase 3+4: Fan out (OS × Node) Runs across Benches ─────────────────────
-	// Bench assignment is dynamic (capacity-aware, least-loaded pull; enhancement
-	// #108, see internal/schedule), so image presence can't be ensured per bench
-	// up front — it folds into each worker below. This replaces the former
-	// separate EnsureImages phase + one-goroutine-per-OS RunPipelines phase.
-	mode := renderer.ModeTTY
-	if flags.jsonEvents {
-		mode = renderer.ModeJSONEvents
-	}
-	r := renderer.New(stdout, mode)
-	// Quiet-by-default live stream (Option B): a compact heartbeat + failures.
-	// --verbose / GSD_TEST_VERBOSE=1 restores the full firehose; --quiet drops
-	// even the heartbeat. (ModeJSONEvents ignores verbosity — always full.)
-	verbosity := renderer.VerbosityNormal
-	if flags.verbose || os.Getenv("GSD_TEST_VERBOSE") == "1" {
-		verbosity = renderer.VerbosityFull
-	} else if flags.quiet {
-		verbosity = renderer.VerbosityQuiet
-	}
-	r.SetVerbosity(verbosity)
-
-	// One schedulable Unit per (OS, Node) Run, each pre-wired with its own events
-	// channel subscribed by the (OS, Node) stream key. Streams are keyed by cell
-	// identity (not bench) because dispatch is dynamic.
-	type jobPayload struct {
-		run       plan.Run
-		streamKey string
-		events    chan pipeline.Event
-	}
-	units := make([]schedule.Unit, 0, len(p.Runs))
-	for _, run := range p.Runs {
-		streamKey := report.StreamKey(run.OS, run.NodeMajor)
-		// Buffer generously to absorb burst test events (ADR-0017 dec 4).
-		events := make(chan pipeline.Event, 128)
-		r.Subscribe(streamKey, events)
-		units = append(units, schedule.Unit{
-			OS:      run.OS,
-			Payload: &jobPayload{run: run, streamKey: streamKey, events: events},
-		})
-	}
-
-	// Candidate benches per target OS (post pin/exclude) for the scheduler.
-	benchesByOS := make(map[string][]bench.Bench, len(targets))
-	for _, osName := range targets {
-		benchesByOS[osName] = selector.BenchesForOS(osName)
-	}
-	capResolver := newCapacityResolver(ctx)
-
-	type pipelineResult struct {
-		streamKey string
-		rep       report.Report
-		err       error
-		drained   string // local JSONL capture path (Option B persistence)
-	}
-	work := func(ctx context.Context, b bench.Bench, u schedule.Unit) any {
-		jp := u.Payload.(*jobPayload)
-		// Ensure this cell's node-specific image is present on the assigned
-		// bench (folds the old EnsureImages phase in). A local fallback build
-		// gets NODE_VERSION so it bakes the right major (enhancement #108).
-		if err := images.EnsurePresent(ctx, b, jp.run.ImageID, images.EnsurePresentOptions{
-			FallbackDockerfile: "dockerfiles/" + jp.run.OS + ".Dockerfile",
-			FallbackContextDir: ".",
-			FallbackBuildArgs:  map[string]string{"NODE_VERSION": jp.run.NodeMajor},
-		}); err != nil {
-			fmt.Fprintf(stderr, "EnsurePresent(bench=%s, image=%s): %v\n", b.Name, jp.run.ImageID, err)
-			return pipelineResult{streamKey: jp.streamKey, err: err}
-		}
-		pl := pipeline.New(b, jp.run.ImageID, jp.run.Version, wt.Path(), cfg.Testing.Command, jp.events)
-		rep, err := pl.RunAll(ctx)
-		// The pipeline's pump goroutine owns closing events (it flushes the
-		// unbounded queue first), so we must NOT close it here (#84).
-		rep.NodeMajor = jp.run.NodeMajor // stamp the cell's node major onto the report
-		return pipelineResult{streamKey: jp.streamKey, rep: rep, err: err, drained: pl.DrainedPath()}
-	}
-
-	schedResults := schedule.Run(ctx, units, benchesByOS, capResolver.capacity, work)
-
-	// ── Phase 5: Aggregate + Render ────────────────────────────────────────────
-	var sawLegError, sawFail bool
-	reps := make([]report.Report, 0, len(p.Runs))
-	osJSONL := make(map[string]string, len(p.Runs))
-	for _, sr := range schedResults {
-		jp := sr.Unit.Payload.(*jobPayload)
-		res, ok := sr.Value.(pipelineResult)
-		if !ok {
-			// The unit never ran (ErrNoBench — plan should have skipped it — or
-			// ctx cancellation). No pump exists to close this stream, so close it
-			// ourselves or r.Wait() would block forever. Record it as infra_error.
-			close(jp.events)
-			fmt.Fprintf(stderr, "%s: not run: %v\n", jp.streamKey, sr.Value)
-			sawLegError = true
-			infra := report.New(jp.run.OS, "", string(jp.run.ImageID), jp.run.Version, time.Now().UTC())
-			infra.NodeMajor = jp.run.NodeMajor
-			infra.Outcome = report.OutcomeInfraError
-			r.AddResult(jp.streamKey, infra, fmt.Errorf("not run: %v", sr.Value))
-			reps = append(reps, infra)
-			continue
-		}
-		r.AddResult(res.streamKey, res.rep, res.err)
-		osJSONL[res.streamKey] = res.drained
-		if res.err != nil {
-			sawLegError = true
-			// A leg error means the suite did not run as designed; record it as
-			// an infra_error per-cell report so the digest/verdict still account
-			// for this (OS, Node) cell (RunAll returns a zero Report on error).
-			infra := res.rep
-			infra.OS = jp.run.OS
-			infra.NodeMajor = jp.run.NodeMajor
-			infra.Outcome = report.OutcomeInfraError
-			reps = append(reps, infra)
-			continue
-		}
-		reps = append(reps, res.rep)
-		if res.rep.Kind == report.KindFail {
-			sawFail = true
-		}
-	}
-	r.Wait() // blocks for renderer event consumers + emits final summary
-
-	// Failure-first artifacts + loud last-line verdict (epic #84, ADR-0023).
-	// Best-effort: a write error never changes the exit code or suppresses the
-	// verdict (the verdict's outcome is the source of truth).
-	emitRunArtifacts(reps, osJSONL, stdout, stderr)
-
-	// Inconclusive if any Pipeline failed OR any Plan.Skipped entry exists.
-	if sawLegError || len(p.Skipped) > 0 {
-		return exitInconclusive
-	}
-	if sawFail {
-		return exitSomeFailed
-	}
-	return exitAllPass
-}
-
-// writeRunArtifacts writes the failure-first digest (FAILURES.md, failures.json,
-// per-failure files) for reps under the per-run XDG dir for runID and returns
-// the artifact paths (epic #84, ADR-0023). Best-effort: a write failure is
-// logged to stderr and returns whatever paths succeeded, never affecting the
-// caller's exit code.
-func writeRunArtifacts(runID string, reps []report.Report, stderr io.Writer) digest.Paths {
-	dir, err := runstate.EnsureRunDir(runID)
-	if err != nil {
-		fmt.Fprintf(stderr, "warning: create run artifact dir: %v\n", err)
-		return digest.Paths{}
-	}
-	paths, err := digest.WriteDigest(dir, reps, digest.WriteOpts{PerFailureFiles: true})
-	if err != nil {
-		fmt.Fprintf(stderr, "warning: write run digest: %v\n", err)
-		return digest.Paths{Dir: dir}
-	}
-	return paths
-}
-
-// writeVerdict prints the loud last-line machine verdict as the final stdout
-// line (Option C). Best-effort: never changes the exit code (the verdict's
-// outcome is the source of truth regardless of the artifacts).
-func writeVerdict(reps []report.Report, paths digest.Paths, stdout, stderr io.Writer) {
-	if err := digest.Verdict(reps, paths).WriteLine(stdout); err != nil {
-		fmt.Fprintf(stderr, "warning: write verdict line: %v\n", err)
-	}
-}
-
-// writeInconclusiveVerdict emits a minimal verdict line with outcome=infra_error
-// (the canonical project outcome for a genuine-inconclusive run) to stdout.
-// Called before any early-return in runSubmit that represents a run-outcome
-// failure (not a CLI usage error). Best-effort: a write error is reported to
-// stderr and never changes the exit code.
-func writeInconclusiveVerdict(stdout, stderr io.Writer) {
-	v := digest.VerdictLine{
-		Type:           "verdict",
-		Outcome:        string(report.OutcomeInfraError),
-		PerOS:          map[string]digest.OSCount{},
-		UniqueFailures: 0,
-		TotalFailures:  0,
-		Top:            []digest.VerdictTop{},
-		Artifacts:      digest.VerdictArtifacts{},
-	}
-	if err := v.WriteLine(stdout); err != nil {
-		fmt.Fprintf(stderr, "warning: write inconclusive verdict line: %v\n", err)
-	}
-}
-
-// emitRunArtifacts is the standard multi-OS path: it mints a run-id, writes the
-// digest, persists each OS's full JSONL, and prints the verdict as the final
-// stdout line in every outcome.
-func emitRunArtifacts(reps []report.Report, osJSONL map[string]string, stdout, stderr io.Writer) {
-	runID, err := runspec.NewRunID()
-	if err != nil {
-		runID = "run-unknown"
-	}
-	paths := writeRunArtifacts(runID, reps, stderr)
-	if paths.Dir != "" {
-		// B-11: assign the persisted events JSONL path so the verdict's
-		// events_jsonl field is populated (was always omitted before).
-		paths.EventsJSONL = copyEventsJSONL(paths.Dir, osJSONL, stderr)
-	}
-	writeVerdict(reps, paths, stdout, stderr)
-}
-
-// copyEventsJSONL persists each per-OS drained JSONL into the run dir as
-// test-events-<os>.jsonl so the full per-test detail (passes included) is always
-// available, not just the failure digest (Option B, #84). Best-effort.
-// Returns the path of the last successfully persisted file (or "" when none),
-// which the caller assigns to paths.EventsJSONL for the verdict (B-11).
-// After a successful copy the source temp file is removed to avoid orphaned
-// os.TempDir() files (issue #102, Option D).
-func copyEventsJSONL(dir string, osJSONL map[string]string, stderr io.Writer) string {
-	var lastPersisted string
-	for osName, src := range osJSONL {
-		if src == "" {
-			continue
-		}
-		dst := filepath.Join(dir, "test-events-"+osName+".jsonl")
-		if err := copyFile(src, dst); err != nil {
-			fmt.Fprintf(stderr, "warning: persist %s JSONL: %v\n", osName, err)
-			continue
-		}
-		lastPersisted = dst
-		_ = os.Remove(src) // release the throwaway drain temp once persisted (issue #102, Option D)
-	}
-	return lastPersisted
-}
-
-func copyFile(src, dst string) error {
-	in, err := os.Open(src)
-	if err != nil {
-		return err
-	}
-	defer in.Close()
-	out, err := os.Create(dst)
-	if err != nil {
-		return err
-	}
-	if _, err := io.Copy(out, in); err != nil {
-		out.Close()
-		return err
-	}
-	return out.Close()
-}
-
-// emitRunDieArtifacts is the run-and-die single-OS path: it writes the digest
-// under the run's existing run-id and prints the verdict as the final stdout
-// line, so `gsd-test run`/`wait` share the standard path's failure-first
-// contract (Option C, epic #84).
-func emitRunDieArtifacts(runID string, rep report.Report, stdout, stderr io.Writer) {
-	reps := []report.Report{rep}
-	writeVerdict(reps, writeRunArtifacts(runID, reps, stderr), stdout, stderr)
 }
 
 // runSubmit implements `gsd-test submit`: read a JSON run spec (from --spec-file
@@ -554,14 +230,14 @@ func runSubmit(args []string, stdout, stderr *os.File) int {
 	}
 	if err != nil {
 		fmt.Fprintf(stderr, "submit: read spec: %v\n", err)
-		writeInconclusiveVerdict(stdout, stderr)
+		runner.WriteInconclusiveVerdict(stdout, stderr)
 		return exitInconclusive
 	}
 
 	spec, err := runspec.Parse(data)
 	if err != nil {
 		fmt.Fprintf(stderr, "submit: invalid run spec: %v\n", err)
-		writeInconclusiveVerdict(stdout, stderr)
+		runner.WriteInconclusiveVerdict(stdout, stderr)
 		return exitInconclusive
 	}
 
@@ -671,14 +347,14 @@ func runRun(args []string, stdout, stderr *os.File) int {
 		// B-3: ADR-0023 Decision 2 requires a verdict on EVERY outcome, including
 		// infra_error. Emit an inconclusive verdict so the last stdout line is
 		// always machine-readable, even when the run could not start.
-		writeInconclusiveVerdict(stdout, stderr)
+		runner.WriteInconclusiveVerdict(stdout, stderr)
 		return exitInconclusive
 	}
 
 	text, code := runrender.Render(rep)
 	fmt.Fprint(stdout, text)
 	// Failure-first digest + loud verdict, shared with the standard path (#84).
-	emitRunDieArtifacts(spec.RunID, rep, stdout, stderr)
+	runner.EmitRunDieArtifacts(spec.RunID, rep, stdout, stderr)
 	return code
 }
 
@@ -770,7 +446,7 @@ func runWorker(args []string, stdout, stderr *os.File) int {
 		_, code := runrender.Render(rep)
 		// Persist the failure-first digest now so artifacts exist on disk as soon
 		// as the async run finishes; `gsd-test wait` prints the verdict (#84).
-		_ = writeRunArtifacts(st.Spec.RunID, []report.Report{rep}, stderr)
+		_ = runner.WriteRunArtifacts(st.Spec.RunID, []report.Report{rep}, stderr)
 		st.Report = &rep
 		st.ExitCode = code
 		st.Status = runstate.StatusDone
@@ -781,7 +457,7 @@ func runWorker(args []string, stdout, stderr *os.File) int {
 			OS:      st.Spec.Target,
 			Outcome: report.OutcomeInfraError,
 		}
-		_ = writeRunArtifacts(st.Spec.RunID, []report.Report{infraRep}, stderr)
+		_ = runner.WriteRunArtifacts(st.Spec.RunID, []report.Report{infraRep}, stderr)
 		st.Status = runstate.StatusDone
 		st.ExitCode = exitInconclusive
 		st.Err = "dispatch failed"
@@ -871,12 +547,12 @@ func waitRun(args []string, stdout, stderr *os.File) int {
 		// B-3: ADR-0023 Decision 2 requires a verdict on EVERY outcome. The
 		// worker persisted an infra_error artifact; emit the verdict from it so
 		// the last stdout line is always machine-readable.
-		writeInconclusiveVerdict(stdout, stderr)
+		runner.WriteInconclusiveVerdict(stdout, stderr)
 		return exitInconclusive
 	}
 	if st.Report == nil {
 		fmt.Fprintf(stderr, "wait: run %s has no report\n", runID)
-		writeInconclusiveVerdict(stdout, stderr)
+		runner.WriteInconclusiveVerdict(stdout, stderr)
 		return exitInconclusive
 	}
 
@@ -894,7 +570,7 @@ func waitRun(args []string, stdout, stderr *os.File) int {
 	if keepArtifacts {
 		// Non-ephemeral: write the failure-first digest + verdict as a blocking
 		// `gsd-test run` would (#84).
-		emitRunDieArtifacts(st.Spec.RunID, *st.Report, stdout, stderr)
+		runner.EmitRunDieArtifacts(st.Spec.RunID, *st.Report, stdout, stderr)
 		return code
 	}
 	// Ephemeral (#102 Option B): stdout above is self-contained. Emit the verdict
@@ -1182,7 +858,7 @@ func executeSpec(spec runspec.Spec, configPath string, stdout, stderr *os.File) 
 	if !ok {
 		// B-12: emit inconclusive verdict even when dispatch fails so every
 		// submit --execute outcome conforms to ADR-0023 Decision 2.
-		writeInconclusiveVerdict(stdout, stderr)
+		runner.WriteInconclusiveVerdict(stdout, stderr)
 		return exitInconclusive
 	}
 
@@ -1196,76 +872,10 @@ func executeSpec(spec runspec.Spec, configPath string, stdout, stderr *os.File) 
 	// B-12: emit the compact verdict as the LAST stdout line (ADR-0023 Option C).
 	// The indented JSON report is emitted above for human/agent consumption; the
 	// verdict below is the machine-readable last-line contract.
-	emitRunDieArtifacts(spec.RunID, rep, stdout, stderr)
+	runner.EmitRunDieArtifacts(spec.RunID, rep, stdout, stderr)
 
 	if rep.Outcome == report.OutcomePassed {
 		return exitAllPass
 	}
 	return exitSomeFailed
-}
-
-// capacityResolver resolves a Bench's per-run container concurrency: the
-// configured capacity when set (> 0), else the Bench's own CPU count (probed
-// via `docker info -f {{.NCPU}}` against that Bench's daemon), else 1. Results
-// are cached per Bench name so the NCPU probe runs at most once per Bench per
-// invocation (enhancement #108). Safe for concurrent use by the scheduler.
-type capacityResolver struct {
-	ctx   context.Context
-	mu    sync.Mutex
-	cache map[string]int
-}
-
-func newCapacityResolver(ctx context.Context) *capacityResolver {
-	return &capacityResolver{ctx: ctx, cache: make(map[string]int)}
-}
-
-// capacity returns the max concurrent Tester containers to run on b. Configured
-// capacity wins; otherwise the Bench's NCPU (auto-parallel), floored at 1.
-func (c *capacityResolver) capacity(b bench.Bench) int {
-	if b.Capacity > 0 {
-		return b.Capacity
-	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if v, ok := c.cache[b.Name]; ok {
-		return v
-	}
-	n := queryNCPU(c.ctx, b)
-	if n < 1 {
-		n = 1
-	}
-	c.cache[b.Name] = n
-	return n
-}
-
-// queryNCPU returns the Bench daemon's CPU count via `docker info -f {{.NCPU}}`.
-// Returns 0 on any error (the caller floors to 1) — a probe failure must never
-// abort the run, only fall back to serial for that Bench. Package var so tests
-// can stub it without a Docker daemon.
-var queryNCPU = func(ctx context.Context, b bench.Bench) int {
-	out, err := dockerexec.Run(ctx, b, []string{"info", "-f", "{{.NCPU}}"})
-	if err != nil {
-		return 0
-	}
-	n, err := strconv.Atoi(strings.TrimSpace(out))
-	if err != nil {
-		return 0
-	}
-	return n
-}
-
-// commaSplit splits s on commas and trims whitespace from each part.
-// Returns nil when s is empty (not an empty slice).
-func commaSplit(s string) []string {
-	if s == "" {
-		return nil
-	}
-	parts := strings.Split(s, ",")
-	out := make([]string, 0, len(parts))
-	for _, p := range parts {
-		if t := strings.TrimSpace(p); t != "" {
-			out = append(out, t)
-		}
-	}
-	return out
 }
