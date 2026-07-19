@@ -98,15 +98,21 @@ func DockerRunArgs(spec runspec.Spec, imageID string, deadlineEpochMs int64, wor
 	}
 	sort.Strings(envKeys)
 
-	// Pre-calculate capacity: base (8) + labels (6) + env pairs (2*N) + image (1).
+	// Pre-calculate capacity: base (12) + labels (6) + env pairs (2*N) + image (1).
+	// --name + sh.gsd-test.branch label are ADR-0029: the name makes the branch
+	// legible at `docker ps`; the label is the machine-readable ownership signal
+	// the Tier-2 reaper scopes on. Both derive from the same Spec.BranchSlug so
+	// they cannot drift (parity invariant, known-defect gauntlet).
 	base := []string{
 		"run", "--rm",
 		"--pids-limit", DefaultPidsLimit,
 		"--memory", DefaultMemory,
 		"--cpus", DefaultCPUs,
+		"--name", spec.ContainerName(),
 		"--label", fmt.Sprintf("%s=%s", reaper.LabelRunID, spec.RunID),
 		"--label", fmt.Sprintf("%s=%d", reaper.LabelDeadline, deadlineEpochMs),
 		"--label", fmt.Sprintf("sh.gsd-test.target=%s", spec.Target),
+		"--label", fmt.Sprintf("%s=%s", reaper.LabelBranch, spec.BranchSlug()),
 	}
 
 	result := make([]string, len(base), len(base)+2*len(envKeys)+1)

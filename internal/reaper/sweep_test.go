@@ -9,12 +9,17 @@ import (
 )
 
 func TestParsePS(t *testing.T) {
-	out := []byte("c1\t1000\trun-a\nc2\t\trun-b\n\nc3\tnotanumber\trun-c\n")
+	// Pre-ADR-0029 psFormat was ID/deadline/run-id; modern psFormat adds Name
+	// and BranchSlug. parsePS tolerates both, populating the new fields as the
+	// extra columns appear.
+	out := []byte("c1\t1000\trun-a\tgsd-test-fix-foo-aaaaaaaa\tfix-foo\n" +
+		"c2\t\trun-b\t\t\n" +
+		"c3\tnotanumber\trun-c\tkeen_euclid\t\n")
 	got := parsePS(out)
 	want := []Container{
-		{ID: "c1", DeadlineMs: 1000, RunID: "run-a"},
-		{ID: "c2", DeadlineMs: 0, RunID: "run-b"},
-		{ID: "c3", DeadlineMs: 0, RunID: "run-c"},
+		{ID: "c1", DeadlineMs: 1000, RunID: "run-a", Name: "gsd-test-fix-foo-aaaaaaaa", BranchSlug: "fix-foo"},
+		{ID: "c2", DeadlineMs: 0, RunID: "run-b", Name: "", BranchSlug: ""},
+		{ID: "c3", DeadlineMs: 0, RunID: "run-c", Name: "keen_euclid", BranchSlug: ""},
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("parsePS = %+v, want %+v", got, want)
@@ -40,8 +45,8 @@ func (f *fakeRunner) run(_ context.Context, args ...string) ([]byte, error) {
 }
 
 func TestSweep_KillsOnlyOverdue(t *testing.T) {
-	f := &fakeRunner{psOut: []byte("past\t500\trun-a\nfuture\t5000\trun-b\n")}
-	reaped, err := Sweep(context.Background(), f.run, 1000)
+	f := &fakeRunner{psOut: []byte("past\t500\trun-a\t\t\nfuture\t5000\trun-b\t\t\n")}
+	reaped, err := Sweep(context.Background(), f.run, 1000, "")
 	if err != nil {
 		t.Fatalf("Sweep: %v", err)
 	}
@@ -55,7 +60,7 @@ func TestSweep_KillsOnlyOverdue(t *testing.T) {
 
 func TestSweep_ListErrorPropagates(t *testing.T) {
 	f := &fakeRunner{psErr: errors.New("ssh down")}
-	_, err := Sweep(context.Background(), f.run, 1000)
+	_, err := Sweep(context.Background(), f.run, 1000, "")
 	if err == nil {
 		t.Fatal("Sweep: want error when list fails, got nil")
 	}
@@ -66,7 +71,7 @@ func TestSweep_ListErrorPropagates(t *testing.T) {
 // kill remaining overdue containers and returns nil error (#104).
 func TestSweep_ContinuesPastAlreadyGoneContainer(t *testing.T) {
 	// Two overdue containers: A (already gone) and B (still needs killing).
-	listOut := []byte("containerA\t500\trun-a\ncontainerB\t500\trun-b\n")
+	listOut := []byte("containerA\t500\trun-a\t\t\ncontainerB\t500\trun-b\t\t\n")
 
 	var killCalls []string
 
@@ -101,7 +106,7 @@ func TestSweep_ContinuesPastAlreadyGoneContainer(t *testing.T) {
 		return nil, nil
 	}
 
-	reaped, err := Sweep(context.Background(), run, 1000)
+	reaped, err := Sweep(context.Background(), run, 1000, "")
 	if err != nil {
 		t.Fatalf("Sweep: want nil error, got: %v", err)
 	}
@@ -124,7 +129,7 @@ func TestSweep_ContinuesPastAlreadyGoneContainer(t *testing.T) {
 // for a container that is still present is propagated as a genuine failure, and
 // the overdue slice is still returned (#104).
 func TestSweep_ReturnsErrorWhenKillFailsAndStillRunning(t *testing.T) {
-	listOut := []byte("containerA\t500\trun-a\n")
+	listOut := []byte("containerA\t500\trun-a\t\t\n")
 
 	run := func(_ context.Context, args ...string) ([]byte, error) {
 		if len(args) == 0 {
@@ -145,7 +150,7 @@ func TestSweep_ReturnsErrorWhenKillFailsAndStillRunning(t *testing.T) {
 		return nil, nil
 	}
 
-	reaped, err := Sweep(context.Background(), run, 1000)
+	reaped, err := Sweep(context.Background(), run, 1000, "")
 	if err == nil {
 		t.Fatal("Sweep: want non-nil error when kill fails and container still running, got nil")
 	}

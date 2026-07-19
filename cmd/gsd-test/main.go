@@ -777,9 +777,11 @@ func dispatchRun(spec runspec.Spec, configPath, label string, stderr io.Writer) 
 
 	// Tier-2 reaper, "reap on next contact" (ADR-0021 Decision 2): before
 	// starting, kill any run container on this Bench whose deadline has passed —
-	// e.g. one whose in-container watchdog wedged on a previous run. Best-effort;
-	// a sweep failure must not block this run.
-	if reaped, sweepErr := reaper.Sweep(ctx, runner, time.Now().UnixMilli()); sweepErr != nil {
+	// e.g. one whose in-container watchdog wedged on a previous run. Scoped to
+	// this invocation's branch (ADR-0029): only containers labeled for the same
+	// branch are reaped, so leftover containers from unrelated branches stay for
+	// their own invocations. Best-effort; a sweep failure must not block this run.
+	if reaped, sweepErr := reaper.Sweep(ctx, runner, time.Now().UnixMilli(), spec.BranchSlug()); sweepErr != nil {
 		fmt.Fprintf(stderr, "%s: warning: reaper sweep: %v\n", label, sweepErr)
 	} else if len(reaped) > 0 {
 		fmt.Fprintf(stderr, "%s: reaped %d stale container(s) before running\n", label, len(reaped))

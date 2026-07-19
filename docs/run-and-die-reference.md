@@ -283,7 +283,10 @@ Each run container carries these labels (reverse-DNS, matching the image-version
 | `sh.gsd-test.run-id` | The run's `runId`. |
 | `sh.gsd-test.deadline` | Absolute deadline as epoch milliseconds. The Tier-2 reaper sweeps on this. |
 | `sh.gsd-test.target` | The target OS. |
+| `sh.gsd-test.branch` | Branch slug under test (ADR-0029). The Tier-2 reaper scopes ownership to containers whose slug matches the current invocation; an empty/unset value (pre-ADR-0029 containers) is included only by an unscoped sweep. |
 | `sh.gsd-test.image-version` | (On the image, not the container) the version sentinel verified before each run. |
+
+The container is also launched with `--name gsd-test-<branch-slug>-<short-runId>` (ADR-0029) so a Bench operator can read the branch under test directly off `docker ps`. The slug is derived from the run spec's `prBranch` (preferred) or `base`; the 8-character `runId` tail disambiguates concurrent runs of the same branch.
 
 ## Resource caps
 

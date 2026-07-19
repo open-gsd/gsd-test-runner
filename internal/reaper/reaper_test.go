@@ -52,4 +52,9 @@ func TestLabelConstants(t *testing.T) {
 	if LabelDeadline != "sh.gsd-test.deadline" {
 		t.Errorf("LabelDeadline = %q", LabelDeadline)
 	}
+	// ADR-0029 adds the branch ownership label so the Tier-2 reaper can scope
+	// which containers an invocation owns.
+	if LabelBranch != "sh.gsd-test.branch" {
+		t.Errorf("LabelBranch = %q", LabelBranch)
+	}
 }

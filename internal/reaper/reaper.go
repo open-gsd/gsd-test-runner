@@ -9,17 +9,24 @@
 package reaper
 
 // Container labels (reverse-DNS, matching the image-version sentinel
-// convention from ADR-0011).
+// convention from ADR-0011). ADR-0029 adds LabelBranch so the Tier-2 reaper
+// can scope ownership to containers belonging to a specific branch slug.
 const (
 	LabelRunID    = "sh.gsd-test.run-id"
 	LabelDeadline = "sh.gsd-test.deadline"
+	LabelBranch   = "sh.gsd-test.branch"
 )
 
-// Container is a labeled run container observed on a Bench.
+// Container is a labeled run container observed on a Bench. Name carries the
+// `gsd-test-<slug>-<runIdTail>` value from ADR-0029 so the reaper can scope
+// ownership by branch; it is empty for containers launched before ADR-0029
+// landed (which have no --name and no sh.gsd-test.branch label).
 type Container struct {
 	ID         string
+	Name       string
 	RunID      string
-	DeadlineMs int64 // epoch ms from the sh.gsd-test.deadline label; 0 == unset
+	BranchSlug string // from sh.gsd-test.branch label; "" when unset (pre-ADR-0029)
+	DeadlineMs int64  // epoch ms from the sh.gsd-test.deadline label; 0 == unset
 }
 
 // Overdue returns, in input order, the containers whose deadline is at or
