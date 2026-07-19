@@ -327,6 +327,8 @@ func TestDockerRunArgs_FullOrder(t *testing.T) {
 	spec := baseSpec()
 	spec.RunID = "run-1"
 	spec.Target = "linux"
+	spec.PRBranch = "fix/123-branch-named-containers"
+	spec.Base = "main"
 	spec.Env = map[string]string{"CI": "1", "NODE_ENV": "test"}
 	got := dispatch.DockerRunArgs(spec, "sha256:deadbeef", 5000, "/mnt:/mnt")
 	want := []string{
@@ -334,9 +336,11 @@ func TestDockerRunArgs_FullOrder(t *testing.T) {
 		"--pids-limit", "512",
 		"--memory", "2g",
 		"--cpus", "2",
+		"--name", "gsd-test-fix-123-branch-named-containers-run-1",
 		"--label", "sh.gsd-test.run-id=run-1",
 		"--label", "sh.gsd-test.deadline=5000",
 		"--label", "sh.gsd-test.target=linux",
+		"--label", "sh.gsd-test.branch=fix-123-branch-named-containers",
 		"-e", "CI=1",
 		"-e", "NODE_ENV=test",
 		"sha256:deadbeef",
@@ -344,6 +348,34 @@ func TestDockerRunArgs_FullOrder(t *testing.T) {
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("DockerRunArgs =\n  %v\nwant\n  %v", got, want)
 	}
+}
+
+// TestDockerRunArgs_NameAndBranchLabelConsistent asserts the parity invariant
+// (ADR-0029, known-defect gauntlet): the --name suffix and the
+// sh.gsd-test.branch label MUST derive from the same slug. A divergence would
+// mean a Bench operator reading the name and the reaper reading the label
+// disagree about ownership.
+func TestDockerRunArgs_NameAndBranchLabelConsistent(t *testing.T) {
+	spec := baseSpec()
+	spec.PRBranch = "fix/some-Cool_Branch.Name"
+	got := dispatch.DockerRunArgs(spec, "img:latest", 0, "")
+	wantName := spec.ContainerName()
+	wantSlug := spec.BranchSlug()
+	mustContainPair(t, got, "--name", wantName)
+	mustContainPair(t, got, "--label", "sh.gsd-test.branch="+wantSlug)
+	// The name's slug portion must equal the label slug (parity).
+	if !strings.Contains(wantName, "-"+wantSlug+"-") {
+		t.Errorf("name %q does not contain the label slug %q between dashes; parity violated", wantName, wantSlug)
+	}
+}
+
+// TestDockerRunArgs_NameFallbackForEmptyBranch verifies that a spec without
+// branch info still produces a valid Docker name (the "unknown" sentinel).
+func TestDockerRunArgs_NameFallbackForEmptyBranch(t *testing.T) {
+	spec := baseSpec() // no PRBranch/Base
+	got := dispatch.DockerRunArgs(spec, "img:latest", 0, "")
+	mustContainPair(t, got, "--name", spec.ContainerName())
+	mustContainPair(t, got, "--label", "sh.gsd-test.branch=unknown")
 }
 
 // TestDockerRunArgs_ExportedCaps verifies that the exported cap consts match

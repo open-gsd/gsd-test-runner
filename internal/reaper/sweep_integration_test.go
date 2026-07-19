@@ -27,17 +27,22 @@ func requireDocker(t *testing.T) {
 }
 
 // TestSweep_RealDocker_ReapsOverdueContainer proves the docker ps label format
-// and `docker kill` path against a live daemon (ADR-0021 Decision 2/4).
+// and `docker kill` path against a live daemon (ADR-0021 Decision 2/4). The
+// planted container carries ADR-0029's --name and sh.gsd-test.branch label so
+// the test exercises the modern psFormat and the branch-scoped Sweep path.
 func TestSweep_RealDocker_ReapsOverdueContainer(t *testing.T) {
 	requireDocker(t)
 	ctx := context.Background()
 
 	runID := "gsd-test-reaper-it-" + strings.ReplaceAll(t.Name(), "/", "-")
+	branchSlug := "fix-reaper-it"
 	deadline := time.Now().Add(-time.Minute).UnixMilli() // already overdue
 
 	idOut, err := exec.CommandContext(ctx, "docker", "run", "-d", "--rm",
+		"--name", "gsd-test-"+branchSlug+"-reaperit",
 		"--label", LabelRunID+"="+runID,
 		"--label", LabelDeadline+"="+strconv.FormatInt(deadline, 10),
+		"--label", LabelBranch+"="+branchSlug,
 		"alpine:3", "sleep", "300").Output()
 	if err != nil {
 		t.Fatalf("docker run: %v", err)
@@ -46,7 +51,9 @@ func TestSweep_RealDocker_ReapsOverdueContainer(t *testing.T) {
 	// Best-effort cleanup if the assertions below fail before the reap.
 	t.Cleanup(func() { _ = exec.Command("docker", "rm", "-f", id).Run() })
 
-	reaped, err := Sweep(ctx, localDockerRunner, time.Now().UnixMilli())
+	// Scope to the branch we planted: only this container should be reaped.
+	// (Any unrelated gsd-test containers on the host daemon are left alone.)
+	reaped, err := Sweep(ctx, localDockerRunner, time.Now().UnixMilli(), branchSlug)
 	if err != nil {
 		t.Fatalf("Sweep: %v", err)
 	}

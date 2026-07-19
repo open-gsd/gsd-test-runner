@@ -34,6 +34,10 @@ A file baked into each Tester Image at a known path containing the image's versi
 
 The per-run payload. Constructed by the Local Engine in a scratch clone: base branch fetched, PR branch merged into it via real `git merge`. Merge conflicts surface here as a named failure, before any container starts. Contains all project source AND all tests including the PR's new/changed ones. Copied (not bind-mounted) into the Tester Image's container at run time.
 
+### Branch-derived container name (ADR-0029)
+
+Every dispatch/Watchdog run container is launched with `--name gsd-test-<branch-slug>-<short-runId>` and a matching `sh.gsd-test.branch=<slug>` label, both derived from the same `Spec.BranchSlug()` helper in `internal/runspec`. The name makes the branch under test legible at `docker ps` on a Bench (no more Docker-assigned `keen_euclid`); the label is the machine-readable ownership signal the Tier-2 reaper scopes on. `reaper.Sweep(ctx, run, now, branchSlug)` with a non-empty slug reaps only containers belonging to that branch; an empty slug preserves the pre-ADR-0029 "reap every labeled+overdue container" behavior as an operator escape hatch. The Pipeline engine (ADR-0027) does not yet carry the branch to its `StartContainer` leg and is excluded from this scheme — see ADR-0029 for the follow-up plan.
+
 ### Local Engine
 
 The developer-side launcher, distributed as a single static Go binary per Dev Workstation OS (see ADR-0006). Per OS: (1) constructs the PR-merged worktree on the Dev Workstation, (2) selects a Bench for the target OS and verifies the right Tester Image is present on that Bench (pulls from GHCR if not, or builds from the in-repo Dockerfile as fallback), (3) checks the Image-version sentinel, (4) copies the worktree into a fresh container on the Bench, (5) runs npm ci + build + the full test suite, (6) drains JSON Lines output, (7) emits a Per-OS report. Each target OS runs independently on its assigned Bench; there is no cross-OS comparison.
