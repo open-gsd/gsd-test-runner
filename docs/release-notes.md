@@ -12,10 +12,31 @@ This page summarizes the recent releases so you can quickly decide what to adopt
 - `v1.6.0`: Node LTS matrix — test your project on every supported Node LTS line at once, fanned out across your Benches with per-Bench concurrency
 - `v1.6.1`: fixes `run`/`wait`/`submit` reporting `infra_error` on large suites — the watchdog now drains its result envelope to the dispatcher before exiting
 - `v1.6.2`: internal architecture cleanup (ADRs 0027/0028) — consolidated image/worktree prep, testable runner policy, pipeline god-file split, streaming-leg dedup; run-and-die now pulls the explicit `:<version>` Tester Image tag
+- `v1.7.0`: branch-derived container names — `docker ps` on a Bench shows `gsd-test-<branch>-<runId>` instead of `keen_euclid`, and the Tier-2 reaper reaps only containers from the branch it is working on
 
 ## Unreleased
 
 _Nothing yet — changes land here before the next tagged release._
+
+## v1.7.0
+
+### Added
+
+- **Run containers are named after the branch under test** ([ADR-0029](adr/0029-container-name-from-branch.md)). Every run-and-die dispatch now launches its container as `gsd-test-<branch-slug>-<short-runId>` instead of accepting Docker's random name (`keen_euclid`, `sleepy_kepler`, …). `docker ps` on a Bench now answers both "is this one mine?" (the `gsd-test-` prefix) and "which branch is it testing?" (the slug) at a glance, with no `docker inspect` round-trip at exactly the moment something else is already broken. The slug is derived from the run spec's `prBranch` (preferred) or `base`; the 8-character `runId` tail keeps concurrent runs of the same branch distinct. Names are capped at Docker's 63-byte ceiling, truncating the slug and never the tail, so the uniqueness guarantee never weakens (issue #123).
+- **A `sh.gsd-test.branch` container label** carrying that same slug. The name is the human-readable ownership signal; the label is the machine-readable one the reaper matches on. Both come from one helper, so they cannot drift apart.
+
+### Changed
+
+- **The Tier-2 reaper now only reaps its own branch's containers.** `gsd-test submit --execute` for `fix/foo` previously swept every overdue container the runner had ever labeled — including a leftover from yesterday's `fix/bar` run. It now filters on the `sh.gsd-test.branch` label before applying the deadline filter, so each invocation cleans up only what it owns and leaves other branches' containers for their own invocations ([ADR-0029](adr/0029-container-name-from-branch.md) §3). The match is on the label value, not on parsing the container name, so it stays correct even where Docker substitutes a random name.
+
+### Upgrade notes
+
+- **Containers started before v1.7.0 are no longer swept automatically.** They carry no `sh.gsd-test.branch` label, so a branch-scoped sweep skips them by design. Clear any stragglers once with `docker ps --filter label=sh.gsd-test.run-id` and `docker rm -f <id>`; everything started from v1.7.0 onward is swept normally.
+- The standard multi-OS Pipeline path is **not** covered by this scheme yet — it does not carry the branch through to its container leg, and its containers are torn down directly rather than by the Tier-2 reaper. Tracked as a follow-up in [ADR-0029](adr/0029-container-name-from-branch.md) §4.
+
+### Why it matters
+
+Leftover run containers on a shared Bench used to be both anonymous and collectively owned: you could not tell which branch spawned one without inspecting it, and any run could kill any other run's leftovers. Branch-derived names remove the first problem at `docker ps`; branch-scoped ownership makes the second impossible.
 
 ## v1.6.2
 
