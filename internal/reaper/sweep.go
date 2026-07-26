@@ -16,9 +16,13 @@ type Runner func(ctx context.Context, args ...string) ([]byte, error)
 
 // psFormat emits one line per run container: ID, deadline label, run-id label,
 // name, branch-slug label — tab-separated. .Label yields an empty string when
-// the label is absent; .Name yields Docker's auto-generated random name (or
-// the gsd-test-<slug>-<runIdTail> value from ADR-0029 when set).
-var psFormat = fmt.Sprintf(`{{.ID}}\t{{.Label %q}}\t{{.Label %q}}\t{{.Name}}\t{{.Label %q}}`, LabelDeadline, LabelRunID, LabelBranch)
+// the label is absent; .Names yields Docker's auto-generated random name (or
+// the gsd-test-<slug>-<runIdTail> value from ADR-0029 when set). docker ps
+// renders .Names as a comma-separated list when a container has multiple
+// names; this is harmless here because the reaper matches ownership on the
+// sh.gsd-test.branch LABEL value, never on the name — the name is
+// informational for operators only.
+var psFormat = fmt.Sprintf(`{{.ID}}\t{{.Label %q}}\t{{.Label %q}}\t{{.Names}}\t{{.Label %q}}`, LabelDeadline, LabelRunID, LabelBranch)
 
 // List returns the run containers currently present on the Bench, identified by
 // the run-id label. Containers without a parseable deadline label report

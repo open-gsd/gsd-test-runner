@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/open-gsd/gsd-test-runner/internal/reaper"
+	"github.com/open-gsd/gsd-test-runner/internal/runspec"
 )
 
 var execImageOnce sync.Once
@@ -90,9 +91,53 @@ func TestE2E_SubmitExecute_PassingRun(t *testing.T) {
 	}
 }
 
-// TestE2E_SubmitExecute_SweepsStaleContainer proves the Tier-2 reaper runs on
-// contact: a labelled container whose deadline has already passed is killed
-// when `submit --execute` starts (ADR-0021 Decision 2).
+// planStaleContainer starts a detached, overdue alpine container carrying the
+// reaper's run-id + deadline labels (both required for reaper.List to surface
+// it) plus whatever extra labels the caller supplies (e.g. sh.gsd-test.branch
+// for branch-scoping tests). It registers a t.Cleanup that force-removes the
+// container and returns the container ID.
+func planStaleContainer(t *testing.T, runID string, deadline time.Time, extraLabels ...string) string {
+	t.Helper()
+	args := []string{"run", "-d", "--rm",
+		"--label", reaper.LabelRunID + "=" + runID,
+		"--label", reaper.LabelDeadline + "=" + strconv.FormatInt(deadline.UnixMilli(), 10),
+	}
+	for _, l := range extraLabels {
+		args = append(args, "--label", l)
+	}
+	args = append(args, "alpine:3", "sleep", "300")
+	idOut, err := exec.Command("docker", args...).Output()
+	if err != nil {
+		t.Fatalf("plant container (run-id=%s): %v", runID, err)
+	}
+	id := strings.TrimSpace(string(idOut))
+	t.Cleanup(func() { _ = exec.Command("docker", "rm", "-f", id).Run() })
+	return id
+}
+
+// containerRunning reports whether a container with the given id is still
+// present on the local Docker daemon.
+func containerRunning(t *testing.T, id string) bool {
+	t.Helper()
+	out, err := exec.Command("docker", "ps", "-q", "--no-trunc", "--filter", "id="+id).Output()
+	if err != nil {
+		t.Fatalf("docker ps --filter id=%s: %v", id, err)
+	}
+	return strings.TrimSpace(string(out)) != ""
+}
+
+// TestE2E_SubmitExecute_SweepsStaleContainer proves the Tier-2 reaper's
+// ADR-0029 §3 branch-scoped contract: `submit --execute` reaps only overdue
+// containers whose sh.gsd-test.branch label matches the branch slug the
+// current invocation actually works on. The spec here sets neither base nor
+// prBranch, so spec.BranchSlug() (and therefore the invocation's sweep scope)
+// resolves to the "unknown" sentinel — mirrored below via
+// runspec.Spec{}.BranchSlug() rather than a duplicated string literal. An
+// overdue container belonging to a different branch, and a pre-ADR-0029
+// overdue container with no branch label at all, must both survive: per the
+// ADR-0029 Consequences, scoped sweeps intentionally leave other-branch and
+// legacy containers for their own invocations (or the `Sweep(_, _, _, "")`
+// operator escape hatch) to clean up.
 func TestE2E_SubmitExecute_SweepsStaleContainer(t *testing.T) {
 	ensureTesterImage(t)
 	t.Setenv("XDG_STATE_HOME", t.TempDir())
@@ -115,21 +160,31 @@ func TestE2E_SubmitExecute_SweepsStaleContainer(t *testing.T) {
 		t.Fatal(err)
 	}
 	specPath := filepath.Join(dir, "spec.json")
+	// Deliberately no base/prBranch: adding either would switch the Engine onto
+	// the PR-merged-worktree construction path (ADR-0021 §A), which requires a
+	// real git repo — this test's worktree is a plain directory. BranchSlug()
+	// falls back to "unknown" for exactly this shape of spec.
 	if err := os.WriteFile(specPath, []byte(`{"repo":"`+worktree+`","target":"linux"}`), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
-	// Plant a stale run container with a deadline in the past.
-	past := time.Now().Add(-time.Hour).UnixMilli()
-	idOut, err := exec.Command("docker", "run", "-d", "--rm",
-		"--label", reaper.LabelRunID+"=stale-sweep-it",
-		"--label", reaper.LabelDeadline+"="+strconv.FormatInt(past, 10),
-		"alpine:3", "sleep", "300").Output()
-	if err != nil {
-		t.Fatalf("plant stale container: %v", err)
-	}
-	staleID := strings.TrimSpace(string(idOut))
-	t.Cleanup(func() { _ = exec.Command("docker", "rm", "-f", staleID).Run() })
+	// The branch slug this invocation actually works on, derived from the
+	// production helper so the test tracks runspec's sentinel instead of
+	// duplicating it.
+	unknownSlug := runspec.Spec{}.BranchSlug()
+
+	past := time.Now().Add(-time.Hour)
+
+	// owned: same branch as this invocation, overdue -> must be reaped.
+	ownedID := planStaleContainer(t, "stale-owned", past, reaper.LabelBranch+"="+unknownSlug)
+	// otherBranch: a different branch, overdue -> must survive. This is the
+	// ADR-0029 §3 branch-scoping feature: an invocation must not touch another
+	// branch's leftover containers.
+	otherBranchID := planStaleContainer(t, "stale-other", past, reaper.LabelBranch+"=fix-other")
+	// legacy: pre-ADR-0029 container (no branch label at all), overdue -> must
+	// survive. Documented in ADR-0029 Consequences: scoped sweeps no longer
+	// auto-clean containers that predate branch labeling.
+	legacyID := planStaleContainer(t, "stale-legacy", past)
 
 	rOut, wOut, _ := os.Pipe()
 	code := run([]string{"submit", "--execute", "--config", cfgPath, "--spec-file", specPath}, wOut, os.Stderr)
@@ -139,10 +194,14 @@ func TestE2E_SubmitExecute_SweepsStaleContainer(t *testing.T) {
 		t.Fatalf("submit --execute exit = %d, want 0", code)
 	}
 
-	// The stale container must have been swept.
-	psOut, _ := exec.Command("docker", "ps", "-q", "--no-trunc", "--filter", "id="+staleID).Output()
-	if strings.TrimSpace(string(psOut)) != "" {
-		t.Errorf("stale container %s survived; Tier-2 sweep did not run", staleID)
+	if containerRunning(t, ownedID) {
+		t.Errorf("owned container %s (branch=%s) survived; Tier-2 sweep should have reaped it", ownedID, unknownSlug)
+	}
+	if !containerRunning(t, otherBranchID) {
+		t.Errorf("other-branch container %s (branch=fix-other) was reaped; ADR-0029 branch-scoping violated", otherBranchID)
+	}
+	if !containerRunning(t, legacyID) {
+		t.Errorf("legacy (no branch label) container %s was reaped; pre-ADR-0029 containers must survive scoped sweeps", legacyID)
 	}
 }
 
