@@ -99,14 +99,22 @@ type BenchDockerError = bench.BenchDockerError
 
 // ContainerStartError is the typed Cause for LegError when StartContainer
 // fails for image-specific reasons (no such image, bad image reference, etc.).
-// Distinct from BenchDockerError which covers transport/daemon failures.
+// Distinct from BenchDockerError which covers transport/daemon failures. Name
+// is the --name this StartContainer attempt used (empty for a zero
+// ContainerIdentity), included so a --name collision reads as a legible
+// "container X already exists" diagnostic rather than a mysterious one.
 type ContainerStartError struct {
 	Image    string
+	Name     string
 	Stderr   string
 	ExitCode int
 }
 
 func (e *ContainerStartError) Error() string {
+	if e.Name != "" {
+		return fmt.Sprintf("container start failed for image %s (name=%s, exit=%d): %s",
+			e.Image, e.Name, e.ExitCode, strings.TrimSpace(e.Stderr))
+	}
 	return fmt.Sprintf("container start failed for image %s (exit=%d): %s",
 		e.Image, e.ExitCode, strings.TrimSpace(e.Stderr))
 }

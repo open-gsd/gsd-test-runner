@@ -15,6 +15,7 @@ import (
 	"github.com/open-gsd/gsd-test-runner/internal/pipeline"
 	"github.com/open-gsd/gsd-test-runner/internal/renderer"
 	"github.com/open-gsd/gsd-test-runner/internal/report"
+	"github.com/open-gsd/gsd-test-runner/internal/runspec"
 	"github.com/open-gsd/gsd-test-runner/internal/schedule"
 	"github.com/open-gsd/gsd-test-runner/internal/worktree"
 )
@@ -98,6 +99,22 @@ func Run(ctx context.Context, opts Options) int {
 	}
 	defer wt.Close()
 
+	// ── ADR-0029 Part C: run-wide container identity ───────────────────────
+	// Minted/resolved exactly once per invocation (not per cell) so every
+	// cell's ContainerIdentity — and the artifact directory emitRunArtifacts
+	// writes to — agree on the same run id and branch.
+	runID, runIDErr := runspec.NewRunID()
+	if runIDErr != nil {
+		// An empty run id would silently disable BOTH naming and labeling on
+		// every cell's container, reintroducing exactly the leak this change
+		// fixes — so this is a hard failure, never a silent fallback.
+		fmt.Fprintf(stderr, "runspec.NewRunID: %v\n", runIDErr)
+		WriteInconclusiveVerdict(stdout, stderr)
+		return ExitInconclusive
+	}
+	branchSlug := resolveBranchSlug(ctx, opts)
+	deadlineMs := time.Now().Add(DefaultContainerTTL).UnixMilli()
+
 	// ── Phase 3: Fan out (OS × Node) Runs across Benches ──────────────────
 	mode := renderer.ModeTTY
 	if opts.JSONEvents {
@@ -150,11 +167,19 @@ func Run(ctx context.Context, opts Options) int {
 			fmt.Fprintf(stderr, "EnsurePresent(bench=%s, image=%s): %v\n", b.Name, jp.run.ImageID, ensureErr)
 			return pipelineResult{streamKey: jp.streamKey, err: ensureErr}
 		}
-		pl := pipeline.New(b, jp.run.ImageID, jp.run.Version, wt.Path(), cfg.Testing.Command, jp.events)
+		ident := buildContainerIdentity(branchSlug, runID, jp.run, deadlineMs)
+		pl := pipeline.New(b, jp.run.ImageID, jp.run.Version, wt.Path(), cfg.Testing.Command, jp.events, ident)
 		rep, runErr := pl.RunAll(ctx)
 		rep.NodeMajor = jp.run.NodeMajor
 		return pipelineResult{streamKey: jp.streamKey, rep: rep, err: runErr, drained: pl.DrainedPath()}
 	}
+
+	// Tier-2 reaper, "reap on next contact" (ADR-0021 Decision 2), scoped to
+	// this invocation's branch (ADR-0029 §3): before any cell starts, kill any
+	// run container on each distinct Bench whose deadline has already passed
+	// (e.g. leaked by a previous crashed run). Must run before schedule.Run so
+	// it never races a cell's own StartContainer on the same Bench.
+	sweepStaleContainers(ctx, benchesByOS, branchSlug, stderr)
 
 	schedResults := schedule.Run(ctx, units, benchesByOS, capResolver.capacity, work)
 
@@ -193,7 +218,7 @@ func Run(ctx context.Context, opts Options) int {
 	r.Wait()
 
 	agg := Aggregate(policyInputs, len(p.Skipped))
-	emitRunArtifacts(agg.Reports, osJSONL, stdout, stderr)
+	emitRunArtifacts(runID, agg.Reports, osJSONL, stdout, stderr)
 	return agg.ExitCode
 }
 

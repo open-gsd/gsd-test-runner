@@ -30,7 +30,7 @@ func TestEmitRunArtifacts_VerdictIsLastLine(t *testing.T) {
 	}
 
 	var stdout, stderr bytes.Buffer
-	emitRunArtifacts(reps, nil, &stdout, &stderr)
+	emitRunArtifacts("run-test-artifacts", reps, nil, &stdout, &stderr)
 
 	lines := strings.Split(strings.TrimRight(stdout.String(), "\n"), "\n")
 	last := lines[len(lines)-1]

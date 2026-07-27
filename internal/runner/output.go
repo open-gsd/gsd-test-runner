@@ -8,7 +8,6 @@ import (
 
 	"github.com/open-gsd/gsd-test-runner/internal/digest"
 	"github.com/open-gsd/gsd-test-runner/internal/report"
-	"github.com/open-gsd/gsd-test-runner/internal/runspec"
 	"github.com/open-gsd/gsd-test-runner/internal/runstate"
 )
 
@@ -60,14 +59,12 @@ func WriteInconclusiveVerdict(stdout, stderr io.Writer) {
 	}
 }
 
-// emitRunArtifacts is the standard multi-OS path: it mints a run-id, writes the
-// digest, persists each OS's full JSONL, and prints the verdict as the final
-// stdout line in every outcome.
-func emitRunArtifacts(reps []report.Report, osJSONL map[string]string, stdout, stderr io.Writer) {
-	runID, err := runspec.NewRunID()
-	if err != nil {
-		runID = "run-unknown"
-	}
+// emitRunArtifacts is the standard multi-OS path: it writes the digest under
+// runID, persists each OS's full JSONL, and prints the verdict as the final
+// stdout line in every outcome. runID is minted once per invocation by the
+// caller (Run) so it is the same id every cell's ContainerIdentity carries
+// (ADR-0029 Part C) — the artifact directory and the container labels agree.
+func emitRunArtifacts(runID string, reps []report.Report, osJSONL map[string]string, stdout, stderr io.Writer) {
 	paths := WriteRunArtifacts(runID, reps, stderr)
 	if paths.Dir != "" {
 		paths.EventsJSONL = copyEventsJSONL(paths.Dir, osJSONL, stderr)

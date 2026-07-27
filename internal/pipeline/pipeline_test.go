@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -12,6 +13,8 @@ import (
 	"github.com/open-gsd/gsd-test-runner/internal/bench"
 	"github.com/open-gsd/gsd-test-runner/internal/dockerexec"
 	"github.com/open-gsd/gsd-test-runner/internal/images"
+	"github.com/open-gsd/gsd-test-runner/internal/reaper"
+	"github.com/open-gsd/gsd-test-runner/internal/runspec"
 )
 
 // newTestPipeline builds a Pipeline backed by a buffered event channel
@@ -20,7 +23,7 @@ func newTestPipeline(t *testing.T, bufSize int) (*Pipeline, chan Event) {
 	t.Helper()
 	ch := make(chan Event, bufSize)
 	b := bench.Bench{Name: "test-bench", Host: "localhost", OS: "linux"}
-	p := New(b, images.ImageID("gsd-tester-linux:dev"), "v0.0.0-test", "/tmp/worktree", nil, ch)
+	p := New(b, images.ImageID("gsd-tester-linux:dev"), "v0.0.0-test", "/tmp/worktree", nil, ch, ContainerIdentity{})
 	// Ensure the pump goroutine winds down at end of test: mark the stream closed
 	// and drain any backlog so a pump parked mid-send can deliver and exit. Both
 	// closeEvents and ranging a closed channel are safe to repeat.
@@ -62,7 +65,7 @@ func stubDockerCapture(t *testing.T, out string, err error) *bench.Bench {
 func TestNew_NilEventChannelOK(t *testing.T) {
 	stubDocker(t, "v0.0.0-test", nil) // match so leg succeeds without panicking
 	b := bench.Bench{Name: "nil-chan-bench", Host: "local", OS: "linux"}
-	p := New(b, images.ImageID("gsd-tester-linux:dev"), "v0.0.0-test", "/tmp/worktree", nil, nil)
+	p := New(b, images.ImageID("gsd-tester-linux:dev"), "v0.0.0-test", "/tmp/worktree", nil, nil, ContainerIdentity{})
 	// Must not panic even though emit is called internally.
 	err := p.CheckImageVersion(context.Background())
 	if err != nil {
@@ -180,7 +183,7 @@ func TestEvent_FullChannel_DoesNotBlock(t *testing.T) {
 	// deliver in the background (no events are dropped; #84, ADR-0017 amendment).
 	ch := make(chan Event, 1)
 	b := bench.Bench{Name: "bench", Host: "local", OS: "linux"}
-	p := New(b, images.ImageID("gsd-tester-linux:dev"), "v0.0.0-test", "/tmp/worktree", nil, ch)
+	p := New(b, images.ImageID("gsd-tester-linux:dev"), "v0.0.0-test", "/tmp/worktree", nil, ch, ContainerIdentity{})
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
@@ -267,7 +270,7 @@ func TestCheckImageVersion_MatchingLabel_ReturnsNil(t *testing.T) {
 	stubDocker(t, "v1.2.3\n", nil)
 	ch := make(chan Event, 16)
 	b := bench.Bench{Name: "bench", Host: "local", OS: "linux"}
-	p := New(b, images.ImageID("gsd-tester-linux:v1.2.3"), "v1.2.3", "/tmp/worktree", nil, ch)
+	p := New(b, images.ImageID("gsd-tester-linux:v1.2.3"), "v1.2.3", "/tmp/worktree", nil, ch, ContainerIdentity{})
 
 	err := p.CheckImageVersion(context.Background())
 	if err != nil {
@@ -281,7 +284,7 @@ func TestCheckImageVersion_MismatchedLabel_ReturnsImageVersionMismatch(t *testin
 	stubDocker(t, "v1.2.2\n", nil)
 	ch := make(chan Event, 16)
 	b := bench.Bench{Name: "bench", Host: "local", OS: "linux"}
-	p := New(b, images.ImageID("gsd-tester-linux:v1.2.3"), "v1.2.3", "/tmp/worktree", nil, ch)
+	p := New(b, images.ImageID("gsd-tester-linux:v1.2.3"), "v1.2.3", "/tmp/worktree", nil, ch, ContainerIdentity{})
 
 	err := p.CheckImageVersion(context.Background())
 	if err == nil {
@@ -310,7 +313,7 @@ func TestCheckImageVersion_EmptyLabel_ReturnsImageVersionMismatchWithEmptyActual
 	stubDocker(t, "", nil)
 	ch := make(chan Event, 16)
 	b := bench.Bench{Name: "bench", Host: "local", OS: "linux"}
-	p := New(b, images.ImageID("gsd-tester-linux:v1.2.3"), "v1.2.3", "/tmp/worktree", nil, ch)
+	p := New(b, images.ImageID("gsd-tester-linux:v1.2.3"), "v1.2.3", "/tmp/worktree", nil, ch, ContainerIdentity{})
 
 	err := p.CheckImageVersion(context.Background())
 	if err == nil {
@@ -339,7 +342,7 @@ func TestCheckImageVersion_NoSuchImage_ReturnsImageNotPresent(t *testing.T) {
 	})
 	ch := make(chan Event, 16)
 	b := bench.Bench{Name: "bench", Host: "local", OS: "linux"}
-	p := New(b, images.ImageID("ghcr.io/foo:v1.2.3"), "v1.2.3", "/tmp/worktree", nil, ch)
+	p := New(b, images.ImageID("ghcr.io/foo:v1.2.3"), "v1.2.3", "/tmp/worktree", nil, ch, ContainerIdentity{})
 
 	err := p.CheckImageVersion(context.Background())
 	if err == nil {
@@ -385,7 +388,7 @@ func TestCheckImageVersion_LocalBench_NoDockerHostPassed(t *testing.T) {
 	captured := stubDockerCapture(t, "v1.2.3\n", nil)
 	ch := make(chan Event, 16)
 	b := bench.Bench{Name: "bench", Host: "local", OS: "linux"}
-	p := New(b, images.ImageID("gsd-tester-linux:v1.2.3"), "v1.2.3", "/tmp/worktree", nil, ch)
+	p := New(b, images.ImageID("gsd-tester-linux:v1.2.3"), "v1.2.3", "/tmp/worktree", nil, ch, ContainerIdentity{})
 
 	_ = p.CheckImageVersion(context.Background())
 	if captured.DockerHost() != "" {
@@ -399,7 +402,7 @@ func TestCheckImageVersion_EmptyHost_NoDockerHostPassed(t *testing.T) {
 	captured := stubDockerCapture(t, "v1.2.3\n", nil)
 	ch := make(chan Event, 16)
 	b := bench.Bench{Name: "bench", Host: "", OS: "linux"}
-	p := New(b, images.ImageID("gsd-tester-linux:v1.2.3"), "v1.2.3", "/tmp/worktree", nil, ch)
+	p := New(b, images.ImageID("gsd-tester-linux:v1.2.3"), "v1.2.3", "/tmp/worktree", nil, ch, ContainerIdentity{})
 
 	_ = p.CheckImageVersion(context.Background())
 	if captured.DockerHost() != "" {
@@ -413,7 +416,7 @@ func TestCheckImageVersion_RemoteBench_PassesSSHDockerHost(t *testing.T) {
 	captured := stubDockerCapture(t, "v1.2.3\n", nil)
 	ch := make(chan Event, 16)
 	b := bench.Bench{Name: "bench-linux-1", Host: "bench-linux-1", OS: "linux"}
-	p := New(b, images.ImageID("gsd-tester-linux:v1.2.3"), "v1.2.3", "/tmp/worktree", nil, ch)
+	p := New(b, images.ImageID("gsd-tester-linux:v1.2.3"), "v1.2.3", "/tmp/worktree", nil, ch, ContainerIdentity{})
 
 	_ = p.CheckImageVersion(context.Background())
 	want := "ssh://bench-linux-1"
@@ -428,7 +431,7 @@ func TestCheckImageVersion_EmitsLegSuccessOnMatch(t *testing.T) {
 	stubDocker(t, "v1.2.3\n", nil)
 	ch := make(chan Event, 16)
 	b := bench.Bench{Name: "bench", Host: "local", OS: "linux"}
-	p := New(b, images.ImageID("gsd-tester-linux:v1.2.3"), "v1.2.3", "/tmp/worktree", nil, ch)
+	p := New(b, images.ImageID("gsd-tester-linux:v1.2.3"), "v1.2.3", "/tmp/worktree", nil, ch, ContainerIdentity{})
 
 	err := p.CheckImageVersion(context.Background())
 	if err != nil {
@@ -458,7 +461,7 @@ func TestCheckImageVersion_EmitsLegFailureOnMismatch(t *testing.T) {
 	stubDocker(t, "v1.2.2\n", nil)
 	ch := make(chan Event, 16)
 	b := bench.Bench{Name: "bench", Host: "local", OS: "linux"}
-	p := New(b, images.ImageID("gsd-tester-linux:v1.2.3"), "v1.2.3", "/tmp/worktree", nil, ch)
+	p := New(b, images.ImageID("gsd-tester-linux:v1.2.3"), "v1.2.3", "/tmp/worktree", nil, ch, ContainerIdentity{})
 
 	_ = p.CheckImageVersion(context.Background())
 
@@ -755,6 +758,180 @@ func TestStartContainer_DaemonDown(t *testing.T) {
 	var benchErr *BenchDockerError
 	if !errors.As(legErr.Cause, &benchErr) {
 		t.Fatalf("expected Cause=*BenchDockerError, got %T: %v", legErr.Cause, legErr.Cause)
+	}
+}
+
+// --- ADR-0029: ContainerIdentity naming + labels on StartContainer ---
+
+// newIdentPipeline builds a Pipeline with a populated ContainerIdentity,
+// mirroring newTestPipeline but for the identity-aware StartContainer tests.
+func newIdentPipeline(t *testing.T, ident ContainerIdentity) (*Pipeline, chan Event) {
+	t.Helper()
+	ch := make(chan Event, 16)
+	b := bench.Bench{Name: "test-bench", Host: "localhost", OS: "linux"}
+	p := New(b, images.ImageID("gsd-tester-linux:dev"), "v0.0.0-test", "/tmp/worktree", nil, ch, ident)
+	t.Cleanup(func() {
+		p.closeEvents()
+		for range ch {
+		}
+	})
+	return p, ch
+}
+
+// mustFindLabel scans args for "--label" followed by "key=value" and returns
+// the value, failing the test if the label is absent.
+func mustFindLabel(t *testing.T, args []string, key string) string {
+	t.Helper()
+	prefix := key + "="
+	for i := 0; i < len(args)-1; i++ {
+		if args[i] == "--label" && strings.HasPrefix(args[i+1], prefix) {
+			return strings.TrimPrefix(args[i+1], prefix)
+		}
+	}
+	t.Fatalf("label %q not found in args: %v", key, args)
+	return ""
+}
+
+// mustFindName scans args for "--name" and returns the following value,
+// failing the test if it is absent.
+func mustFindName(t *testing.T, args []string) string {
+	t.Helper()
+	for i := 0; i < len(args)-1; i++ {
+		if args[i] == "--name" {
+			return args[i+1]
+		}
+	}
+	t.Fatalf("--name not found in args: %v", args)
+	return ""
+}
+
+// TestStartContainer_PopulatedIdentity_NameAndLabels verifies that a
+// non-empty ContainerIdentity produces --name plus all four ADR-0029 labels
+// with the expected values.
+func TestStartContainer_PopulatedIdentity_NameAndLabels(t *testing.T) {
+	calls := stubDockerRunCapture(t, "abc123def456\n", nil)
+	stubDockerRmCapture(t)
+
+	ident := ContainerIdentity{
+		BranchSlug: "fix-foo",
+		RunID:      "run-12345678-abcd",
+		Cell:       "linux-node24",
+		Target:     "linux",
+		DeadlineMs: 1234567890,
+	}
+	p, _ := newIdentPipeline(t, ident)
+	if err := p.StartContainer(context.Background()); err != nil {
+		t.Fatalf("expected nil error, got: %v", err)
+	}
+	if len(*calls) != 1 {
+		t.Fatalf("expected 1 dockerRun call, got %d", len(*calls))
+	}
+	args := (*calls)[0]
+
+	wantName := runspec.BuildContainerName(ident.BranchSlug, ident.Cell, ident.RunID)
+	if got := mustFindName(t, args); got != wantName {
+		t.Errorf("--name = %q, want %q", got, wantName)
+	}
+	if got := mustFindLabel(t, args, reaper.LabelRunID); got != ident.RunID {
+		t.Errorf("label %s = %q, want %q", reaper.LabelRunID, got, ident.RunID)
+	}
+	if got := mustFindLabel(t, args, reaper.LabelDeadline); got != strconv.FormatInt(ident.DeadlineMs, 10) {
+		t.Errorf("label %s = %q, want %q", reaper.LabelDeadline, got, strconv.FormatInt(ident.DeadlineMs, 10))
+	}
+	if got := mustFindLabel(t, args, reaper.LabelBranch); got != ident.BranchSlug {
+		t.Errorf("label %s = %q, want %q", reaper.LabelBranch, got, ident.BranchSlug)
+	}
+	if got := mustFindLabel(t, args, "sh.gsd-test.target"); got != ident.Target {
+		t.Errorf("label sh.gsd-test.target = %q, want %q", got, ident.Target)
+	}
+}
+
+// TestStartContainer_NameAndBranchLabelConsistent asserts the ADR-0029 parity
+// invariant on the Pipeline engine, mirroring
+// dispatch.TestDockerRunArgs_NameAndBranchLabelConsistent: the slug embedded
+// in --name must equal the sh.gsd-test.branch label value, so a Bench
+// operator reading the name and the reaper reading the label agree about
+// ownership.
+func TestStartContainer_NameAndBranchLabelConsistent(t *testing.T) {
+	calls := stubDockerRunCapture(t, "abc123def456\n", nil)
+	stubDockerRmCapture(t)
+
+	ident := ContainerIdentity{
+		BranchSlug: "fix-some-cool-branch-name",
+		RunID:      "run-abcdef12-3456",
+		Cell:       "windows",
+		Target:     "windows",
+		DeadlineMs: 42,
+	}
+	p, _ := newIdentPipeline(t, ident)
+	if err := p.StartContainer(context.Background()); err != nil {
+		t.Fatalf("expected nil error, got: %v", err)
+	}
+	args := (*calls)[0]
+
+	name := mustFindName(t, args)
+	branchLabel := mustFindLabel(t, args, reaper.LabelBranch)
+	if !strings.Contains(name, "-"+branchLabel+"-") {
+		t.Errorf("name %q does not contain the label slug %q between dashes; parity violated", name, branchLabel)
+	}
+}
+
+// TestStartContainer_CellDisambiguatesName verifies that two identities
+// differing ONLY in Cell produce different --name values — the concurrency
+// safety property that lets multiple cells of the same run/branch start
+// containers on the same Bench without a Docker --name collision.
+func TestStartContainer_CellDisambiguatesName(t *testing.T) {
+	base := ContainerIdentity{
+		BranchSlug: "fix-foo",
+		RunID:      "run-aaaaaaaa-bbbb",
+		Target:     "linux",
+		DeadlineMs: 100,
+	}
+	identA := base
+	identA.Cell = "linux-node20"
+	identB := base
+	identB.Cell = "linux-node24"
+
+	callsA := stubDockerRunCapture(t, "abc123\n", nil)
+	stubDockerRmCapture(t)
+	pA, _ := newIdentPipeline(t, identA)
+	if err := pA.StartContainer(context.Background()); err != nil {
+		t.Fatalf("pA: expected nil error, got: %v", err)
+	}
+	nameA := mustFindName(t, (*callsA)[0])
+
+	callsB := stubDockerRunCapture(t, "def456\n", nil)
+	stubDockerRmCapture(t)
+	pB, _ := newIdentPipeline(t, identB)
+	if err := pB.StartContainer(context.Background()); err != nil {
+		t.Fatalf("pB: expected nil error, got: %v", err)
+	}
+	nameB := mustFindName(t, (*callsB)[0])
+
+	if nameA == nameB {
+		t.Fatalf("expected different --name values for different cells, both got %q", nameA)
+	}
+}
+
+// TestStartContainer_ZeroIdentity_LegacyArgv verifies that a zero
+// ContainerIdentity{} produces the exact pre-ADR-0029 argv: no --name and no
+// --label at all (existing behavior preserved for callers that don't yet
+// populate identity, e.g. some tests).
+func TestStartContainer_ZeroIdentity_LegacyArgv(t *testing.T) {
+	calls := stubDockerRunCapture(t, "abc123def456\n", nil)
+	stubDockerRmCapture(t)
+
+	p, _ := newTestPipeline(t, 16) // uses ContainerIdentity{} (zero value)
+	if err := p.StartContainer(context.Background()); err != nil {
+		t.Fatalf("expected nil error, got: %v", err)
+	}
+	wantArgs := []string{
+		"run", "--rm", "-d", "--workdir", "/work",
+		"gsd-tester-linux:dev",
+		"sleep", "infinity",
+	}
+	if !reflect.DeepEqual((*calls)[0], wantArgs) {
+		t.Fatalf("dockerRun args mismatch\ngot: %v\nwant: %v", (*calls)[0], wantArgs)
 	}
 }
 

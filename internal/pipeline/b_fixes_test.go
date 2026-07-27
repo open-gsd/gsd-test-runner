@@ -253,7 +253,7 @@ func TestNew_WithEvents_PumpExitsOnClose(t *testing.T) {
 
 	ch := make(chan Event, 4)
 	b := bench.Bench{Name: "leak-test", Host: "local", OS: "linux"}
-	p := New(b, images.ImageID("gsd-tester-linux:dev"), "v", "/tmp/wt", nil, ch)
+	p := New(b, images.ImageID("gsd-tester-linux:dev"), "v", "/tmp/wt", nil, ch, ContainerIdentity{})
 
 	// Simulate: caller created the pipeline but is taking an early-return path
 	// before RunAll. They must call Close/closeEvents to release the pump.
@@ -286,7 +286,7 @@ func TestNew_NilEvents_NoPumpStarted(t *testing.T) {
 	goroutinesBefore := runtime.NumGoroutine()
 
 	b := bench.Bench{Name: "nil-test", Host: "local", OS: "linux"}
-	_ = New(b, images.ImageID("gsd-tester-linux:dev"), "v", "/tmp/wt", nil, nil)
+	_ = New(b, images.ImageID("gsd-tester-linux:dev"), "v", "/tmp/wt", nil, nil, ContainerIdentity{})
 
 	runtime.Gosched()
 	goroutinesAfter := runtime.NumGoroutine()

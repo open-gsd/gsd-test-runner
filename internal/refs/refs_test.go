@@ -249,3 +249,45 @@ func TestResolve_ContextCanceled(t *testing.T) {
 		t.Fatal("expected error with canceled context, got nil")
 	}
 }
+
+// ---------------------------------------------------------------------------
+// CurrentBranch
+// ---------------------------------------------------------------------------
+
+func TestCurrentBranch_NamedBranch(t *testing.T) {
+	repo, _ := initRepo(t)
+	// initRepo leaves HEAD checked out on "feat".
+	got, err := CurrentBranch(context.Background(), repo)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got != "feat" {
+		t.Errorf("got %q, want %q", got, "feat")
+	}
+}
+
+func TestCurrentBranch_DetachedHEAD(t *testing.T) {
+	repo, shas := initRepo(t)
+	// Detach HEAD at the "feat" commit.
+	gitRun(t, repo, "checkout", "--detach", shas["feat"])
+
+	got, err := CurrentBranch(context.Background(), repo)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got != "HEAD" {
+		t.Errorf("got %q, want literal %q for detached HEAD", got, "HEAD")
+	}
+}
+
+func TestCurrentBranch_NotAGitRepo(t *testing.T) {
+	dir := t.TempDir() // real dir, no .git
+	_, err := CurrentBranch(context.Background(), dir)
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	var ire *InvalidRepoError
+	if !errors.As(err, &ire) {
+		t.Fatalf("expected *InvalidRepoError, got %T: %v", err, err)
+	}
+}

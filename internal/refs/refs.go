@@ -76,3 +76,39 @@ func Resolve(ctx context.Context, repoPath, userRef string) (string, error) {
 	}
 	return sha, nil
 }
+
+// CurrentBranch returns the name of the branch currently checked out in
+// repoPath, by running `git -C repoPath rev-parse --abbrev-ref HEAD`.
+//
+// On a detached HEAD, git prints the literal string "HEAD" for
+// --abbrev-ref; CurrentBranch returns that string as-is with a nil error —
+// it does not special-case detached HEAD into an error. Callers that need to
+// distinguish a real branch from a detached HEAD must check the returned
+// value against "HEAD" themselves.
+//
+// Returns a non-nil error when the command fails (repoPath is not a git
+// repository, the git binary is missing, etc).
+func CurrentBranch(ctx context.Context, repoPath string) (string, error) {
+	if repoPath == "" {
+		return "", &InvalidRepoError{RepoPath: repoPath, Detail: "empty path"}
+	}
+
+	// Verify repoPath is a git repo. A .git file (submodules) or a
+	// .git directory both count.
+	if _, err := os.Stat(filepath.Join(repoPath, ".git")); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return "", &InvalidRepoError{RepoPath: repoPath, Detail: "no .git entry"}
+		}
+		return "", &InvalidRepoError{RepoPath: repoPath, Detail: err.Error()}
+	}
+
+	var stdout, stderr bytes.Buffer
+	cmd := exec.CommandContext(ctx, "git", "-C", repoPath, "rev-parse", "--abbrev-ref", "HEAD")
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return "", fmt.Errorf("git rev-parse --abbrev-ref HEAD failed in %s: %w (%s)", repoPath, err, strings.TrimSpace(stderr.String()))
+	}
+
+	return strings.TrimSpace(stdout.String()), nil
+}
