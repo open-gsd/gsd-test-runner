@@ -13,10 +13,38 @@ This page summarizes the recent releases so you can quickly decide what to adopt
 - `v1.6.1`: fixes `run`/`wait`/`submit` reporting `infra_error` on large suites — the watchdog now drains its result envelope to the dispatcher before exiting
 - `v1.6.2`: internal architecture cleanup (ADRs 0027/0028) — consolidated image/worktree prep, testable runner policy, pipeline god-file split, streaming-leg dedup; run-and-die now pulls the explicit `:<version>` Tester Image tag
 - `v1.7.0`: branch-derived container names — `docker ps` on a Bench shows `gsd-test-<branch>-<runId>` instead of `keen_euclid`, and the Tier-2 reaper reaps only containers from the branch it is working on
+- `v1.8.0`: extends that to the standard `gsd-test` path (v1.7.0 covered run-and-die only) and fixes the leak behind it — Pipeline containers were unlabeled, so nothing ever reaped the ones a crashed run left behind
 
 ## Unreleased
 
 _Nothing yet — changes land here before the next tagged release._
+
+## v1.8.0
+
+### Added
+
+- **The standard `gsd-test` path now names its containers too** ([ADR-0029](adr/0029-container-name-from-branch.md) §5). v1.7.0 shipped branch-derived names for run-and-die only; the multi-OS/Node-matrix path — the one most people actually run — still produced `keen_euclid`. Every cell's container is now `gsd-test-<branch-slug>-<os>-node<major>-<short-runId>` and carries the same four `sh.gsd-test.*` labels the run-and-die path emits. The `<os>-node<major>` cell segment is what keeps the concurrent cells of one matrix run from colliding on a name.
+- **The branch is resolved from git when you don't pass `--head`.** A bare `gsd-test` asks the source repo for its current branch, so names are useful without extra flags. Detached HEAD or a non-repo source falls back to the `unknown` sentinel rather than failing the run.
+
+### Fixed
+
+- **Leaked Pipeline containers are finally reaped.** This is the real bug behind the cosmetic one. Because Pipeline containers carried *no labels at all*, the Tier-2 reaper's `--filter label=sh.gsd-test.run-id` could never see them — so a container orphaned by a crashed or killed `gsd-test` run survived indefinitely (observed in the wild at 37 hours, with 19 alive on one Bench at once). They were only ever cleaned up by `RunAll`'s deferred `docker rm -f`, which by definition does not run when the engine dies. Labeling them brings them under the existing "reap on next contact" contract (ADR-0021 Decision 2), and `gsd-test` now sweeps each distinct Bench once — scoped to its own branch — before scheduling any cell.
+- **A run's container labels and its artifact directory now agree.** The run id was previously minted twice: once (post-hoc) for artifacts, never for containers. There is now one id per invocation, shared by both.
+
+### Upgrade notes
+
+- **Pipeline containers now have a 2-hour deadline.** They previously had none, because nothing reaped them. A container still alive past `runner.DefaultContainerTTL` is presumed leaked and can be swept by a later invocation of the **same branch** against the **same Bench** — a run in isolation is never at risk no matter how long it takes, and other branches are never touched. If you have a single (OS, Node) cell that legitimately runs longer than two hours, say so and the TTL should become configurable.
+- **Containers started before v1.8.0 still need one manual cleanup.** They carry no `sh.gsd-test.*` labels, so the scoped sweep cannot see them either. `docker ps --filter label=sh.gsd-test.run-id` will *not* list them; find them by image instead:
+
+  ```
+  docker ps -q --filter ancestor=ghcr.io/open-gsd/gsd-tester-linux:v1.7.0-node22 | xargs -r docker rm -f
+  ```
+
+  Everything started from v1.8.0 onward is swept automatically.
+
+### Why it matters
+
+v1.7.0 answered "which branch is this container testing?" for the run-and-die path and left the common path untouched — and the gap was worse than cosmetic, because unlabeled containers are also unreapable. This closes both halves for both engines.
 
 ## v1.7.0
 
