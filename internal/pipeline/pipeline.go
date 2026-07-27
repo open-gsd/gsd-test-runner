@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -16,6 +17,7 @@ import (
 	"github.com/open-gsd/gsd-test-runner/internal/images"
 	"github.com/open-gsd/gsd-test-runner/internal/reaper"
 	"github.com/open-gsd/gsd-test-runner/internal/report"
+	"github.com/open-gsd/gsd-test-runner/internal/runspec"
 )
 
 // containerJSONLPath is the path inside the Tester Image container where the
@@ -119,6 +121,17 @@ func isBenchInfraFailure(e *dockerexec.ExecError) bool {
 		strings.Contains(s, "ssh:") // ssh errors include "ssh: connect to host..."
 }
 
+// ContainerIdentity carries the ADR-0029 naming + ownership metadata for a
+// Pipeline container. A zero value means "unnamed" (pre-ADR-0029 behavior),
+// which only tests should use — internal/runner always populates it.
+type ContainerIdentity struct {
+	BranchSlug string // already slugified via runspec.SlugifyBranch
+	RunID      string // per-invocation run id, shared by every cell of one run
+	Cell       string // slug-safe cell id, e.g. "linux-node24"; disambiguates cells within one run
+	Target     string // OS, for the sh.gsd-test.target label
+	DeadlineMs int64  // epoch ms; the Tier-2 reaper sweeps on this
+}
+
 // Pipeline executes the 8 per-OS legs against one Bench using one
 // Tester Image and one PR-merged worktree. One Pipeline per (Bench,
 // OS) per Local Engine run. See ADR-0008 for the shape rationale.
@@ -127,6 +140,7 @@ type Pipeline struct {
 	image           images.ImageID
 	expectedVersion string // per ADR-0011 decision 3: caller-supplied
 	work            string // path to the PR-merged worktree (from worktree.Worktree.Path())
+	ident           ContainerIdentity
 	events          chan<- Event
 	// queue is the bounded, loss-tolerant buffer between emit (producers) and the
 	// events channel. A single pump goroutine drains it and is the sole closer
@@ -155,12 +169,18 @@ type Pipeline struct {
 // before RunAll) does not leak a goroutine parked on cond.Wait. The pump is the
 // sole closer of events; callers must drain events and must NOT close it
 // themselves. A nil events channel makes emit a no-op (no pump is ever started).
-func New(b bench.Bench, img images.ImageID, expectedVersion string, worktreePath string, testCommand []string, events chan<- Event) *Pipeline {
+//
+// ident carries the ADR-0029 naming + ownership metadata StartContainer uses
+// to name and label the container it starts. A zero ContainerIdentity{}
+// preserves pre-ADR-0029 behavior (no --name, no labels); internal/runner
+// always populates a real one, and tests may pass the zero value.
+func New(b bench.Bench, img images.ImageID, expectedVersion string, worktreePath string, testCommand []string, events chan<- Event, ident ContainerIdentity) *Pipeline {
 	p := &Pipeline{
 		bench:           b,
 		image:           img,
 		expectedVersion: expectedVersion,
 		work:            worktreePath,
+		ident:           ident,
 		testCommand:     testCommand,
 		events:          events,
 		queue:           newEventQueue(),
@@ -262,10 +282,28 @@ func (p *Pipeline) CopyWorktree(ctx context.Context) error {
 // Tester Image. The container runs `sleep infinity` so subsequent legs
 // can docker exec into it. --rm ensures docker removes it on stop, and
 // RunAll additionally defers a `docker rm -f` to handle the running case.
+//
+// When p.ident.RunID is non-empty (the normal internal/runner path), the
+// container is also named and labeled per ADR-0029 so the Tier-2 reaper can
+// see and sweep it: --name (runspec.BuildContainerName) plus the run-id,
+// deadline, branch, and target labels — mirroring dispatch.go's DockerRunArgs
+// label set. When RunID is empty (zero ContainerIdentity, tests), the argv is
+// emitted exactly as pre-ADR-0029: no --name, no labels.
 func (p *Pipeline) StartContainer(ctx context.Context) error {
 	return p.runLeg(ctx, LegStartContainer, func(_ context.Context) (string, error) {
 		imageRef := string(p.image)
+		containerName := ""
 		args := []string{"run", "--rm", "-d", "--workdir", "/work"}
+		if p.ident.RunID != "" {
+			containerName = runspec.BuildContainerName(p.ident.BranchSlug, p.ident.Cell, p.ident.RunID)
+			args = append(args,
+				"--name", containerName,
+				"--label", fmt.Sprintf("%s=%s", reaper.LabelRunID, p.ident.RunID),
+				"--label", fmt.Sprintf("%s=%s", reaper.LabelDeadline, strconv.FormatInt(p.ident.DeadlineMs, 10)),
+				"--label", fmt.Sprintf("%s=%s", reaper.LabelBranch, p.ident.BranchSlug),
+				"--label", fmt.Sprintf("sh.gsd-test.target=%s", p.ident.Target),
+			)
+		}
 		if p.bench.Platform != "" {
 			args = append(args, "--platform", p.bench.Platform)
 		}
@@ -284,6 +322,7 @@ func (p *Pipeline) StartContainer(ctx context.Context) error {
 				}
 				return "", &ContainerStartError{
 					Image:    imageRef,
+					Name:     containerName,
 					Stderr:   execErr.Stderr,
 					ExitCode: execErr.ExitCode,
 				}

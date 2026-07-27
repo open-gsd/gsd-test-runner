@@ -77,7 +77,7 @@ func TestEventQueue_CloseFlushesRemaining(t *testing.T) {
 func TestEmit_NeverDropsUnderBurst_ThroughPump(t *testing.T) {
 	ch := make(chan Event) // unbuffered: the pump must block-and-deliver, not drop
 	b := bench.Bench{Name: "burst", Host: "local", OS: "linux"}
-	p := New(b, images.ImageID("gsd-tester-linux:dev"), "v", "/tmp/wt", nil, ch)
+	p := New(b, images.ImageID("gsd-tester-linux:dev"), "v", "/tmp/wt", nil, ch, ContainerIdentity{})
 
 	const N = 5000
 	go func() {
