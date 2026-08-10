@@ -15,19 +15,6 @@ if [ -f package.json ]; then
   npm ci >&2
   echo "gsd-test: building (npm run build --if-present)" >&2
   npm run build --if-present >&2
-  # Project-level pretest hook (issue #3187, ADR-0021 Decision 1): runs here —
-  # AFTER npm ci/build, BEFORE the watchdog handoff below — so any one-time
-  # base-ref-dependent setup work (e.g. a baseline artifact a project's own
-  # tests need) happens once, serially, on an otherwise-idle container instead
-  # of competing with the parallel test suite under the watchdog deadline.
-  # This runner stays generic: it knows only the convention name
-  # "gsd:pretest-baseline"; --if-present is Postel's Law applied visibly
-  # (matches the header comment above) — a missing hook is a silent no-op.
-  # Unlike npm ci above, a FAILING hook must NOT abort the run: the consumer
-  # is expected to have an in-job-build fallback, so failure here degrades to
-  # today's (pre-hook) behavior rather than aborting under `set -e`.
-  echo "gsd-test: pretest baseline hook (npm run gsd:pretest-baseline --if-present)" >&2
-  npm run gsd:pretest-baseline --if-present >&2 || true
 fi
 # Per-test leak detection (ADR-0021 §F): preload the probe into each node --test
 # child and point it at a scratch dir the watchdog reads after the run. Set after
