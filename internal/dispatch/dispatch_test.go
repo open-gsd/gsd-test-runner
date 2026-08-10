@@ -355,6 +355,19 @@ func TestDockerRunArgs_FullOrder(t *testing.T) {
 // sh.gsd-test.branch label MUST derive from the same slug. A divergence would
 // mean a Bench operator reading the name and the reaper reading the label
 // disagree about ownership.
+// TestDockerRunArgs_ForwardsBaseRefFromParsedSpec proves the GSD_TEST_BASE_REF
+// wiring end-to-end (issue #3187): runspec.Parse forwards Base into
+// Env["GSD_TEST_BASE_REF"], and DockerRunArgs's existing sorted env
+// forwarding (unmodified) carries it into the container argv.
+func TestDockerRunArgs_ForwardsBaseRefFromParsedSpec(t *testing.T) {
+	spec, err := runspec.Parse([]byte(`{"repo":"/src","target":"linux","base":"next","prBranch":"feat/x"}`))
+	if err != nil {
+		t.Fatalf("runspec.Parse: %v", err)
+	}
+	got := dispatch.DockerRunArgs(*spec, "img:latest", 0, "")
+	mustContainPair(t, got, "-e", "GSD_TEST_BASE_REF=next")
+}
+
 func TestDockerRunArgs_NameAndBranchLabelConsistent(t *testing.T) {
 	spec := baseSpec()
 	spec.PRBranch = "fix/some-Cool_Branch.Name"

@@ -124,6 +124,21 @@ Deferred-set round (cont.):
   runs on a killed process) cannot. File-level and best-effort; no-op under
   `isolation:"none"`. The sampler's own interval is masked from the leak count.
 
+Gap-closure round (cont., issue #3187):
+
+- **Project-level pretest hook** — done. The run spec's `base` ref (§A) is now
+  forwarded into the container as `GSD_TEST_BASE_REF` (`internal/runspec.Parse`,
+  populated into `Env` so `dispatch.DockerRunArgs`'s existing sorted env
+  forwarding carries it — no `DockerRunArgs` special-case). `reporter/run-and-die.sh`
+  invokes `npm run gsd:pretest-baseline --if-present` after `npm ci`/`npm run
+  build` and before the watchdog handoff, so a consuming project's own
+  base-ref-dependent setup work runs once, serially, on an otherwise-idle
+  container (Decision 1) instead of competing with the parallel suite. The
+  runner stays generic: it knows only the convention names
+  `gsd:pretest-baseline` (npm script) and `GSD_TEST_BASE_REF` (env var),
+  nothing about what a project does with them. A missing hook is a silent
+  no-op (`--if-present`); a failing hook does not abort the run.
+
 Still deferred:
 
 - **Windows orphaned-`node.exe` gate** (Decision 4) — `taskkill /T` path + gated test exist; needs a Windows-container Bench. Tracked in issue #62.
