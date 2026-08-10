@@ -212,52 +212,6 @@ func TestParse_BaseAndPRBranch(t *testing.T) {
 	}
 }
 
-// TestParse_BaseForwardedAsBaseRefEnv verifies that Parse forwards Base into
-// Env["GSD_TEST_BASE_REF"] (issue #3187) so DockerRunArgs's existing sorted
-// env forwarding carries it into the container without any DockerRunArgs
-// special-case.
-func TestParse_BaseForwardedAsBaseRefEnv(t *testing.T) {
-	spec, err := Parse([]byte(`{"repo":"/src","target":"linux","base":"next","prBranch":"feat/x"}`))
-	if err != nil {
-		t.Fatalf("Parse: %v", err)
-	}
-	if got := spec.Env["GSD_TEST_BASE_REF"]; got != "next" {
-		t.Errorf(`Env["GSD_TEST_BASE_REF"] = %q, want "next"`, got)
-	}
-}
-
-// TestParse_NoBase_NoBaseRefEnv verifies GSD_TEST_BASE_REF is never
-// synthesized when the spec has no base ref (also proves Env stays nil, not
-// an empty map, so DockerRunArgs's -e omission for nil Env is unaffected).
-func TestParse_NoBase_NoBaseRefEnv(t *testing.T) {
-	spec, err := Parse([]byte(`{"repo":"/src","target":"linux"}`))
-	if err != nil {
-		t.Fatalf("Parse: %v", err)
-	}
-	if spec.Env != nil {
-		t.Errorf("Env = %v, want nil when Base is unset", spec.Env)
-	}
-}
-
-// TestParse_ExplicitBaseRefEnv_NotOverwritten verifies that an
-// agent-supplied explicit env["GSD_TEST_BASE_REF"] wins over the
-// Base-derived value (Postel's Law: caller's explicit override is honored).
-func TestParse_ExplicitBaseRefEnv_NotOverwritten(t *testing.T) {
-	spec, err := Parse([]byte(`{
-		"repo": "/src",
-		"target": "linux",
-		"base": "next",
-		"prBranch": "feat/x",
-		"env": {"GSD_TEST_BASE_REF": "explicit-override"}
-	}`))
-	if err != nil {
-		t.Fatalf("Parse: %v", err)
-	}
-	if got := spec.Env["GSD_TEST_BASE_REF"]; got != "explicit-override" {
-		t.Errorf(`Env["GSD_TEST_BASE_REF"] = %q, want "explicit-override"`, got)
-	}
-}
-
 func TestParse_OnlyOneOfBasePRBranchRejected(t *testing.T) {
 	for _, body := range []string{
 		`{"repo":"/src","target":"linux","base":"main"}`,

@@ -171,24 +171,6 @@ func Parse(data []byte) (*Spec, error) {
 	if err := spec.validate(); err != nil {
 		return nil, err
 	}
-
-	// Forward the base ref into the container as GSD_TEST_BASE_REF (issue
-	// #3187). A project's opt-in "gsd:pretest-baseline" npm hook
-	// (reporter/run-and-die.sh, ADR-0021 Decision 1) reads this convention-only
-	// env var to build any base-ref-dependent artifact it needs — at the base
-	// ref, never at HEAD. Populated here (rather than as a DockerRunArgs
-	// special-case) so DockerRunArgs stays unchanged and inherits its
-	// deterministic env sorting. Only set when Base is present, and never
-	// overwrites an explicit env override the caller already supplied.
-	if spec.Base != "" {
-		if spec.Env == nil {
-			spec.Env = map[string]string{}
-		}
-		if _, exists := spec.Env["GSD_TEST_BASE_REF"]; !exists {
-			spec.Env["GSD_TEST_BASE_REF"] = spec.Base
-		}
-	}
-
 	return &spec, nil
 }
 
