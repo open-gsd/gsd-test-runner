@@ -1,6 +1,6 @@
 # Contributing to gsd-test-runner
 
-This repository hosts the remote Dockerized test runner for [GSD](https://github.com/open-gsd/get-shit-done-redux). It is small in surface (a Dockerfile plus a handful of shell scripts) but participates in the same org-wide contribution model as the main repo.
+This repository hosts the remote Dockerized test runner for [GSD](https://github.com/open-gsd/get-shit-done-redux). It is a Go CLI (`cmd/gsd-test`, with the engine under `internal/`) plus the Dockerfiles for the Tester Images, and participates in the same org-wide contribution model as the main repo.
 
 If you have not read it, please skim [the GSD CONTRIBUTING guide](https://github.com/open-gsd/get-shit-done-redux/blob/main/CONTRIBUTING.md) — the issue/PR workflow described there applies here too.
 
@@ -12,14 +12,20 @@ If you have not read it, please skim [the GSD CONTRIBUTING guide](https://github
 git clone https://github.com/open-gsd/gsd-test-runner.git
 cd gsd-test-runner
 
-# Requirements: Docker (Linux + Windows daemons reachable), rsync, bash, ssh.
-# See the README for environment variables (SSH host, image tag, etc).
+# Requirements: the Go toolchain (version pinned in go.mod), git, and ssh.
+# Dispatching a real run additionally needs an SSH-reachable Docker daemon —
+# see docs/benches.md and docs/configuration.md.
 
-# Run the suite the same way CI does:
-./gsd-test-both
+# Build:
+go build ./...
+
+# Run the suite (the canonical local check):
+go test ./... -race
 ```
 
-There is no `npm install` step — this repo is shell + Docker.
+The suite is green on a machine with no Docker daemon: the end-to-end tests that need one call `requireDocker`, which skips rather than fails.
+
+There is no `npm install` step — this repo is Go. `npm` appears only *inside* the Tester Images, where the runner installs and tests a target repo's suite.
 
 ---
 
@@ -65,7 +71,7 @@ Adds something that doesn't exist today — a new script, a new workflow, a new 
 - **Use the correct typed template.** The default (untyped) template is a rejection reason — it exists only to route you to the right one.
 - **Link the approved issue.** For enhancements and features, the linked issue must carry the approval label.
 - **Keep PRs focused.** One concern per PR. Refactors get their own PR.
-- **Tests must pass locally** before push. `./gsd-test-both` is the canonical local check.
+- **Tests must pass locally** before push. `go test ./... -race` is the canonical local check, and `go vet ./...` must be clean.
 - **Atomic commits with clear messages.** Follow conventional-commit-style prefixes (`fix:`, `feat:`, `chore:`, `docs:`) where possible.
 
 CI / tooling, dependency, and doc-only PRs are exempt from the typed-template requirement (the PR template detects this from the changed paths).
