@@ -354,13 +354,12 @@ jobs:
 
       - name: Log in to GHCR (Tart)
         run: |
-          # TODO(verify): `tart login` was not hands-on-verified this
-          # session -- inferred from Tart's documented command list. This
-          # matches the shape `docker/login-action` uses for the other jobs
-          # (username + password/token via stdin), adapted to Tart's own
-          # login command. Confirm the exact flag names against a real Tart
-          # install before relying on this in production.
-          echo "${{ secrets.GITHUB_TOKEN }}" | tart login "${{ env.REGISTRY }}" -u "${{ github.actor }}" --password-stdin
+          # CONFIRMED (studio-mac-mini.local, 2026-09-07, real `tart login
+          # --help`): there is no `-u` shorthand for --username -- passing
+          # -u left --username unset, so both --username and --password-stdin
+          # were reported missing even though a value followed -u on the
+          # command line.
+          echo "${{ secrets.GITHUB_TOKEN }}" | tart login "${{ env.REGISTRY }}" --username "${{ github.actor }}" --password-stdin
 
       - name: packer init
         run: packer init dockerfiles/macos-tart.pkr.hcl
