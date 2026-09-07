@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/open-gsd/gsd-test-runner/internal/bench"
 	"github.com/open-gsd/gsd-test-runner/internal/images"
@@ -64,6 +65,15 @@ func stubRunShellOnBench(t *testing.T, fn func(ctx context.Context, b bench.Benc
 	orig := runShellOnBench
 	runShellOnBench = fn
 	t.Cleanup(func() { runShellOnBench = orig })
+}
+
+// stubProbeVM swaps the package-level probeVM var (used by the RunTests
+// liveness-probe loop).
+func stubProbeVM(t *testing.T, fn func(ctx context.Context, b bench.Bench, vmName string) (bool, string, error)) {
+	t.Helper()
+	orig := probeVM
+	probeVM = fn
+	t.Cleanup(func() { probeVM = orig })
 }
 
 // allGood wires every seam to a no-op success, so tests can override just
@@ -559,6 +569,175 @@ func TestRunTests_ReporterDestination_UnderMountedPath(t *testing.T) {
 	}
 	if !strings.Contains(guestJSONLPath, guestMountBase) {
 		t.Fatalf("test invariant broken: guestJSONLPath must be under guestMountBase")
+	}
+}
+
+// --- RunTests: liveness probe ---------------------------------------------------------
+
+func TestRunTests_LivenessProbe_EmitsMultipleTicks_WhenExecGuestBlocks(t *testing.T) {
+	allGood(t)
+	orig := livenessInterval
+	livenessInterval = 5 * time.Millisecond
+	t.Cleanup(func() { livenessInterval = orig })
+
+	stubProbeVM(t, func(context.Context, bench.Bench, string) (bool, string, error) {
+		return true, "running", nil
+	})
+	stubExecGuest(t, func(_ context.Context, _ bench.Bench, _, _, _ string, args []string) (string, error) {
+		if len(args) == 3 && strings.Contains(args[2], "--test") {
+			time.Sleep(30 * time.Millisecond)
+		}
+		return "", nil
+	})
+
+	p, ch := newTestPipeline(t, 128)
+	started := time.Now()
+	if err := p.RunTests(context.Background()); err != nil {
+		t.Fatalf("expected nil, got %v", err)
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("RunTests took too long (%v) — test must complete in well under 1s", elapsed)
+	}
+
+	evs := drainEvents(t, ch, 64)
+	livenessCount := 0
+	for _, e := range evs {
+		if e.Kind == pipeline.EventLiveness {
+			livenessCount++
+			if e.Leg != pipeline.LegRunTests {
+				t.Errorf("expected Leg=LegRunTests, got %v", e.Leg)
+			}
+		}
+	}
+	if livenessCount < 2 {
+		t.Errorf("expected at least 2 EventLiveness events during a blocking RunTests call, got %d", livenessCount)
+	}
+}
+
+func TestRunTests_LivenessProbe_NoTicks_WhenExecGuestReturnsImmediately(t *testing.T) {
+	allGood(t)
+	// Deliberately leave livenessInterval at its real (20s) default: the
+	// point of this test is that execGuest returning immediately means
+	// RunTests itself returns almost instantly, long before even one real
+	// tick could fire — no override, no sleep, needed for this to be
+	// deterministic.
+	stubProbeVM(t, func(context.Context, bench.Bench, string) (bool, string, error) {
+		t.Error("probeVM must not be called when execGuest returns immediately")
+		return false, "", nil
+	})
+	p, ch := newTestPipeline(t, 32)
+	if err := p.RunTests(context.Background()); err != nil {
+		t.Fatalf("expected nil, got %v", err)
+	}
+	for _, e := range drainEvents(t, ch, 32) {
+		if e.Kind == pipeline.EventLiveness {
+			t.Errorf("expected no EventLiveness events, got one: %+v", e)
+		}
+	}
+}
+
+func TestRunTests_LivenessProbe_FullyStoppedBeforeReturn_NoPanicOnClose(t *testing.T) {
+	allGood(t)
+	orig := livenessInterval
+	livenessInterval = 5 * time.Millisecond
+	t.Cleanup(func() { livenessInterval = orig })
+
+	stubProbeVM(t, func(context.Context, bench.Bench, string) (bool, string, error) {
+		return true, "running", nil
+	})
+	stubExecGuest(t, func(_ context.Context, _ bench.Bench, _, _, _ string, args []string) (string, error) {
+		if len(args) == 3 && strings.Contains(args[2], "--test") {
+			time.Sleep(20 * time.Millisecond)
+		}
+		return "", nil
+	})
+
+	ch := make(chan pipeline.Event, 128)
+	p := New(testBench(), images.ImageID("gsd-tester-macos-tart:dev"), "v0.0.0-test", "/tmp/worktree", nil, "22", ch, pipeline.ContainerIdentity{})
+
+	if err := p.RunTests(context.Background()); err != nil {
+		t.Fatalf("expected nil, got %v", err)
+	}
+
+	// RunTests's own deferred wg.Wait() (see its doc comment) already
+	// guarantees the probe goroutine has fully exited by the time RunTests
+	// returned above — this drains then closes the channel directly (rather
+	// than via p.closeEvents(), to prove the invariant independently of that
+	// helper) as the directly-observable half of the proof: a still-running
+	// probe goroutine sending on ch after this close would panic the whole
+	// test binary (send on a closed channel), failing this test hard.
+	for draining := true; draining; {
+		select {
+		case _, ok := <-ch:
+			if !ok {
+				draining = false
+			}
+		default:
+			draining = false
+		}
+	}
+	close(ch)
+	// Small grace window: if some future change reintroduced a lingering
+	// goroutine, give it a chance to fire (and panic the test) rather than
+	// the test process exiting cleanly by pure luck of timing.
+	time.Sleep(20 * time.Millisecond)
+}
+
+func TestEmitLivenessTick_DetailMessageShapes(t *testing.T) {
+	cases := []struct {
+		name    string
+		probe   func(context.Context, bench.Bench, string) (bool, string, error)
+		wantSub string
+	}{
+		{
+			name: "running",
+			probe: func(context.Context, bench.Bench, string) (bool, string, error) {
+				return true, "running", nil
+			},
+			wantSub: "still running",
+		},
+		{
+			name: "registered_not_running",
+			probe: func(context.Context, bench.Bench, string) (bool, string, error) {
+				return false, "stopped", nil
+			},
+			wantSub: "VM state=stopped",
+		},
+		{
+			name: "vm_not_found",
+			probe: func(context.Context, bench.Bench, string) (bool, string, error) {
+				return false, "", &tartreaper.VMNotFoundError{Name: "gsd-tart-x"}
+			},
+			wantSub: "VM no longer exists",
+		},
+		{
+			name: "generic_probe_error",
+			probe: func(context.Context, bench.Bench, string) (bool, string, error) {
+				return false, "", errors.New("ssh: connection refused")
+			},
+			wantSub: "liveness probe failed",
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			stubProbeVM(t, c.probe)
+			p, ch := newTestPipeline(t, 4)
+			p.emitLivenessTick(context.Background(), time.Now())
+			evs := drainEvents(t, ch, 4)
+			if len(evs) != 1 {
+				t.Fatalf("expected exactly 1 event, got %d: %+v", len(evs), evs)
+			}
+			ev := evs[0]
+			if ev.Kind != pipeline.EventLiveness {
+				t.Fatalf("expected EventLiveness, got %v", ev.Kind)
+			}
+			if ev.Leg != pipeline.LegRunTests {
+				t.Errorf("expected Leg=LegRunTests, got %v", ev.Leg)
+			}
+			if !strings.Contains(ev.Detail, c.wantSub) {
+				t.Errorf("expected Detail to contain %q, got %q", c.wantSub, ev.Detail)
+			}
+		})
 	}
 }
 

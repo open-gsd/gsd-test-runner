@@ -166,6 +166,60 @@ func shellQuote(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }
 
+// tartGetEntry is the shape of `tart get <name> --format json`'s single-object
+// output — CONFIRMED (not guessed) real captured output, per this package's
+// doc comment and docs/adr/0030-macos-bench-via-tart.md Decision 5:
+// Display, Memory, OS, Disk, Size, DiskFormat, State, CPU, Running. Only
+// Running/State matter to Probe; a smaller struct (not tartListEntry, whose
+// Name/Source/Accessed fields `tart get` doesn't even return) is used here
+// since the two commands' output shapes are only partially overlapping.
+type tartGetEntry struct {
+	Running bool   `json:"Running"`
+	State   string `json:"State"`
+}
+
+// VMNotFoundError is returned by Probe when the named VM no longer exists on
+// the Bench at all (Tart's confirmed "does not exist" signal — exit code 2,
+// the same isAlreadyGone match stop/delete already rely on). Distinct from a
+// generic probe failure so a caller can errors.As it specifically and word
+// its message as "gone," not just "probe failed" — a VM that has vanished
+// entirely (reaped, crashed and cleaned up) is a materially different, more
+// alarming signal than one that is merely State != "running".
+type VMNotFoundError struct {
+	Name string
+}
+
+func (e *VMNotFoundError) Error() string {
+	return fmt.Sprintf("tartreaper: VM %q does not exist", e.Name)
+}
+
+// Probe runs `tart get <vmName> --format json` on the Bench (via the runTart
+// stubbable var, the same seam List/Sweep already use) and reports whether
+// the VM is currently running, plus its raw State string. This is a
+// targeted, single-VM liveness check — cheaper and more directly aimed at
+// "is this one VM still alive" than List's `tart list`, which enumerates
+// every VM on the Bench.
+//
+// On success, returns (running, state, nil). On failure, isAlreadyGone
+// (exit code 2) is distinguished from any other failure: a gone VM returns
+// (false, "", *VMNotFoundError), any other error returns (false, "", err)
+// wrapping the underlying error generically.
+func Probe(ctx context.Context, b bench.Bench, vmName string) (running bool, state string, err error) {
+	out, err := runTart(ctx, b, []string{"get", vmName, "--format", "json"})
+	if err != nil {
+		if isAlreadyGone(err) {
+			return false, "", &VMNotFoundError{Name: vmName}
+		}
+		return false, "", fmt.Errorf("tartreaper: probe %s: %w", vmName, err)
+	}
+
+	var entry tartGetEntry
+	if err := json.Unmarshal([]byte(strings.TrimSpace(out)), &entry); err != nil {
+		return false, "", fmt.Errorf("tartreaper: parse tart get output for %s: %w", vmName, err)
+	}
+	return entry.Running, entry.State, nil
+}
+
 // Overdue returns, in input order, the VMs whose deadline is at or before
 // nowMs — mirroring reaper.Overdue exactly, with one addition: VMs with
 // HasState=false are unconditionally excluded first (an unlabeled VM has no

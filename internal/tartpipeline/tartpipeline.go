@@ -127,7 +127,44 @@ var (
 	// arbitrary one-hop shell command on the Bench" primitive RunTart cannot
 	// express (RunTart always prepends "tart ").
 	runShellOnBench = tartexec.RunShell
+	// probeVM is the test seam for the RunTests liveness-probe loop (see
+	// runWithLivenessProbe below), mirroring the vars above. Real
+	// implementation delegates to tartreaper.Probe.
+	probeVM = tartreaper.Probe
 )
+
+// livenessProbeInterval is how often the RunTests liveness-probe loop calls
+// probeVM while execAndCapture's single long blocking guest-exec call is in
+// flight. JUDGMENT CALL: 20s is chosen in the 15-30s range the brief called
+// out — frequent enough that a human watching a long, otherwise-silent
+// RunTests leg isn't left wondering "is this hung?" for more than about 20s
+// at a time, infrequent enough not to spam the Bench (each tick is one more
+// `tart get` SSH round-trip) or the renderer with a constant drip of
+// near-identical "still running" lines. No existing constant to mirror —
+// this is a new kind of periodic signal with no Docker-side analogue (see
+// RunTests's doc comment).
+const livenessProbeInterval = 20 * time.Second
+
+// newLivenessTicker constructs the ticker the liveness-probe loop selects
+// on. A package-level stubbable var (mirroring runTart/execGuest/etc.'s
+// exact pattern above) so tests could, in principle, substitute a different
+// ticker implementation — in practice, tests instead call
+// runLivenessProbeLoop directly with a tiny interval (see that function's
+// doc comment), so this is real time.NewTicker in both production and test.
+var newLivenessTicker = func(d time.Duration) *time.Ticker {
+	return time.NewTicker(d)
+}
+
+// livenessInterval is the interval RunTests's liveness-probe loop actually
+// uses (livenessProbeInterval, in production). A package-level var rather
+// than a direct read of the const, purely as a test seam: tests override
+// this to a tiny duration (e.g. 5ms) so a RunTests call can be driven
+// end-to-end and observe several real ticks in well under 100ms of wall-clock
+// time, deterministically, without waiting anywhere near the real 20s
+// interval. Mirrors this package's other package-level stubbable-var
+// pattern (runTart, execGuest, ...) even though this one wraps a duration,
+// not a function.
+var livenessInterval = livenessProbeInterval
 
 // tartReaperState is the JSON shape written to
 // tartreaper.StateDir/<vmName>.json by StartContainer's write_state step, and
@@ -626,6 +663,18 @@ func (p *Pipeline) Build(ctx context.Context) error {
 // burst (via execAndCapture) followed by Drain/Parse's aggregate
 // pass/fail/total counts. This is a real UX gap versus Docker, not a bug.
 //
+// LIVENESS SIGNAL (this PR): it does NOT fix the limitation above, but it
+// closes a narrower, cheaper gap the maintainer flagged separately — a
+// long-running RunTests leg with zero output for minutes is otherwise
+// indistinguishable from a genuinely hung VM. While execAndCapture's single
+// blocking guest-exec call is in flight, a concurrent goroutine periodically
+// (every livenessProbeInterval) calls tartreaper.Probe against p.vmName and
+// emits a pipeline.EventLiveness carrying a human-readable "still alive"
+// (or not) statement — see runLivenessProbeLoop/emitLivenessTick. This does
+// NOT tell you which test is currently running or how far through the suite
+// it is; it only tells you whether the underlying VM is still alive,
+// registered, and running.
+//
 // Test-process exit code 1 (tests failed) is NOT a leg error — mirrors
 // internal/pipeline's exit-1 downgrade so the Parse leg surfaces failures
 // via Report.Failures instead of a false leg-infra failure.
@@ -633,6 +682,27 @@ func (p *Pipeline) RunTests(ctx context.Context) error {
 	return p.runLeg(ctx, pipeline.LegRunTests, func(ctx context.Context) (string, error) {
 		testArgs := p.runTestsCommandArgs()
 		args := p.guestShellCommand(shellJoinQuoted(testArgs))
+
+		start := time.Now()
+		stop := make(chan struct{})
+		var wg sync.WaitGroup
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			p.runLivenessProbeLoop(ctx, start, livenessInterval, stop)
+		}()
+		// HARD CORRECTNESS REQUIREMENT (see emit's doc comment on the
+		// single-producer-goroutine invariant): the probe goroutine MUST have
+		// fully exited — no longer able to call p.emit — before this work
+		// function returns, in BOTH the success and error paths below. Closing
+		// stop signals it to stop; wg.Wait() blocks until it actually has,
+		// guaranteeing no send races runLeg's own success/failure emit or a
+		// later closeEvents().
+		defer func() {
+			close(stop)
+			wg.Wait()
+		}()
+
 		err := p.execAndCapture(ctx, pipeline.LegRunTests, "test runner", args)
 		if err != nil {
 			var ge *GuestExecError
@@ -643,6 +713,69 @@ func (p *Pipeline) RunTests(ctx context.Context) error {
 		}
 		return "", nil
 	})
+}
+
+// runLivenessProbeLoop ticks every interval (via newLivenessTicker(interval))
+// until stop is closed, calling emitLivenessTick on each tick. Unexported and
+// interval-parameterized (rather than always reading the livenessProbeInterval
+// const directly) specifically so tests can call it directly with a tiny
+// interval (e.g. 5ms) and observe several real ticks in well under 100ms of
+// wall-clock time, deterministically, without sleeping — RunTests itself
+// always calls this with the package const.
+//
+// Stop condition: on stop-channel-closed, returns without emitting one final
+// tick — a tick received in the same select as stop's closure is discarded
+// (double-checked below) rather than emitted, to avoid racing the leg's own
+// closing events.
+func (p *Pipeline) runLivenessProbeLoop(ctx context.Context, start time.Time, interval time.Duration, stop <-chan struct{}) {
+	ticker := newLivenessTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-stop:
+			return
+		case <-ticker.C:
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			p.emitLivenessTick(ctx, start)
+		}
+	}
+}
+
+// emitLivenessTick calls probeVM for p.vmName and emits a single
+// pipeline.EventLiveness with a Detail message distinguishing four cases:
+// probe succeeded and the VM is running, probe succeeded but the VM is
+// registered and not running (materially more alarming — the guest process
+// may have crashed), the VM no longer exists at all (*tartreaper.VMNotFoundError,
+// a different, more alarming signal than merely not-running — see
+// tartreaper.Probe's doc comment), or any other probe failure (the Bench
+// itself may be unreachable — still useful information, not swallowed).
+// elapsed is measured from start (RunTests's work function start time) and
+// formatted compactly via time.Duration.String() after rounding to whole
+// seconds.
+func (p *Pipeline) emitLivenessTick(ctx context.Context, start time.Time) {
+	elapsed := time.Since(start).Round(time.Second)
+	running, state, err := probeVM(ctx, p.bench, p.vmName)
+
+	var detail string
+	switch {
+	case err == nil && running:
+		detail = fmt.Sprintf("still running (%s elapsed; VM confirmed running)", elapsed)
+	case err == nil && !running:
+		detail = fmt.Sprintf("VM state=%s (%s elapsed; VM is registered but NOT running — guest process may have crashed)", state, elapsed)
+	default:
+		var notFound *tartreaper.VMNotFoundError
+		if errors.As(err, &notFound) {
+			detail = fmt.Sprintf("VM no longer exists (%s elapsed) — it may have been reaped or crashed and been cleaned up", elapsed)
+		} else {
+			detail = fmt.Sprintf("liveness probe failed (%s elapsed): %s", elapsed, err)
+		}
+	}
+
+	p.emit(pipeline.Event{Kind: pipeline.EventLiveness, OS: p.bench.OS, Time: time.Now(), Leg: pipeline.LegRunTests, Detail: detail})
 }
 
 // Drain pulls the JSONL results file from the Bench to the Dev Workstation

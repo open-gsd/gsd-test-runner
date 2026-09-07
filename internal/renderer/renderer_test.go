@@ -473,6 +473,36 @@ func TestRenderer_EventLegSkipped(t *testing.T) {
 	}
 }
 
+func TestRenderTTY_EventLiveness_NormalAndFullShowIt_QuietSuppressesIt(t *testing.T) {
+	livenessEv := makeEvent(pipeline.EventLiveness, pipeline.LegRunTests, "", "", "still running (20s elapsed; VM confirmed running)")
+
+	for _, v := range []renderer.Verbosity{renderer.VerbosityFull, renderer.VerbosityNormal} {
+		var buf bytes.Buffer
+		r := renderer.New(&buf, renderer.ModeTTY).SetVerbosity(v)
+		ch := make(chan pipeline.Event, 1)
+		r.Subscribe("macos", ch)
+		drainAndClose(ch, []pipeline.Event{livenessEv})
+		r.Wait()
+
+		out := buf.String()
+		if !strings.Contains(out, "still running (20s elapsed; VM confirmed running)") {
+			t.Errorf("verbosity=%v: expected liveness Detail in output, got: %q", v, out)
+		}
+	}
+
+	var buf bytes.Buffer
+	r := renderer.New(&buf, renderer.ModeTTY).SetVerbosity(renderer.VerbosityQuiet)
+	ch := make(chan pipeline.Event, 1)
+	r.Subscribe("macos", ch)
+	drainAndClose(ch, []pipeline.Event{livenessEv})
+	r.Wait()
+
+	out := buf.String()
+	if strings.Contains(out, "still running") {
+		t.Errorf("quiet mode must suppress EventLiveness, got: %q", out)
+	}
+}
+
 func TestWait_BlocksUntilAllChannelsClose(t *testing.T) {
 	var buf bytes.Buffer
 	r := renderer.New(&buf, renderer.ModeTTY)
