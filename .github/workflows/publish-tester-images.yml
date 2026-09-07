@@ -305,6 +305,19 @@ jobs:
     # fleets. This project's Bench model is already "the developer's own Mac
     # hardware" (ADR-0007), so self-hosted matches existing philosophy too.
     runs-on: [self-hosted, macos, tart]
+    # TART_REGISTRY_USERNAME/PASSWORD: confirmed via `tart pull --help` on
+    # real hardware (2026-09-07) that Tart supports registry auth via these
+    # env vars, in addition to Keychain (`tart login`) and Docker credential
+    # helpers -- no `tart login` step needed, so no Keychain access at all.
+    # This replaces an earlier `tart login` + Keychain-unlock approach that
+    # required a dedicated CI-only keychain set as the session default,
+    # which caused an unwanted macOS system prompt (Spotlight and other
+    # services asking for that keychain's password) on every reboot/login.
+    # Same credentials as before (github.actor / GITHUB_TOKEN), just handed
+    # to Tart directly instead of written into Keychain first.
+    env:
+      TART_REGISTRY_USERNAME: ${{ github.actor }}
+      TART_REGISTRY_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
     strategy:
       matrix:
         # Keep in sync with DEFAULT_NODE_MAJOR above; add a line here to
@@ -351,28 +364,6 @@ jobs:
           packer version
           tart --version
           sshpass -V
-
-      - name: Unlock CI keychain
-        run: |
-          # `tart login` writes the registry credential into Keychain
-          # (confirmed: it failed with "Keychain failed to add item: User
-          # interaction is not allowed" when the runner's session had no
-          # unlocked keychain to write to -- a self-hosted macOS runner has
-          # no interactive session to prompt for one). The Bench operator
-          # provisions a dedicated CI-only keychain (`runner.keychain-db`,
-          # set as the session default) so this never touches the operator's
-          # real login keychain/password. See the how-to guide for the
-          # one-time `security create-keychain` setup this depends on.
-          security unlock-keychain -p "${{ secrets.MACOS_CI_KEYCHAIN_PASSWORD }}" runner.keychain-db
-
-      - name: Log in to GHCR (Tart)
-        run: |
-          # CONFIRMED (studio-mac-mini.local, 2026-09-07, real `tart login
-          # --help`): there is no `-u` shorthand for --username -- passing
-          # -u left --username unset, so both --username and --password-stdin
-          # were reported missing even though a value followed -u on the
-          # command line.
-          echo "${{ secrets.GITHUB_TOKEN }}" | tart login "${{ env.REGISTRY }}" --username "${{ github.actor }}" --password-stdin
 
       - name: packer init
         run: packer init dockerfiles/macos-tart.pkr.hcl
