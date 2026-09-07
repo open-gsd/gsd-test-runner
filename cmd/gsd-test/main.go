@@ -4,7 +4,8 @@
 // multi-OS test pipeline orchestration (ADR-0018 as amended: Load → Plan →
 // Schedule, with EnsurePresent folded into each scheduler worker per Node
 // matrix enhancement #108). The run-and-die subcommands (submit, run, wait,
-// status, __run-worker) and install-agent-hooks are handled inline below.
+// status, __run-worker), install-agent-hooks, and sweep (manual Tier-2
+// reaper front door, ADR-0029 §6) are handled inline below.
 //
 // Exit codes per ADR-0009:
 //
@@ -36,6 +37,7 @@ import (
 	"github.com/open-gsd/gsd-test-runner/internal/images"
 	"github.com/open-gsd/gsd-test-runner/internal/installhooks"
 	"github.com/open-gsd/gsd-test-runner/internal/reaper"
+	"github.com/open-gsd/gsd-test-runner/internal/refs"
 	"github.com/open-gsd/gsd-test-runner/internal/report"
 	"github.com/open-gsd/gsd-test-runner/internal/runner"
 	"github.com/open-gsd/gsd-test-runner/internal/runrender"
@@ -173,6 +175,14 @@ func run(args []string, stdout, stderr io.Writer) int {
 	// documented in help text; it is invoked exclusively by realSpawn.
 	if len(args) > 0 && args[0] == "__run-worker" {
 		return runWorker(args[1:], stdout, stderr)
+	}
+
+	// `sweep` is the manual Tier-2 reaper front door (ADR-0029 §6 amendment):
+	// the operator escape hatch that Decision 3's branch scoping never exposed
+	// as an actual CLI command. Destructive by design (it kills containers);
+	// defaults to the same branch-scoped safety as the automatic sweep.
+	if len(args) > 0 && args[0] == "sweep" {
+		return runSweep(args[1:], stdout, stderr)
 	}
 
 	flags, err := parseFlags(args)
@@ -723,6 +733,144 @@ func runInstallHooks(args []string, stdout, stderr io.Writer) int {
 	}
 	fmt.Fprintf(stdout, "\nReverse with `gsd-test install-agent-hooks --uninstall`.\n")
 	return exitAllPass
+}
+
+// resolveSweepBranchSlug resolves the branch slug for a `gsd-test sweep`
+// invocation that was given no explicit --branch: the branch currently
+// checked out at the repo root, via the same refs.CurrentBranch +
+// runspec.SlugifyBranch path internal/runner's (unexported)
+// resolveBranchSlug uses for the default pipeline run. This is a small local
+// equivalent — same fallback chain, minus the opts.Head override a manual
+// sweep has no run spec to supply. Never fails: an unresolvable branch falls
+// back to runspec.BranchSlugUnknown, same as the pipeline path, so `sweep`
+// with no flags always has a safe, non-empty scope.
+func resolveSweepBranchSlug(ctx context.Context) string {
+	repo, err := repoRoot()
+	if err != nil {
+		return runspec.BranchSlugUnknown
+	}
+	branch, err := refs.CurrentBranch(ctx, repo)
+	if err != nil || branch == "" || branch == "HEAD" {
+		return runspec.BranchSlugUnknown
+	}
+	return runspec.SlugifyBranch(branch)
+}
+
+// sweepScopeLabel renders branchSlug for human-readable `sweep` output:
+// "<all branches>" for the unscoped escape hatch, the slug itself otherwise.
+func sweepScopeLabel(branchSlug string) string {
+	if branchSlug == "" {
+		return "<all branches>"
+	}
+	return branchSlug
+}
+
+// runSweep implements `gsd-test sweep`: the manual front door onto the Tier-2
+// reaper's operator escape hatch (ADR-0029 §6 amendment) — `reaper.Sweep`
+// always supported an unscoped branchSlug="" mode, but nothing in the shipped
+// binary ever invoked it. This command is DESTRUCTIVE (it kills running
+// containers), so --all is never the default: with no flags, sweep is scoped
+// to the current branch only, the same safety property the automatic
+// on-next-contact sweep (dispatchRun, sweepStaleContainers) already has.
+//
+// Exit codes: exitAllPass (0) when every targeted Bench's sweep completed
+// without error, even if nothing was reaped ("nothing to clean up" is
+// success). exitInconclusive (2) if a Bench was unreachable, a named --bench
+// was not found, or a kill genuinely failed on any Bench.
+func runSweep(args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("gsd-test sweep", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	benchName := fs.String("bench", "", "sweep only the named Bench (default: every Bench in the loaded config)")
+	branch := fs.String("branch", "", "sweep scoped to this branch slug (default: the current branch, resolved from git)")
+	all := fs.Bool("all", false, "sweep every overdue container on the target Bench(es), regardless of branch — the unscoped operator escape hatch (mutually exclusive with --branch)")
+	configPath := fs.String("config", "", "path to config.toml")
+	fs.Usage = func() {
+		fmt.Fprint(stderr, `Usage: gsd-test sweep [flags]
+
+Manually runs the Tier-2 reaper sweep (ADR-0021 Decision 2): kills run
+containers past their deadline on one or more Benches. DESTRUCTIVE — this
+kills running containers.
+
+Default (no flags): scoped to the CURRENT branch only, exactly like the
+automatic on-next-contact sweep every gsd-test run/submit --execute already
+performs — containers from other branches are left alone. Pass --all to
+widen the blast radius to every overdue container regardless of branch.
+
+Flags:
+`)
+		fs.PrintDefaults()
+	}
+	if err := fs.Parse(args); err != nil {
+		return exitInconclusive
+	}
+
+	if *all && *branch != "" {
+		fmt.Fprintln(stderr, "sweep: --all and --branch are mutually exclusive")
+		return exitInconclusive
+	}
+
+	cfg, err := config.Load(*configPath, config.LoadOptions{})
+	if err != nil {
+		fmt.Fprintf(stderr, "sweep: config.Load: %v\n", err)
+		return exitInconclusive
+	}
+
+	targets := cfg.Registry
+	if *benchName != "" {
+		found := false
+		for _, b := range cfg.Registry {
+			if b.Name == *benchName {
+				targets = []bench.Bench{b}
+				found = true
+				break
+			}
+		}
+		if !found {
+			available := make([]string, 0, len(cfg.Registry))
+			for _, b := range cfg.Registry {
+				available = append(available, b.Name)
+			}
+			fmt.Fprintf(stderr, "sweep: bench %q not found in config; available: %v\n", *benchName, available)
+			return exitInconclusive
+		}
+	}
+	if len(targets) == 0 {
+		fmt.Fprintln(stderr, "sweep: no Benches configured")
+		return exitInconclusive
+	}
+
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer cancel()
+
+	branchSlug := *branch
+	if *all {
+		branchSlug = ""
+	} else if branchSlug == "" {
+		branchSlug = resolveSweepBranchSlug(ctx)
+	}
+
+	exitCode := exitAllPass
+	for _, b := range targets {
+		runnerFn := func(ctx context.Context, args ...string) ([]byte, error) {
+			out, runErr := dockerexec.Run(ctx, b, args)
+			return []byte(out), runErr
+		}
+		fmt.Fprintf(stdout, "bench=%s: sweeping (branch=%s)...\n", b.Name, sweepScopeLabel(branchSlug))
+		reaped, sweepErr := reaper.Sweep(ctx, runnerFn, time.Now().UnixMilli(), branchSlug)
+		if sweepErr != nil {
+			fmt.Fprintf(stderr, "bench=%s: sweep error: %v\n", b.Name, sweepErr)
+			exitCode = exitInconclusive
+			// Still report any successfully reaped containers below before moving on.
+		}
+		if len(reaped) == 0 {
+			fmt.Fprintf(stdout, "bench=%s: nothing to clean up\n", b.Name)
+			continue
+		}
+		for _, c := range reaped {
+			fmt.Fprintf(stdout, "bench=%s: reaped id=%s name=%s branch=%s\n", b.Name, c.ID, c.Name, c.BranchSlug)
+		}
+	}
+	return exitCode
 }
 
 // dispatchRun resolves the Bench + Tester Image for spec.Target (reusing config,

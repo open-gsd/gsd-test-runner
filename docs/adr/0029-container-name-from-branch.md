@@ -3,6 +3,7 @@
 **Date**: 2026-07-18
 **Status**: Accepted (2026-07-18)
 **Amended**: 2026-07-26 — the Decision 4 deferral is resolved: the Pipeline engine now carries branch-derived naming + labels too. See Decision 5.
+**Amended**: 2026-09-07 — Decision 3's branch scoping left cross-branch leaks unreaped indefinitely; a safety-net tier + manual `gsd-test sweep` command close the gap. See Decision 6.
 **Context**: Issue #123 — name the run container after the branch under test so a Bench operator can tell at a glance whether a container was spawned by gsd-test-runner, and tighten the Tier-2 reaper's ownership so an invocation only reaps containers belonging to the branch it works on.
 
 ## Context
@@ -58,6 +59,19 @@ The Decision 4 deferral is resolved. Real-world evidence (containers observed al
 - **The deadline is a fixed `runner.DefaultContainerTTL` of 2 hours.** The dispatch/Watchdog path derives its deadline from `Spec.Budget.EffectiveDeadlineMs`, but the Pipeline path has no budget concept at all — `internal/config` carries no timeout, deadline, or budget field, and none of the CLI flags supply one. Rather than invent a config surface in this change, the TTL is a single named constant chosen to sit far above a realistic single-cell run (minutes) and far below the observed leak durations (5–37 hours). A container still alive past it is presumed leaked, not slow.
 
   The accepted risk: a genuine single-cell run exceeding 2 hours can be killed by a *later* invocation of the **same branch** against the **same Bench**. Other branches are unaffected (Decision 3 scoping), and a run in isolation is never at risk regardless of length — the reaper only ever acts on next contact. Making the TTL configurable via `[defaults]` is the natural follow-up if anyone hits this.
+
+### 6. (Amendment, 2026-09-07) Safety-net tier for cross-branch leaks + manual `gsd-test sweep`
+
+Real-world observation of Decision 3's scoping surfaced a gap it did not anticipate: a container leaked on branch A (crashed engine, killed process) is never automatically reaped unless the exact same branch A is worked again on the exact same Bench. A developer bouncing between branches on shared Bench hardware — completely normal usage — accumulates leaked containers that sit indefinitely past their deadline, observed on the order of a day in production. `Sweep`'s only unscoped path (`branchSlug == ""`, the "operator escape hatch" from Decision 3) was never invoked by the shipped binary — both call sites always pass a real branch slug — so the escape hatch existed in code but not in practice.
+
+**Two-tier `Sweep`.** `reaper.Sweep` now reaps the union of two sets, deduped by `Container.ID`, without any change to its exported signature:
+
+1. **Branch-scoped** (unchanged from Decision 3): containers owned by `branchSlug` whose deadline has passed at `nowMs`.
+2. **Safety net** (new): ANY container, regardless of branch, whose deadline passed more than `reaper.SafetyNetGrace` (6 hours) ago.
+
+Both existing call sites (`internal/runner/identity.go`'s `sweepStaleContainers`, `cmd/gsd-test/main.go`'s `dispatchRun`) get the safety-net protection automatically — no call-site changes were needed. `SafetyNetGrace`'s value is a judgment call, not a derived constant: conservative enough to give a human a real diagnostic window after a container's deadline passes (so an operator actively investigating a hang on another branch is not surprised mid-investigation), short enough to bound the leak in hours rather than days.
+
+**Manual `gsd-test sweep` command.** The operator escape hatch (`branchSlug == ""`) is now also reachable directly: `gsd-test sweep [--bench <name>] [--branch <slug> | --all] [--config <path>]`. Default (no flags): scoped to the current branch only — the same safety property the automatic on-next-contact sweep already has. `--all` passes an empty branch slug to `reaper.Sweep`, widening to every overdue container on the target Bench(es) regardless of branch; it is not the default because this command kills running containers and the wider blast radius must be an explicit operator choice. `--bench` targets one configured Bench; default is every Bench in the loaded config.
 
 ## Consequences
 
