@@ -334,7 +334,13 @@ jobs:
           # `command -v jq` pattern) rather than a bare `brew install` that
           # would just no-op-but-still-cost-time on every run anyway.
           if ! command -v packer >/dev/null 2>&1; then
-            brew install packer
+            # Packer was pulled from homebrew-core (BUSL license change) and
+            # now lives only in HashiCorp's own tap; `brew install packer`
+            # 404s with "No available formula" as of Homebrew's post-removal
+            # index. `brew install hashicorp/tap/packer` auto-taps and
+            # installs in one step -- confirmed working against a real
+            # runner (studio-mac-mini.local, 2026-09-07).
+            brew install hashicorp/tap/packer
           fi
           if ! command -v tart >/dev/null 2>&1; then
             brew install cirruslabs/cli/tart
