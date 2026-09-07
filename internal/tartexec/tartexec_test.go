@@ -30,6 +30,27 @@ func stubRunSSH(result sshResult) (captured *struct {
 	return captured, func() { runSSH = orig }
 }
 
+// stubRunSCP replaces the package-level runSCP var with a fake that records
+// the call and returns result. Returns the captured call (populated after
+// the stubbed function has been invoked) and a restore func. Mirrors
+// stubRunSSH, swapping which package var it replaces.
+func stubRunSCP(result sshResult) (captured *struct {
+	ctx  context.Context
+	args []string
+}, restore func()) {
+	captured = &struct {
+		ctx  context.Context
+		args []string
+	}{}
+	orig := runSCP
+	runSCP = func(ctx context.Context, scpArgs []string) sshResult {
+		captured.ctx = ctx
+		captured.args = scpArgs
+		return result
+	}
+	return captured, func() { runSCP = orig }
+}
+
 // --- shellQuote / shellJoinQuoted ---
 
 func TestShellQuote_KnownCorrectOutput(t *testing.T) {
@@ -324,6 +345,174 @@ func TestExec_CtxCancellationReturnsCtxErrDirectly(t *testing.T) {
 	if stdout != "" {
 		t.Errorf("stdout = %q, want empty string on cancellation", stdout)
 	}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("err = %v, want context.Canceled", err)
+	}
+}
+
+// --- CopyToBench ---
+
+func TestCopyToBench_ConstructsSCPArgv(t *testing.T) {
+	captured, restore := stubRunSCP(sshResult{ExitCode: 0})
+	defer restore()
+
+	b := bench.Bench{Host: "bench-1"}
+	err := CopyToBench(context.Background(), b, "/local/worktree", "/remote/worktree")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	wantArgs := []string{"-r", "/local/worktree", "bench-1:/remote/worktree"}
+	if len(captured.args) != len(wantArgs) {
+		t.Fatalf("scpArgs = %#v, want %#v", captured.args, wantArgs)
+	}
+	for i := range wantArgs {
+		if captured.args[i] != wantArgs[i] {
+			t.Fatalf("scpArgs[%d] = %q, want %q (full: %#v)", i, captured.args[i], wantArgs[i], captured.args)
+		}
+	}
+}
+
+func TestCopyToBench_PathWithSpaceIsSingleArgvElement(t *testing.T) {
+	captured, restore := stubRunSCP(sshResult{ExitCode: 0})
+	defer restore()
+
+	b := bench.Bench{Host: "bench-1"}
+	localPath := "/Users/dev/my worktree/project"
+	err := CopyToBench(context.Background(), b, localPath, "/remote/worktree")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if len(captured.args) != 3 {
+		t.Fatalf("scpArgs = %#v, want 3 elements", captured.args)
+	}
+	if captured.args[1] != localPath {
+		t.Fatalf("scpArgs[1] = %q, want unmangled %q", captured.args[1], localPath)
+	}
+}
+
+func TestCopyToBench_ErrorOnNonZeroExit(t *testing.T) {
+	_, restore := stubRunSCP(sshResult{
+		Stderr:   "scp: no such file or directory",
+		ExitCode: 1,
+		RunErr:   &exec.ExitError{},
+	})
+	defer restore()
+
+	b := bench.Bench{Host: "bench-1"}
+	err := CopyToBench(context.Background(), b, "/local/worktree", "/remote/worktree")
+
+	var execErr *ExecError
+	if !errors.As(err, &execErr) {
+		t.Fatalf("err = %v (%T), want *ExecError", err, err)
+	}
+	if execErr.ExitCode != 1 {
+		t.Errorf("ExitCode = %d, want 1", execErr.ExitCode)
+	}
+	if execErr.Stderr != "scp: no such file or directory" {
+		t.Errorf("Stderr = %q, want %q", execErr.Stderr, "scp: no such file or directory")
+	}
+	wantArgs := []string{"/local/worktree", "/remote/worktree"}
+	if len(execErr.Args) != 2 || execErr.Args[0] != wantArgs[0] || execErr.Args[1] != wantArgs[1] {
+		t.Errorf("Args = %#v, want %#v", execErr.Args, wantArgs)
+	}
+}
+
+func TestCopyToBench_CtxCancellationReturnsCtxErrDirectly(t *testing.T) {
+	_, restore := stubRunSCP(sshResult{ExitCode: 0})
+	defer restore()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	b := bench.Bench{Host: "bench-1"}
+	err := CopyToBench(ctx, b, "/local/worktree", "/remote/worktree")
+
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("err = %v, want context.Canceled", err)
+	}
+}
+
+// --- CopyFromBench ---
+
+func TestCopyFromBench_ConstructsSCPArgv(t *testing.T) {
+	captured, restore := stubRunSCP(sshResult{ExitCode: 0})
+	defer restore()
+
+	b := bench.Bench{Host: "bench-1"}
+	err := CopyFromBench(context.Background(), b, "/remote/results.jsonl", "/local/results.jsonl")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	wantArgs := []string{"-r", "bench-1:/remote/results.jsonl", "/local/results.jsonl"}
+	if len(captured.args) != len(wantArgs) {
+		t.Fatalf("scpArgs = %#v, want %#v", captured.args, wantArgs)
+	}
+	for i := range wantArgs {
+		if captured.args[i] != wantArgs[i] {
+			t.Fatalf("scpArgs[%d] = %q, want %q (full: %#v)", i, captured.args[i], wantArgs[i], captured.args)
+		}
+	}
+}
+
+func TestCopyFromBench_PathWithSpaceIsSingleArgvElement(t *testing.T) {
+	captured, restore := stubRunSCP(sshResult{ExitCode: 0})
+	defer restore()
+
+	b := bench.Bench{Host: "bench-1"}
+	localPath := "/Users/dev/my worktree/results.jsonl"
+	err := CopyFromBench(context.Background(), b, "/remote/results.jsonl", localPath)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if len(captured.args) != 3 {
+		t.Fatalf("scpArgs = %#v, want 3 elements", captured.args)
+	}
+	if captured.args[2] != localPath {
+		t.Fatalf("scpArgs[2] = %q, want unmangled %q", captured.args[2], localPath)
+	}
+}
+
+func TestCopyFromBench_ErrorOnNonZeroExit(t *testing.T) {
+	_, restore := stubRunSCP(sshResult{
+		Stderr:   "scp: connection refused",
+		ExitCode: 1,
+		RunErr:   &exec.ExitError{},
+	})
+	defer restore()
+
+	b := bench.Bench{Host: "bench-1"}
+	err := CopyFromBench(context.Background(), b, "/remote/results.jsonl", "/local/results.jsonl")
+
+	var execErr *ExecError
+	if !errors.As(err, &execErr) {
+		t.Fatalf("err = %v (%T), want *ExecError", err, err)
+	}
+	if execErr.ExitCode != 1 {
+		t.Errorf("ExitCode = %d, want 1", execErr.ExitCode)
+	}
+	if execErr.Stderr != "scp: connection refused" {
+		t.Errorf("Stderr = %q, want %q", execErr.Stderr, "scp: connection refused")
+	}
+	wantArgs := []string{"/remote/results.jsonl", "/local/results.jsonl"}
+	if len(execErr.Args) != 2 || execErr.Args[0] != wantArgs[0] || execErr.Args[1] != wantArgs[1] {
+		t.Errorf("Args = %#v, want %#v", execErr.Args, wantArgs)
+	}
+}
+
+func TestCopyFromBench_CtxCancellationReturnsCtxErrDirectly(t *testing.T) {
+	_, restore := stubRunSCP(sshResult{ExitCode: 0})
+	defer restore()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	b := bench.Bench{Host: "bench-1"}
+	err := CopyFromBench(ctx, b, "/remote/results.jsonl", "/local/results.jsonl")
+
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("err = %v, want context.Canceled", err)
 	}
