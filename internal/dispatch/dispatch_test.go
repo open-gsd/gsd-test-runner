@@ -213,6 +213,27 @@ func TestDockerRunArgs_RequiredStructureAndCaps(t *testing.T) {
 	mustContainPair(t, got, "--cpus", "2")
 }
 
+// TestDockerRunArgs_IncludesInitFlag verifies that DockerRunArgs' returned
+// argv includes --init. This is preventive/defense-in-depth (issue #139):
+// this path's PID 1 is the real watchdog/entry-script process rather than
+// `sleep infinity`, so it is not the reported zombie-reaping bug directly,
+// but Node doesn't reap arbitrary orphaned grandchildren either, and --init
+// keeps both docker run call sites in the codebase consistent.
+func TestDockerRunArgs_IncludesInitFlag(t *testing.T) {
+	spec := baseSpec()
+	got := dispatch.DockerRunArgs(spec, "img:latest", 0, "/w:/w")
+	found := false
+	for _, a := range got {
+		if a == "--init" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("expected --init in DockerRunArgs, got: %v", got)
+	}
+}
+
 func TestDockerRunArgs_LabelsPresent(t *testing.T) {
 	spec := baseSpec()
 	spec.RunID = "run-xyz"
@@ -333,6 +354,7 @@ func TestDockerRunArgs_FullOrder(t *testing.T) {
 	got := dispatch.DockerRunArgs(spec, "sha256:deadbeef", 5000, "/mnt:/mnt")
 	want := []string{
 		"run", "--rm",
+		"--init",
 		"--pids-limit", "512",
 		"--memory", "2g",
 		"--cpus", "2",

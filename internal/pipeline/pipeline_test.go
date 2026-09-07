@@ -680,6 +680,32 @@ func TestStartContainer_Success(t *testing.T) {
 	}
 }
 
+// TestStartContainer_IncludesInitFlag verifies that StartContainer's docker
+// run argv includes --init so Docker's built-in tini reaps zombie processes
+// left behind by grandchildren reparented to PID 1 inside the container
+// (sleep infinity never calls wait()/waitpid() on them) — issue #139.
+func TestStartContainer_IncludesInitFlag(t *testing.T) {
+	calls := stubDockerRunCapture(t, "abc123def456\n", nil)
+	stubDockerRmCapture(t)
+
+	p, _ := newTestPipeline(t, 16)
+	err := p.StartContainer(context.Background())
+	if err != nil {
+		t.Fatalf("expected nil error, got: %v", err)
+	}
+	args := (*calls)[0]
+	found := false
+	for _, a := range args {
+		if a == "--init" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("expected --init in dockerRun args, got: %v", args)
+	}
+}
+
 func TestStartContainer_PassesPlatformWhenConfigured(t *testing.T) {
 	calls := stubDockerRunCapture(t, "abc123def456\n", nil)
 	stubDockerRmCapture(t)
@@ -694,7 +720,7 @@ func TestStartContainer_PassesPlatformWhenConfigured(t *testing.T) {
 		t.Fatalf("expected 1 dockerRun call, got %d", len(*calls))
 	}
 	wantArgs := []string{
-		"run", "--rm", "-d", "--workdir", "/work",
+		"run", "--rm", "-d", "--init", "--workdir", "/work",
 		"--platform", "linux/amd64",
 		"gsd-tester-linux:dev",
 		"sleep", "infinity",
@@ -926,7 +952,7 @@ func TestStartContainer_ZeroIdentity_LegacyArgv(t *testing.T) {
 		t.Fatalf("expected nil error, got: %v", err)
 	}
 	wantArgs := []string{
-		"run", "--rm", "-d", "--workdir", "/work",
+		"run", "--rm", "-d", "--init", "--workdir", "/work",
 		"gsd-tester-linux:dev",
 		"sleep", "infinity",
 	}

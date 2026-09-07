@@ -283,17 +283,26 @@ func (p *Pipeline) CopyWorktree(ctx context.Context) error {
 // can docker exec into it. --rm ensures docker removes it on stop, and
 // RunAll additionally defers a `docker rm -f` to handle the running case.
 //
+// --init runs Docker's built-in tini as PID 1's supervisor (issue #139):
+// `sleep infinity` as PID 1 never calls wait()/waitpid() on its children, so
+// any process reparented to PID 1 — which happens for any grandchild spawned
+// via `docker exec` (or by the test runner's own child-process usage) whose
+// immediate parent has already exited — becomes a permanent zombie once it
+// exits. tini reaps those zombies immediately. Confirmed live: identical
+// containers with and without --init showed permanent `[sleep]` zombies vs.
+// zero zombies, respectively.
+//
 // When p.ident.RunID is non-empty (the normal internal/runner path), the
 // container is also named and labeled per ADR-0029 so the Tier-2 reaper can
 // see and sweep it: --name (runspec.BuildContainerName) plus the run-id,
 // deadline, branch, and target labels — mirroring dispatch.go's DockerRunArgs
 // label set. When RunID is empty (zero ContainerIdentity, tests), the argv is
-// emitted exactly as pre-ADR-0029: no --name, no labels.
+// emitted exactly as pre-ADR-0029 (plus --init): no --name, no labels.
 func (p *Pipeline) StartContainer(ctx context.Context) error {
 	return p.runLeg(ctx, LegStartContainer, func(_ context.Context) (string, error) {
 		imageRef := string(p.image)
 		containerName := ""
-		args := []string{"run", "--rm", "-d", "--workdir", "/work"}
+		args := []string{"run", "--rm", "-d", "--init", "--workdir", "/work"}
 		if p.ident.RunID != "" {
 			containerName = runspec.BuildContainerName(p.ident.BranchSlug, p.ident.Cell, p.ident.RunID)
 			args = append(args,
