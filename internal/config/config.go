@@ -114,7 +114,7 @@ type rawBench struct {
 	Name     string `toml:"name"`
 	Host     string `toml:"host"`
 	OS       string `toml:"os"`
-	Runtime  string `toml:"runtime,omitempty"`  // "docker" (default; all benches today) | "container" (reserved for future Apple Containers)
+	Runtime  string `toml:"runtime,omitempty"`  // "docker" (default; all benches today) | "container" (reserved, unused — Apple Containers, ADR-0020/0030) | "tart" (macOS-native via Tart, ADR-0030)
 	Platform string `toml:"platform,omitempty"` // optional OCI platform override, e.g. "linux/amd64"
 	Capacity int    `toml:"capacity,omitempty"` // max concurrent Tester containers; 0 = unset (runner defaults to the Bench's NCPU, floored to 1)
 }
