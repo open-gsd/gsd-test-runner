@@ -6,7 +6,21 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 )
+
+// SafetyNetGrace is the extra grace period, beyond a container's own
+// deadline, before Sweep will reap it regardless of branch (the "safety net"
+// tier — see Sweep). Cross-branch leaks (a container leaked on branch A that
+// is never automatically reaped unless branch A is worked again on the same
+// Bench, per ADR-0029 §3's deliberate branch scoping) previously survived
+// indefinitely — observed on the order of a day in production. SafetyNetGrace
+// bounds that: it is conservative enough to give a human a real diagnostic
+// window after a container's deadline passes (so an operator actively
+// investigating a hang on another branch is not surprised mid-diagnosis), and
+// short enough to guarantee eventual cleanup in hours rather than days. The
+// exact value is a judgment call, not a derived constant.
+const SafetyNetGrace = 6 * time.Hour
 
 // Runner executes a docker CLI invocation (args after the `docker` binary) and
 // returns its stdout. In production this is backed by internal/dockerexec,
@@ -115,22 +129,39 @@ func OwnedBy(containers []Container, branchSlug string) []Container {
 	return out
 }
 
-// Sweep lists run containers, selects those past their deadline at nowMs that
-// belong to the named branch (empty branchSlug = all labeled containers,
-// preserving the pre-ADR-0029 behavior), kills each, and returns the reaped
-// slice. It tolerates already-gone containers — if a Kill fails but the
-// container is no longer present (e.g. it exited and was removed by --rm, or a
-// concurrent sweeper beat us to it), the error is suppressed and the sweep
-// continues (#104). Only genuine kill failures (the container is still
-// running) are returned as errors, joined via errors.Join so all remaining
-// containers are still attempted.
+// Sweep lists run containers and reaps the union of two tiers, kills each,
+// and returns the reaped slice:
+//
+//  1. Branch-scoped: containers owned by branchSlug (ADR-0029 §3; empty
+//     branchSlug = every labeled container, the pre-ADR-0029 operator escape
+//     hatch) whose deadline has passed at nowMs. This is the fast, precise
+//     tier — an invocation reaps its own branch's overdue containers on
+//     next contact.
+//  2. Safety net: ANY container (any branch, unfiltered by branchSlug)
+//     whose deadline passed more than SafetyNetGrace ago. This closes the
+//     cross-branch leak gap the branch-scoped tier deliberately leaves open —
+//     a container leaked on branch A is no longer stuck waiting for branch A
+//     to be worked again on the same Bench; it is guaranteed eventual
+//     cleanup, bounded by SafetyNetGrace, from any invocation that touches
+//     the Bench.
+//
+// The two sets are unioned, deduped by Container.ID (a container can be
+// overdue in both tiers; it is only killed/reported once). It tolerates
+// already-gone containers — if a Kill fails but the container is no longer
+// present (e.g. it exited and was removed by --rm, or a concurrent sweeper
+// beat us to it), the error is suppressed and the sweep continues (#104).
+// Only genuine kill failures (the container is still running) are returned
+// as errors, joined via errors.Join so all remaining containers are still
+// attempted.
 func Sweep(ctx context.Context, run Runner, nowMs int64, branchSlug string) ([]Container, error) {
 	containers, err := List(ctx, run)
 	if err != nil {
 		return nil, err
 	}
 	owned := OwnedBy(containers, branchSlug)
-	overdue := Overdue(owned, nowMs)
+	branchScoped := Overdue(owned, nowMs)
+	safetyNet := Overdue(containers, nowMs-int64(SafetyNetGrace/time.Millisecond))
+	overdue := unionByID(branchScoped, safetyNet)
 	var errs []error
 	for _, c := range overdue {
 		if err := Kill(ctx, run, c.ID); err != nil {
@@ -148,4 +179,28 @@ func Sweep(ctx context.Context, run Runner, nowMs int64, branchSlug string) ([]C
 		return overdue, errors.Join(errs...)
 	}
 	return overdue, nil
+}
+
+// unionByID returns a, followed by any Containers in b whose ID is not
+// already present in a, preserving each input slice's own relative order.
+// Used by Sweep to merge its branch-scoped and safety-net overdue sets
+// without killing or reporting the same container twice.
+func unionByID(a, b []Container) []Container {
+	if len(a) == 0 && len(b) == 0 {
+		return nil
+	}
+	seen := make(map[string]bool, len(a))
+	out := make([]Container, 0, len(a)+len(b))
+	for _, c := range a {
+		seen[c.ID] = true
+		out = append(out, c)
+	}
+	for _, c := range b {
+		if seen[c.ID] {
+			continue
+		}
+		seen[c.ID] = true
+		out = append(out, c)
+	}
+	return out
 }

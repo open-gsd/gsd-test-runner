@@ -144,6 +144,28 @@ Reverse the install with `gsd-test install-agent-hooks --uninstall`. The manifes
 | `0` | Install or uninstall completed successfully. |
 | `2` | Could not determine the home directory (`--global`), find the repo root, or apply the install/uninstall. |
 
+## `gsd-test sweep`
+
+Manually runs the Tier-2 reaper sweep (see [Container labels](#container-labels)) against one or more Benches — the operator escape hatch onto `reaper.Sweep`'s unscoped mode, which no other command exposes directly (every other run/dispatch path always scopes the sweep to its own invocation's branch). **Destructive by design: this kills running containers.**
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--bench <name>` | (unset) | Sweep only the named Bench. Default: every Bench in the loaded config. |
+| `--branch <slug>` | (current branch) | Sweep scoped to this branch slug. Default: the branch currently checked out at the working directory, resolved via `git rev-parse --abbrev-ref HEAD` and slugified the same way `gsd-test run`/`submit --execute` do (ADR-0029). Mutually exclusive with `--all`. |
+| `--all` | off | Sweep every overdue container on the target Bench(es), regardless of branch — the full unscoped escape hatch (`reaper.Sweep(..., "")`). Mutually exclusive with `--branch`. |
+| `--config <path>` | (standard config search) | `config.toml` path. |
+
+**Default behavior (no flags) is branch-scoped**, identical in safety to the automatic on-next-contact sweep every `gsd-test run` / `submit --execute` already performs before starting a run: only containers whose `sh.gsd-test.branch` label matches the current branch are killed. Pass `--all` to widen the blast radius to every Bench-wide overdue container; this is never the default precisely because it kills containers a human may not expect.
+
+For each targeted Bench, `sweep` prints what it found and what it reaped (container ID, name, and branch) or `nothing to clean up` when there was nothing overdue. Every kill and error is written to stdout/stderr as it happens — the command does not batch its report at the end.
+
+### Exit codes
+
+| Code | Meaning |
+|------|---------|
+| `0` | Every targeted Bench's sweep completed without error — including when nothing was reaped. |
+| `2` | A named `--bench` was not found in the config, no Benches are configured, a Bench was unreachable, or a kill genuinely failed on some Bench. |
+
 ## Run spec
 
 A single JSON object. Unknown fields are ignored; invalid values are rejected with an error naming the offending field.
@@ -287,6 +309,8 @@ Each run container carries these labels (reverse-DNS, matching the image-version
 | `sh.gsd-test.image-version` | (On the image, not the container) the version sentinel verified before each run. |
 
 The container is also launched with `--name gsd-test-<branch-slug>-<short-runId>` (ADR-0029) so a Bench operator can read the branch under test directly off `docker ps`. The slug is derived from the run spec's `prBranch` (preferred) or `base`; the 8-character `runId` tail disambiguates concurrent runs of the same branch.
+
+**Safety-net tier (ADR-0029 §6 amendment).** Branch-scoped sweeping (above) intentionally leaves a container from another branch alone. Without a further backstop that gap is unbounded: a container leaked on branch A is never automatically reaped unless branch A is worked again on the same Bench. Every `reaper.Sweep` call (the automatic on-next-contact sweep AND the manual [`gsd-test sweep`](#gsd-test-sweep) command) additionally reaps ANY container, regardless of branch, whose deadline passed more than `reaper.SafetyNetGrace` (6 hours) ago — bounding a cross-branch leak to hours rather than the indefinite gap the scoped tier alone leaves.
 
 ## Resource caps
 

@@ -3,8 +3,10 @@ package reaper
 import (
 	"context"
 	"errors"
+	"fmt"
 	"reflect"
 	"testing"
+	"time"
 )
 
 // TestParsePS_IncludesNameAndBranch verifies the extended docker ps format
@@ -118,6 +120,118 @@ func TestSweep_BranchScoped_LeavesFutureDeadlineAlone(t *testing.T) {
 	}
 	if len(f.killed) != 0 {
 		t.Errorf("killed = %v, want none", f.killed)
+	}
+}
+
+// Fixed synthetic "now" for the safety-net tests below, chosen large enough
+// that nowMs - SafetyNetGrace stays comfortably positive (avoids any
+// int64-underflow edge cases while still using the deterministic synthetic-ms
+// convention the rest of this package's tests use — never real wall-clock
+// time.Now()).
+const safetyNetNowMs = int64(1_700_000_000_000)
+
+// safetyNetGraceMs is SafetyNetGrace expressed in the same millisecond units
+// as every Container.DeadlineMs / nowMs value in this package.
+var safetyNetGraceMs = int64(SafetyNetGrace / time.Millisecond)
+
+// TestSweep_SafetyNet_LeavesRecentCrossBranchAlone verifies the safety net's
+// diagnostic window: a different-branch container whose deadline passed only
+// recently (well within SafetyNetGrace) is left alone by both tiers — an
+// operator actively diagnosing it on another branch is not surprised
+// mid-investigation.
+func TestSweep_SafetyNet_LeavesRecentCrossBranchAlone(t *testing.T) {
+	recentDeadline := safetyNetNowMs - int64(time.Hour/time.Millisecond) // 1h overdue, << 6h grace
+	psOut := []byte(fmt.Sprintf("other-ctr\t%d\trun-x\tgsd-test-fix-bar-xxxxxxxx\tfix-bar\n", recentDeadline))
+	f := &fakeRunner{psOut: psOut}
+	reaped, err := Sweep(context.Background(), f.run, safetyNetNowMs, "fix-foo")
+	if err != nil {
+		t.Fatalf("Sweep: %v", err)
+	}
+	if len(reaped) != 0 {
+		t.Errorf("reaped = %+v, want none (within SafetyNetGrace diagnostic window)", reaped)
+	}
+	if len(f.killed) != 0 {
+		t.Errorf("killed = %v, want none", f.killed)
+	}
+}
+
+// TestSweep_SafetyNet_ReapsCrossBranchPastGrace verifies the safety-net tier
+// itself: a different-branch container whose deadline passed more than
+// SafetyNetGrace ago IS reaped even though branchSlug doesn't match — this is
+// the fix for the cross-branch leak (ADR-0029 §3's branch scoping previously
+// left such a container unreaped forever).
+func TestSweep_SafetyNet_ReapsCrossBranchPastGrace(t *testing.T) {
+	longOverdue := safetyNetNowMs - safetyNetGraceMs - int64(time.Hour/time.Millisecond) // grace + 1h overdue
+	psOut := []byte(fmt.Sprintf("other-ctr\t%d\trun-y\tgsd-test-fix-bar-yyyyyyyy\tfix-bar\n", longOverdue))
+	f := &fakeRunner{psOut: psOut}
+	reaped, err := Sweep(context.Background(), f.run, safetyNetNowMs, "fix-foo")
+	if err != nil {
+		t.Fatalf("Sweep: %v", err)
+	}
+	if len(reaped) != 1 || reaped[0].ID != "other-ctr" {
+		t.Errorf("reaped = %+v, want exactly [other-ctr]", reaped)
+	}
+	if !reflect.DeepEqual(f.killed, []string{"other-ctr"}) {
+		t.Errorf("killed = %v, want [other-ctr]", f.killed)
+	}
+}
+
+// TestSweep_SafetyNet_MixedTiers exercises both tiers together in one Sweep
+// call: a same-branch overdue container (caught by the branch-scoped tier), a
+// cross-branch container overdue past SafetyNetGrace (caught by the safety
+// net), and a cross-branch container only recently overdue (caught by
+// neither) — asserting exactly the right subset is killed.
+func TestSweep_SafetyNet_MixedTiers(t *testing.T) {
+	sameBranchOverdue := safetyNetNowMs - 1000                                               // trivially overdue, same branch
+	longCrossBranch := safetyNetNowMs - safetyNetGraceMs - int64(time.Hour/time.Millisecond) // past grace, other branch
+	recentCrossBranch := safetyNetNowMs - int64(time.Hour/time.Millisecond)                  // within grace, other branch
+	psOut := []byte(
+		fmt.Sprintf("same-ctr\t%d\trun-a\tgsd-test-fix-foo-aaaaaaaa\tfix-foo\n", sameBranchOverdue) +
+			fmt.Sprintf("long-ctr\t%d\trun-b\tgsd-test-fix-bar-bbbbbbbb\tfix-bar\n", longCrossBranch) +
+			fmt.Sprintf("recent-ctr\t%d\trun-c\tgsd-test-fix-baz-cccccccc\tfix-baz\n", recentCrossBranch),
+	)
+	f := &fakeRunner{psOut: psOut}
+	reaped, err := Sweep(context.Background(), f.run, safetyNetNowMs, "fix-foo")
+	if err != nil {
+		t.Fatalf("Sweep: %v", err)
+	}
+
+	gotIDs := make(map[string]bool, len(reaped))
+	for _, c := range reaped {
+		gotIDs[c.ID] = true
+	}
+	wantIDs := map[string]bool{"same-ctr": true, "long-ctr": true}
+	if !reflect.DeepEqual(gotIDs, wantIDs) {
+		t.Errorf("reaped IDs = %v, want %v (recent-ctr must survive: neither same-branch nor past grace)", gotIDs, wantIDs)
+	}
+
+	gotKilled := make(map[string]bool, len(f.killed))
+	for _, id := range f.killed {
+		gotKilled[id] = true
+	}
+	if !reflect.DeepEqual(gotKilled, wantIDs) {
+		t.Errorf("killed = %v, want %v", gotKilled, wantIDs)
+	}
+}
+
+// TestSweep_SafetyNet_EmptyBranchSlugIsNoOpSuperset verifies that when
+// branchSlug == "" (the existing unscoped operator escape hatch), unioning in
+// the safety-net tier is a no-op: the branch-scoped tier already equals
+// "everything overdue" (OwnedBy("") returns every container unfiltered), so
+// adding the safety-net set changes nothing.
+func TestSweep_SafetyNet_EmptyBranchSlugIsNoOpSuperset(t *testing.T) {
+	longCrossBranch := safetyNetNowMs - safetyNetGraceMs - int64(time.Hour/time.Millisecond)
+	psOut := []byte(
+		fmt.Sprintf("a-ctr\t%d\trun-a\tgsd-test-fix-foo-aaaaaaaa\tfix-foo\n", safetyNetNowMs-1000) +
+			fmt.Sprintf("b-ctr\t%d\trun-b\tgsd-test-fix-bar-bbbbbbbb\tfix-bar\n", longCrossBranch),
+	)
+	f := &fakeRunner{psOut: psOut}
+	reaped, err := Sweep(context.Background(), f.run, safetyNetNowMs, "")
+	if err != nil {
+		t.Fatalf("Sweep: %v", err)
+	}
+	if len(reaped) != 2 {
+		t.Errorf("reaped = %+v, want both (empty branchSlug already reaps everything overdue)", reaped)
 	}
 }
 
