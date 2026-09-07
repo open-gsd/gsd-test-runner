@@ -55,8 +55,25 @@ source "tart-cli" "tart" {
   disk_size_gb = 50
   ssh_username = "admin"
   ssh_password = "admin"
-  ssh_timeout  = "120s"
+  ssh_timeout  = "180s"
   headless     = true
+
+  # CONFIRMED real failure (studio-mac-mini.local, 2026-09-07): the very
+  # first build attempt against a genuinely fresh clone errored "Timeout
+  # waiting for SSH" after ssh_timeout elapsed, even though a manual
+  # clone+boot+SSH reproduction of the exact same base image had the guest
+  # SSH-reachable (real password auth, not just an open TCP port) in well
+  # under 30s. This matches a known, still-open upstream issue
+  # (cirruslabs/packer-plugin-tart#79, "Occasional Timeout waiting for
+  # SSH"): Virtualization.framework's own VM-creation process can still be
+  # settling in the background when the plugin starts polling SSH.
+  # create_grace_time is the plugin's own documented parameter for exactly
+  # this race ("time to wait after finishing the installation process").
+  # ssh_timeout was also bumped 120s -> 180s (matching the upstream
+  # reporter's config) purely for extra headroom on a slower/loaded Bench;
+  # it was not itself the cause (SSH was reachable well inside the old
+  # 120s budget once genuinely ready).
+  create_grace_time = "30s"
 }
 
 build {
