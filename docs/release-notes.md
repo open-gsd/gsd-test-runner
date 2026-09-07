@@ -15,10 +15,21 @@ This page summarizes the recent releases so you can quickly decide what to adopt
 - `v1.7.0`: branch-derived container names — `docker ps` on a Bench shows `gsd-test-<branch>-<runId>` instead of `keen_euclid`, and the Tier-2 reaper reaps only containers from the branch it is working on
 - `v1.8.0`: extends that to the standard `gsd-test` path (v1.7.0 covered run-and-die only) and fixes the leak behind it — Pipeline containers were unlabeled, so nothing ever reaped the ones a crashed run left behind
 - `v1.9.0`: macOS Bench via Tart (`runtime = "tart"`) — a real macOS guest with a hypervisor-enforced memory cap, additive alongside Docker-on-macOS — plus automated leak cleanup for both runtimes, a liveness signal for long Tart runs, and a manual `gsd-test sweep` command
+- `v1.9.1`: run containers no longer accumulate unreaped zombie processes over the course of a run
 
 ## Unreleased
 
 _Nothing yet — changes land here before the next tagged release._
+
+## v1.9.1
+
+### Fixed
+
+- **Run containers no longer accumulate unreaped zombie processes** (issue #139). The standard multi-OS/Node-matrix path launches every run container with `sleep infinity` as PID 1, which never calls `wait()`/`waitpid()` on its children. Any process reparented to PID 1 — which happens for any grandchild spawned via `docker exec`, or by the test runner's own child-process usage, whose immediate parent has already exited — became a permanent zombie once it exited. On a long-running or heavily-parallel suite on a shared Bench, this could accumulate into the hundreds and correlate with real CPU pressure degrading other concurrent runs on the same host. Every run container now launches with Docker's built-in `--init` (`tini`), which reaps them immediately — no image/Dockerfile change needed. Applies to both the standard `gsd-test` path and run-and-die.
+
+### Why it matters
+
+No new features — a shared-Bench stability fix. If you've run `gsd-test` against a Bench other people or CI also use, this closes a real, confirmed leak: reproduced live with 118 accumulated zombies and correlated host CPU pressure (`avg10=85.91`) on one report. The fix is entirely in the `gsd-test` binary's own `docker run` invocation — upgrade the binary and you're covered; no Tester Image rebuild or config change needed.
 
 ## v1.9.0
 
