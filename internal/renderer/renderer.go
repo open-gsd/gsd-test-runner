@@ -192,6 +192,17 @@ func (r *Renderer) renderTTY(osName string, ev pipeline.Event) {
 	case pipeline.EventTestFail:
 		// Always loud, and enriched with file:line · class · msg (Option I).
 		s = fmt.Sprintf("%s   %s\n", prefix, failLine(ev))
+	case pipeline.EventLiveness:
+		// The Tart-side analogue of heartbeat's "still alive" UX goal (see
+		// that method's doc comment) — NOT the same mechanism, NOT renamed
+		// or reused: heartbeat throttles Docker's own per-test pass count,
+		// this renders a periodic tartpipeline-emitted liveness statement
+		// verbatim. Suppressed in VerbosityQuiet, matching heartbeat's own
+		// quiet-suppression; shown at VerbosityNormal and VerbosityFull.
+		if r.verbosity == VerbosityQuiet {
+			return
+		}
+		s = fmt.Sprintf("%s   … %s\n", prefix, ev.Detail)
 	default:
 		return
 	}

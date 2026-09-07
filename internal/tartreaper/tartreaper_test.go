@@ -163,6 +163,89 @@ func contains(s, substr string) bool {
 	return false
 }
 
+// --- Probe ---------------------------------------------------------
+
+// realTartGetJSON is the CONFIRMED real `tart get <vmName> --format json`
+// shape from a live installation (docs/adr/0030-macos-bench-via-tart.md
+// Decision 5 / this package's doc comment) — a single JSON object, not an
+// array.
+const realTartGetJSON = `{
+  "Display" : "1920x1200",
+  "Memory" : 4096,
+  "OS" : "darwin",
+  "Disk" : 50,
+  "Size" : 33,
+  "DiskFormat" : "APFS",
+  "State" : "running",
+  "CPU" : 4,
+  "Running" : true
+}`
+
+func TestProbe_ParsesRealShape_Running(t *testing.T) {
+	var gotArgs []string
+	stubRunTart(t, func(_ context.Context, _ bench.Bench, args []string) (string, error) {
+		gotArgs = args
+		return realTartGetJSON, nil
+	})
+	running, state, err := Probe(context.Background(), testBench(), "gsd-tart-macos-run1")
+	if err != nil {
+		t.Fatalf("Probe: %v", err)
+	}
+	if !running {
+		t.Error("expected running=true")
+	}
+	if state != "running" {
+		t.Errorf("expected state=running, got %q", state)
+	}
+	if len(gotArgs) != 4 || gotArgs[0] != "get" || gotArgs[1] != "gsd-tart-macos-run1" {
+		t.Errorf("unexpected tart args: %v", gotArgs)
+	}
+}
+
+func TestProbe_ParsesRealShape_NotRunning(t *testing.T) {
+	stubRunTart(t, func(_ context.Context, _ bench.Bench, args []string) (string, error) {
+		return `{"State":"stopped","Running":false}`, nil
+	})
+	running, state, err := Probe(context.Background(), testBench(), "gsd-tart-macos-run1")
+	if err != nil {
+		t.Fatalf("Probe: %v", err)
+	}
+	if running {
+		t.Error("expected running=false")
+	}
+	if state != "stopped" {
+		t.Errorf("expected state=stopped, got %q", state)
+	}
+}
+
+func TestProbe_ExitCode2_ReturnsVMNotFoundError(t *testing.T) {
+	stubRunTart(t, func(context.Context, bench.Bench, []string) (string, error) {
+		return "", &tartexec.ExecError{ExitCode: 2, Stderr: `the specified VM "gsd-tart-macos-run1" does not exist`}
+	})
+	_, _, err := Probe(context.Background(), testBench(), "gsd-tart-macos-run1")
+	var nfe *VMNotFoundError
+	if !errors.As(err, &nfe) {
+		t.Fatalf("expected *VMNotFoundError, got %T: %v", err, err)
+	}
+	if nfe.Name != "gsd-tart-macos-run1" {
+		t.Errorf("expected Name=gsd-tart-macos-run1, got %q", nfe.Name)
+	}
+}
+
+func TestProbe_OtherFailure_ReturnsGenericError(t *testing.T) {
+	stubRunTart(t, func(context.Context, bench.Bench, []string) (string, error) {
+		return "", &tartexec.ExecError{ExitCode: 255, Stderr: "ssh down"}
+	})
+	_, _, err := Probe(context.Background(), testBench(), "gsd-tart-macos-run1")
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	var nfe *VMNotFoundError
+	if errors.As(err, &nfe) {
+		t.Fatal("expected a generic error, not *VMNotFoundError, for a non-exit-2 failure")
+	}
+}
+
 // --- Overdue / OwnedBy ---------------------------------------------------------
 
 func TestOverdue_ExcludesStatelessAndFutureAndUnset(t *testing.T) {

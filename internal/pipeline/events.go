@@ -24,6 +24,18 @@ const (
 	// slow consumer. Detail contains the drop count. Failure events are never
 	// dropped. (B-7 fix.)
 	EventDroppedOutput
+	// EventLiveness is a synthetic, periodic marker emitted while a
+	// long-running, otherwise-silent step is in progress. It is NOT a test
+	// result and NOT a leg transition — it carries (via Detail) a
+	// human-readable statement of what is currently known about whether the
+	// underlying compute resource (e.g. a Tart VM) is still alive. Leg is
+	// set to the leg it concerns. Introduced for
+	// internal/tartpipeline.Pipeline.RunTests, whose single long blocking
+	// guest-exec call would otherwise produce total silence indistinguishable
+	// from a hung VM — see that method's doc comment. internal/pipeline.Pipeline
+	// (Docker) does not emit this kind: Docker's live JSONL-tail already
+	// solves the same underlying "is this still alive" concern.
+	EventLiveness
 )
 
 func (k EventKind) String() string {
@@ -44,6 +56,8 @@ func (k EventKind) String() string {
 		return "test_fail"
 	case EventDroppedOutput:
 		return "dropped_output"
+	case EventLiveness:
+		return "liveness"
 	}
 	return fmt.Sprintf("event(%d)", int(k))
 }
