@@ -98,13 +98,22 @@ func DockerRunArgs(spec runspec.Spec, imageID string, deadlineEpochMs int64, wor
 	}
 	sort.Strings(envKeys)
 
-	// Pre-calculate capacity: base (12) + labels (6) + env pairs (2*N) + image (1).
+	// Pre-calculate capacity: base (13) + labels (6) + env pairs (2*N) + image (1).
 	// --name + sh.gsd-test.branch label are ADR-0029: the name makes the branch
 	// legible at `docker ps`; the label is the machine-readable ownership signal
 	// the Tier-2 reaper scopes on. Both derive from the same Spec.BranchSlug so
 	// they cannot drift (parity invariant, known-defect gauntlet).
+	//
+	// --init is defense-in-depth for issue #139: unlike pipeline.go's
+	// StartContainer (whose PID 1 is `sleep infinity`, which never reaps),
+	// this run-and-die container's PID 1 is the watchdog/entry-script process.
+	// That script doesn't reap arbitrary orphaned grandchildren either (Node
+	// itself has no wait()-on-all-children behavior), so a zombie is still
+	// possible here; --init keeps both docker-run call sites consistent rather
+	// than relying on this path's entry script to happen to exit quickly.
 	base := []string{
 		"run", "--rm",
+		"--init",
 		"--pids-limit", DefaultPidsLimit,
 		"--memory", DefaultMemory,
 		"--cpus", DefaultCPUs,
