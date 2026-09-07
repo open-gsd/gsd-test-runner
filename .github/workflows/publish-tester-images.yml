@@ -289,3 +289,167 @@ jobs:
             exit 1
           fi
           echo "Sentinel label OK on macOS alias: $LABEL (node-major $NODE_LABEL)"
+
+  publish-macos-tart:
+    # Real macOS-native Tart image (ADR-0030 Phase 4, issue #134) -- the
+    # opt-in RuntimeTart path, additive alongside tag-macos-alias (which
+    # remains the default macOS path per ADR-0030 Decision 2). This job does
+    # NOT alias the Linux image; it builds a genuine macOS guest image via
+    # Packer + the cirruslabs/tart plugin (dockerfiles/macos-tart.pkr.hcl).
+    #
+    # runs-on targets a SELF-HOSTED runner, not macos-26, because whether
+    # GitHub-hosted macOS runners expose the nested-virtualization CPU
+    # features Tart's Virtualization.framework usage needs is NOT confirmed
+    # (ADR-0030 research). Real-world Tart CI setups found in research
+    # (Cirrus Runners, Cirrus Labs' own templates) are self-hosted Mac
+    # fleets. This project's Bench model is already "the developer's own Mac
+    # hardware" (ADR-0007), so self-hosted matches existing philosophy too.
+    runs-on: [self-hosted, macos, tart]
+    strategy:
+      matrix:
+        # Keep in sync with DEFAULT_NODE_MAJOR above; add a line here to
+        # publish another major.
+        node: ["22", "24"]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+
+      - name: Resolve version
+        id: version
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            VERSION="${{ inputs.version }}"
+          else
+            # Strip leading "v" from tag
+            VERSION="${GITHUB_REF_NAME#v}"
+          fi
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "tag=v${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "Publishing as version: ${VERSION} (tag: v${VERSION})"
+
+      - name: Ensure packer + tart are available
+        run: |
+          # Self-hosted runner may already have these from a prior run --
+          # idempotent, house-style check (mirrors INSTALL_GSD_TEST.sh's
+          # `command -v jq` pattern) rather than a bare `brew install` that
+          # would just no-op-but-still-cost-time on every run anyway.
+          if ! command -v packer >/dev/null 2>&1; then
+            brew install packer
+          fi
+          if ! command -v tart >/dev/null 2>&1; then
+            brew install cirruslabs/cli/tart
+          fi
+          if ! command -v sshpass >/dev/null 2>&1; then
+            brew install cirruslabs/cli/sshpass
+          fi
+          packer version
+          tart --version
+          sshpass -V
+
+      - name: Log in to GHCR (Tart)
+        run: |
+          # TODO(verify): `tart login` was not hands-on-verified this
+          # session -- inferred from Tart's documented command list. This
+          # matches the shape `docker/login-action` uses for the other jobs
+          # (username + password/token via stdin), adapted to Tart's own
+          # login command. Confirm the exact flag names against a real Tart
+          # install before relying on this in production.
+          echo "${{ secrets.GITHUB_TOKEN }}" | tart login "${{ env.REGISTRY }}" -u "${{ github.actor }}" --password-stdin
+
+      - name: packer init
+        run: packer init dockerfiles/macos-tart.pkr.hcl
+
+      - name: packer build
+        run: |
+          packer build \
+            -var "node_version=${{ matrix.node }}" \
+            -var "image_version=${{ steps.version.outputs.tag }}" \
+            dockerfiles/macos-tart.pkr.hcl
+
+      - name: Push macOS Tart Tester Image
+        id: push
+        run: |
+          TAG="${{ steps.version.outputs.tag }}"
+          NODE="${{ matrix.node }}"
+          # Matches dockerfiles/macos-tart.pkr.hcl's vm_name template.
+          LOCAL_VM="gsd-tester-macos-tart-node${NODE}"
+          IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/gsd-tester-macos-tart:${TAG}-node${NODE}"
+
+          tart push "$LOCAL_VM" "$IMAGE" \
+            --label "sh.gsd-test.image-version=${TAG}" \
+            --label "sh.gsd-test.node-major=${NODE}"
+          echo "image=${IMAGE}" >> "$GITHUB_OUTPUT"
+
+          # Only the default major also gets the plain (un-suffixed) tag and
+          # :latest, matching the existing publish-linux/publish-windows
+          # conditional-tag pattern.
+          if [[ "$NODE" == "${{ env.DEFAULT_NODE_MAJOR }}" ]]; then
+            IMAGE_PLAIN="${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/gsd-tester-macos-tart:${TAG}"
+            IMAGE_LATEST="${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/gsd-tester-macos-tart:latest"
+            tart push "$LOCAL_VM" "$IMAGE_PLAIN" \
+              --label "sh.gsd-test.image-version=${TAG}" \
+              --label "sh.gsd-test.node-major=${NODE}"
+            tart push "$LOCAL_VM" "$IMAGE_LATEST" \
+              --label "sh.gsd-test.image-version=${TAG}" \
+              --label "sh.gsd-test.node-major=${NODE}"
+          fi
+
+      - name: Verify sentinel file (boot pushed image, cat the sentinel)
+        run: |
+          # No confirmed Tart equivalent of `docker image inspect` for
+          # reading labels back off a pulled image (ADR-0030 Decision 3), so
+          # verification instead boots a fresh instance of the just-pushed
+          # image and reads the in-guest sentinel file baked by
+          # dockerfiles/macos-tart-provision.sh -- same fail-loud spirit as
+          # the Docker jobs' label-inspect steps, adapted to Tart's actual
+          # read mechanism (SSH, ADR-0030 Decision 4). `tart exec` via the
+          # Tart Guest Agent was tried first and found to fail unreliably
+          # and silently (exit 125, empty output) against a real, freshly
+          # booted headless Cirrus Labs guest, even with the Guest Agent
+          # confirmed running -- so this uses SSH with Cirrus Labs' own
+          # documented default admin/admin guest credentials instead,
+          # matching the two-hop pattern internal/tartexec.Exec implements.
+          TAG="${{ steps.version.outputs.tag }}"
+          NODE="${{ matrix.node }}"
+          IMAGE="${{ steps.push.outputs.image }}"
+          VERIFY_VM="gsd-tester-macos-tart-verify-node${NODE}"
+
+          tart clone "$IMAGE" "$VERIFY_VM"
+          tart run "$VERIFY_VM" --no-graphics &
+          RUN_PID=$!
+
+          GUEST_IP=$(tart ip "$VERIFY_VM" --wait 90)
+          if [[ -z "$GUEST_IP" ]]; then
+            echo "::error::Failed to resolve guest IP for $VERIFY_VM within 90s"
+            tart stop "$VERIFY_VM" || true
+            kill "$RUN_PID" 2>/dev/null || true
+            tart delete "$VERIFY_VM" || true
+            exit 1
+          fi
+
+          SSH_OPTS=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10)
+
+          # sshd needs a few seconds after IP resolution before it actually
+          # accepts connections -- poll for readiness the same way the old
+          # tart-exec loop did, just over SSH instead.
+          for i in $(seq 1 30); do
+            if sshpass -p admin ssh "${SSH_OPTS[@]}" admin@"$GUEST_IP" -- true >/dev/null 2>&1; then
+              break
+            fi
+            sleep 2
+          done
+
+          SENTINEL=$(sshpass -p admin ssh "${SSH_OPTS[@]}" admin@"$GUEST_IP" -- cat /opt/gsd-test/image-version)
+          STATUS=0
+          if [[ "$SENTINEL" != "$TAG" ]]; then
+            echo "::error::Sentinel file mismatch: expected '$TAG', got '$SENTINEL'"
+            STATUS=1
+          else
+            echo "Sentinel file OK: $SENTINEL (node-major $NODE)"
+          fi
+
+          tart stop "$VERIFY_VM" || true
+          kill "$RUN_PID" 2>/dev/null || true
+          tart delete "$VERIFY_VM" || true
+
+          exit $STATUS
