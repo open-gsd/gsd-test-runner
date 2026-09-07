@@ -73,6 +73,12 @@ Node version matrix (test every supported Node LTS line, fanned out across your 
 - **[Node matrix How-to Guides](docs/node-matrix-how-to.md)** — Test several Node versions, tune Bench capacity, read per-cell results, move with the LTS schedule
 - **[Node matrix Reference](docs/node-matrix-reference.md)** — The `[node]` table, `capacity`, `--node`, cell identity, image tags, exit codes
 
+macOS via Tart (a real macOS-native guest, memory-capped, opt-in alongside Docker-on-macOS):
+
+- **[macOS via Tart](docs/macos-tart.md)** — Why `RuntimeTart` exists and how it relates to Docker-on-macOS
+- **[macOS via Tart How-to Guides](docs/macos-tart-how-to.md)** — Install Tart, configure a Bench, build/publish a Tester Image, diagnose a stuck run, clean up a leaked VM
+- **[macOS via Tart Reference](docs/macos-tart-reference.md)** — The `runtime = "tart"` value, the 8-leg sequence, `DefaultMemoryMB`, known limitations, the bake recipe, the `publish-macos-tart` CI job
+
 ## How it Works (30-second version)
 
 1. You run `gsd-test` from inside your Node project's git repo.
