@@ -146,7 +146,9 @@ Reverse the install with `gsd-test install-agent-hooks --uninstall`. The manifes
 
 ## `gsd-test sweep`
 
-Manually runs the Tier-2 reaper sweep (see [Container labels](#container-labels)) against one or more Benches — the operator escape hatch onto `reaper.Sweep`'s unscoped mode, which no other command exposes directly (every other run/dispatch path always scopes the sweep to its own invocation's branch). **Destructive by design: this kills running containers.**
+Manually runs the Tier-2 reaper sweep (see [Container labels](#container-labels)) against one or more Benches — the operator escape hatch onto `reaper.Sweep`'s unscoped mode, which no other command exposes directly (every other run/dispatch path always scopes the sweep to its own invocation's branch). **Destructive by design: this kills running containers/VMs.**
+
+Covers both runtimes in one invocation. Each targeted Bench is dispatched by its `Runtime`: a Bench with `runtime = "tart"` is swept via `internal/tartreaper.Sweep` (the Tart-side analogue of the Tier-2 reaper — see [ADR-0030 Decision 7](adr/0030-macos-bench-via-tart.md) and the [macOS via Tart reference](macos-tart-reference.md#leaked-vm-reaping-internaltartreaper)); every other Bench (Docker, Apple Containers, or an unset `runtime`, which defaults to Docker) goes through the existing `reaper.Sweep` path. Both report identically — the same "sweeping...", "reaped id=... name=... branch=...", and "nothing to clean up" lines regardless of which runtime backed a given Bench.
 
 | Flag | Default | Description |
 |------|---------|-------------|

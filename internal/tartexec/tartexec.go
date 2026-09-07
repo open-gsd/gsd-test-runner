@@ -88,20 +88,17 @@ var runSSH = func(ctx context.Context, sshArgs []string) sshResult {
 	}
 }
 
-// RunTart executes `tart <args...>` on the given Bench's host over a
-// single-hop SSH connection — Tart is local-machine-only software (Apple's
-// Virtualization.framework has no remote-daemon concept the way Docker has
-// DOCKER_HOST), so reaching a remote Bench's Tart installation means
-// literally SSHing into it and running the command there, rather than
-// pointing a local CLI at a remote endpoint via an env var. See ADR-0030
-// Decision 4.
-//
-// Returns captured stdout on success. On non-zero exit returns
-// (stdout, *ExecError). On ctx cancellation (pre or mid-exec) returns
-// ("", ctx.Err()) directly, matching dockerexec.Run's contract.
-func RunTart(ctx context.Context, b bench.Bench, args []string) (string, error) {
-	remoteCmd := "tart " + shellJoinQuoted(args)
-	sshArgs := []string{b.Host, "--", remoteCmd}
+// runShellRaw is the shared one-hop-SSH call + result-handling logic behind
+// both RunTart and RunShell: build the outer `ssh <host> -- <script>` argv,
+// invoke runSSH, and translate the result into the (string, error) / *ExecError
+// / ctx-cancellation contract both exported functions share. errArgs is what
+// gets attached to a non-nil *ExecError's Args field — kept as a separate
+// parameter (rather than always using []string{script}) so RunTart can keep
+// reporting its original tart args (e.g. []string{"clone", "vm-1"}) in error
+// messages, not the fully-assembled "tart 'clone' 'vm-1'" shell string, for
+// backward-compatible error output.
+func runShellRaw(ctx context.Context, b bench.Bench, script string, errArgs []string) (string, error) {
+	sshArgs := []string{b.Host, "--", script}
 
 	res := runSSH(ctx, sshArgs)
 
@@ -114,11 +111,44 @@ func RunTart(ctx context.Context, b bench.Bench, args []string) (string, error) 
 	}
 
 	return res.Stdout, &ExecError{
-		Args:     args,
+		Args:     errArgs,
 		Stdout:   res.Stdout,
 		Stderr:   res.Stderr,
 		ExitCode: res.ExitCode,
 	}
+}
+
+// RunTart executes `tart <args...>` on the given Bench's host over a
+// single-hop SSH connection — Tart is local-machine-only software (Apple's
+// Virtualization.framework has no remote-daemon concept the way Docker has
+// DOCKER_HOST), so reaching a remote Bench's Tart installation means
+// literally SSHing into it and running the command there, rather than
+// pointing a local CLI at a remote endpoint via an env var. See ADR-0030
+// Decision 4.
+//
+// Returns captured stdout on success. On non-zero exit returns
+// (stdout, *ExecError) with Args set to args (the tart args, not the
+// assembled "tart ..." shell string). On ctx cancellation (pre or mid-exec)
+// returns ("", ctx.Err()) directly, matching dockerexec.Run's contract.
+func RunTart(ctx context.Context, b bench.Bench, args []string) (string, error) {
+	remoteCmd := "tart " + shellJoinQuoted(args)
+	return runShellRaw(ctx, b, remoteCmd, args)
+}
+
+// RunShell executes script AS-IS (not prefixed with "tart ", unlike RunTart)
+// on the given Bench's host over the same one-hop SSH connection RunTart
+// uses. This is the primitive for "run an arbitrary one-hop shell command on
+// the Bench" — e.g. a `mkdir -p ... && printf ... > ...` state-file write
+// (internal/tartpipeline) or a `tart list --format json` / state-file read
+// (internal/tartreaper) — that nothing before this exposed (RunTart always
+// prepends "tart ", so it cannot express an arbitrary shell command or
+// pipeline).
+//
+// Same (string, error) / *ExecError / ctx-cancellation contract as RunTart,
+// except a non-nil *ExecError's Args is []string{script} (there are no
+// separate "args" to report — script is already the complete command).
+func RunShell(ctx context.Context, b bench.Bench, script string) (string, error) {
+	return runShellRaw(ctx, b, script, []string{script})
 }
 
 // Exec runs a command inside the named Tart guest VM's macOS, on the given

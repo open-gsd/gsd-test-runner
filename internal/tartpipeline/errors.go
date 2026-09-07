@@ -6,11 +6,13 @@ import (
 )
 
 // VMStartError is the typed Cause for a pipeline.LegError from the
-// StartContainer leg: it can fail at clone, set-memory, boot (issuing the
-// detached `tart run`), or wait_ip (the `tart ip --wait` readiness probe).
-// Stage discriminates which sub-step failed.
+// StartContainer leg: it can fail at clone, write_state (the required
+// tartreaper state-file write — see StartContainer's doc comment),
+// set-memory, boot (issuing the detached `tart run`), or wait_ip (the
+// `tart ip --wait` readiness probe). Stage discriminates which sub-step
+// failed.
 type VMStartError struct {
-	Stage  string // "clone" | "set_memory" | "boot" | "wait_ip"
+	Stage  string // "clone" | "write_state" | "set_memory" | "boot" | "wait_ip"
 	VMName string
 	Cause  error
 }

@@ -13,6 +13,7 @@ import (
 	"github.com/open-gsd/gsd-test-runner/internal/reaper"
 	"github.com/open-gsd/gsd-test-runner/internal/refs"
 	"github.com/open-gsd/gsd-test-runner/internal/runspec"
+	"github.com/open-gsd/gsd-test-runner/internal/tartreaper"
 )
 
 // DefaultContainerTTL is the Tier-2 reaper deadline (ADR-0021 Decision 2) that
@@ -117,6 +118,57 @@ func sweepStaleContainers(ctx context.Context, benchesByOS map[string][]bench.Be
 			}
 			if len(reaped) > 0 {
 				fmt.Fprintf(stderr, "bench=%s: reaped %d stale container(s) before running\n", b.Name, len(reaped))
+			}
+		}
+	}
+}
+
+// sweepTartBench is a package-level test seam (mirroring sweepBench exactly)
+// for the internal/tartreaper Tier-2-equivalent sweep of a single Tart-backed
+// Bench. The real implementation delegates straight to tartreaper.Sweep — no
+// runner adaptation needed, unlike sweepBench's dockerexec.Run-to-
+// reaper.Runner adapter, since tartreaper.Sweep already takes a bench.Bench
+// directly (it owns its own SSH transport via internal/tartexec). Tests swap
+// it to assert sweepStaleTartVMs calls it exactly once per distinct
+// RuntimeTart Bench.
+var sweepTartBench = func(ctx context.Context, b bench.Bench, nowMs int64, branchSlug string) ([]tartreaper.VM, error) {
+	return tartreaper.Sweep(ctx, b, nowMs, branchSlug)
+}
+
+// sweepStaleTartVMs is the RuntimeTart analogue of sweepStaleContainers: it
+// runs internal/tartreaper's Tier-2-equivalent sweep once for each DISTINCT
+// Bench (deduped by Name, exactly like sweepStaleContainers) whose Runtime is
+// bench.RuntimeTart, scoped to branchSlug. A separate function (rather than a
+// runtime branch inside sweepStaleContainers) because tartreaper.Sweep's
+// types (tartreaper.VM, and its own internal Bench-based SSH transport) are
+// distinct enough from reaper.Container/reaper.Runner that folding both into
+// one function's body would obscure more than it shares — the dedup-by-name
+// + per-Bench-sweep + stderr-reporting SHAPE is what's mirrored, not the
+// implementation. Must be called before schedule.Run starts, alongside
+// sweepStaleContainers, so both Docker and Tart Benches referenced by a
+// single invocation are swept regardless of runtime mix.
+//
+// A sweep error is logged to stderr and does NOT fail the run, matching
+// sweepStaleContainers' handling of reaper.Sweep failures. Reaped VMs are
+// also reported to stderr in the same style.
+func sweepStaleTartVMs(ctx context.Context, benchesByOS map[string][]bench.Bench, branchSlug string, stderr io.Writer) {
+	seen := make(map[string]bool)
+	for _, benches := range benchesByOS {
+		for _, b := range benches {
+			if b.Runtime != bench.RuntimeTart {
+				continue
+			}
+			if seen[b.Name] {
+				continue
+			}
+			seen[b.Name] = true
+			reaped, err := sweepTartBench(ctx, b, time.Now().UnixMilli(), branchSlug)
+			if err != nil {
+				fmt.Fprintf(stderr, "bench=%s: warning: tart reaper sweep: %v\n", b.Name, err)
+				continue
+			}
+			if len(reaped) > 0 {
+				fmt.Fprintf(stderr, "bench=%s: reaped %d stale tart VM(s) before running\n", b.Name, len(reaped))
 			}
 		}
 	}
