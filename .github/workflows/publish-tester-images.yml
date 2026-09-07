@@ -352,6 +352,19 @@ jobs:
           tart --version
           sshpass -V
 
+      - name: Unlock CI keychain
+        run: |
+          # `tart login` writes the registry credential into Keychain
+          # (confirmed: it failed with "Keychain failed to add item: User
+          # interaction is not allowed" when the runner's session had no
+          # unlocked keychain to write to -- a self-hosted macOS runner has
+          # no interactive session to prompt for one). The Bench operator
+          # provisions a dedicated CI-only keychain (`runner.keychain-db`,
+          # set as the session default) so this never touches the operator's
+          # real login keychain/password. See the how-to guide for the
+          # one-time `security create-keychain` setup this depends on.
+          security unlock-keychain -p "${{ secrets.MACOS_CI_KEYCHAIN_PASSWORD }}" runner.keychain-db
+
       - name: Log in to GHCR (Tart)
         run: |
           # CONFIRMED (studio-mac-mini.local, 2026-09-07, real `tart login
