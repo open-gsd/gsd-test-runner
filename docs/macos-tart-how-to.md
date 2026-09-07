@@ -39,18 +39,7 @@ The bake recipe is a Packer template, `dockerfiles/macos-tart.pkr.hcl`, plus its
 
 **Via CI** — push a version tag (or run the workflow manually) and let `.github/workflows/publish-tester-images.yml`'s `publish-macos-tart` job build and publish for you. That job requires a **self-hosted runner** labeled `[self-hosted, macos, tart]` — it does not run on GitHub-hosted `macos-*` runners, because whether those expose the nested-virtualization CPU features Tart's Virtualization.framework usage needs is unconfirmed. If you want CI-built images, register your own Mac as a self-hosted runner with that label set.
 
-**One-time runner setup: a dedicated Keychain.** `tart login` writes the registry credential into Keychain — confirmed (2026-09-07) to fail with `Keychain failed to add item: User interaction is not allowed` when the runner service has no unlocked keychain to write to, which is the normal state for a self-hosted runner with no interactive session. Provision a CI-only keychain once per runner, never your own login keychain/password:
-
-```bash
-KEYCHAIN_PW='choose-a-new-random-password-here'
-security create-keychain -p "$KEYCHAIN_PW" runner.keychain-db
-security set-keychain-settings runner.keychain-db
-security list-keychains -d user -s runner.keychain-db login.keychain-db
-security default-keychain -s runner.keychain-db
-security unlock-keychain -p "$KEYCHAIN_PW" runner.keychain-db
-```
-
-Then set that same password as the `MACOS_CI_KEYCHAIN_PASSWORD` repo secret (`gh secret set MACOS_CI_KEYCHAIN_PASSWORD`) — the workflow's "Unlock CI keychain" step re-unlocks it at the start of every run, since a keychain re-locks on reboot/logout.
+**No runner-side credential setup needed.** The CI job authenticates to GHCR via `TART_REGISTRY_USERNAME`/`TART_REGISTRY_PASSWORD` environment variables (`github.actor`/`GITHUB_TOKEN`, already available to every workflow run) rather than `tart login` — `tart pull`'s own `--help` documents this as a supported auth method alongside Keychain and Docker credential helpers, and `push` shares the same auth resolution. This deliberately avoids Keychain entirely: an earlier version of this setup used `tart login` (which writes into Keychain) plus a dedicated CI-only keychain kept unlocked as the session default, but that caused an unwanted macOS system prompt (Spotlight and other services asking for that keychain's password) on every reboot or login — not worth it when the env-var path works headlessly with no session dependency at all.
 
 **Locally** — run `packer build` yourself from the repo root (not from `dockerfiles/`, so the `file` provisioner's relative path to `reporter/reporter.mjs` resolves):
 

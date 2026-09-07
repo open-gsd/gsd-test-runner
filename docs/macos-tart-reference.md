@@ -82,7 +82,7 @@ The `tart-cli` Packer source clones `vm_base_name` into a VM named `gsd-tester-m
 
 - **Requires a self-hosted runner**: `runs-on: [self-hosted, macos, tart]`. It does **not** run on GitHub-hosted `macos-*` runners — whether those expose the nested-virtualization CPU features Tart's Virtualization.framework usage needs is unconfirmed by ADR-0030's research. If you want to publish your own image via CI, you need a self-hosted Mac runner carrying those three labels.
 - Installs `packer`, `tart`, and `sshpass` via Homebrew if not already present (idempotent — safe to re-run).
-- Logs in to GHCR via `tart login`.
+- Authenticates to GHCR via `TART_REGISTRY_USERNAME`/`TART_REGISTRY_PASSWORD` environment variables (`tart pull`'s documented env-var auth mechanism, which `push` shares) — no `tart login`/Keychain involved, so no interactive-session dependency on the runner.
 - Runs `packer init` then `packer build` with `node_version`/`image_version` set from the matrix (`node: ["22", "24"]`) and the resolved release tag.
 - Pushes the built VM with `tart push`, tagged `gsd-tester-macos-tart:<tag>-node<major>`, carrying both `sh.gsd-test.image-version` and `sh.gsd-test.node-major` labels. The Active-LTS major (`DEFAULT_NODE_MAJOR`, currently `"24"`) additionally gets the plain `:<tag>` and `:latest` tags, matching the Linux/Windows publish jobs' conditional-tag pattern.
 - Verifies the push by cloning the just-pushed image fresh, booting it, waiting for an IP, and reading back the in-guest sentinel file over SSH with the default `admin`/`admin` credentials — the same read path `CheckImageVersion` uses at runtime, since there's no label-inspect equivalent to verify against directly.
