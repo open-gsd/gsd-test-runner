@@ -161,6 +161,115 @@ func Exec(ctx context.Context, b bench.Bench, vmName, guestUser, guestPassword s
 	}
 }
 
+// runSCP is the function used by CopyToBench and CopyFromBench to invoke
+// the local scp binary. Package-level var so tests can stub it without a
+// real network, mirroring runSSH — file transfer is a structurally
+// different subprocess seam from remote command execution (no remote
+// command, no meaningful stdout capture), so it gets its own var rather
+// than reusing runSSH, even though both shell out to the same OpenSSH
+// binary family and share the sshResult result type.
+var runSCP = func(ctx context.Context, scpArgs []string) sshResult {
+	cmd := exec.CommandContext(ctx, "scp", scpArgs...)
+	var stdoutBuf, stderrBuf bytes.Buffer
+	cmd.Stdout = &stdoutBuf
+	cmd.Stderr = &stderrBuf
+
+	runErr := cmd.Run()
+
+	exitCode := -1
+	switch {
+	case runErr == nil:
+		exitCode = 0
+	default:
+		if ee, ok := runErr.(*exec.ExitError); ok {
+			exitCode = ee.ExitCode()
+		}
+	}
+
+	return sshResult{
+		Stdout:   stdoutBuf.String(),
+		Stderr:   stderrBuf.String(),
+		ExitCode: exitCode,
+		RunErr:   runErr,
+	}
+}
+
+// CopyToBench copies a local file or directory to the given Bench's host,
+// one hop (this process -> Bench), via scp. Tart is local-machine-only
+// software with no DOCKER_HOST-equivalent transparent remote-daemon
+// tunneling (that's precisely why RunTart and Exec exist — they SSH into
+// the Bench to run `tart` there instead), so getting a file onto the
+// Bench's filesystem (e.g. a PR-merged worktree, before it can be
+// --dir-mounted into a guest at `tart run` time) needs its own explicit
+// transfer step rather than something a local CLI can tunnel implicitly.
+// See docs/adr/0030-macos-bench-via-tart.md Decision 6.
+//
+// Uses `-r` unconditionally: both plain files and directories need to
+// work through this one code path (the worktree copy-in is always a
+// directory), and `-r` is a no-op-safe superset for a single file with
+// OpenSSH's scp.
+//
+// Returns nil on success. On non-zero scp exit returns *ExecError, with
+// Args set to the two logical paths involved ([]string{localPath,
+// remotePath}), not the raw scp argv. On ctx cancellation (pre or
+// mid-transfer) returns ctx.Err() directly, matching RunTart's contract.
+func CopyToBench(ctx context.Context, b bench.Bench, localPath, remotePath string) error {
+	scpArgs := []string{"-r", localPath, b.Host + ":" + remotePath}
+
+	res := runSCP(ctx, scpArgs)
+
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+
+	if res.RunErr == nil {
+		return nil
+	}
+
+	return &ExecError{
+		Args:     []string{localPath, remotePath},
+		Stdout:   res.Stdout,
+		Stderr:   res.Stderr,
+		ExitCode: res.ExitCode,
+	}
+}
+
+// CopyFromBench copies a file or directory from the given Bench's host to
+// a local path, one hop (Bench -> this process), via scp. The
+// Drain-equivalent primitive for a Tart-backed pipeline: pulling results
+// (e.g. a JSONL results file) back off the Bench once a guest run has
+// finished, for the same reason CopyToBench exists — Tart has no
+// DOCKER_HOST-equivalent remote-daemon tunneling for a local CLI to ride.
+// See docs/adr/0030-macos-bench-via-tart.md Decision 6.
+//
+// Uses `-r` unconditionally for the same reason as CopyToBench: one code
+// path handles both the (always-a-file) JSONL drain-back and any
+// directory case, without the caller needing to specify which.
+//
+// Same (nil on success) / *ExecError (Args = []string{remotePath,
+// localPath}, the two logical paths, not the raw scp argv) /
+// ctx-cancellation contract as CopyToBench.
+func CopyFromBench(ctx context.Context, b bench.Bench, remotePath, localPath string) error {
+	scpArgs := []string{"-r", b.Host + ":" + remotePath, localPath}
+
+	res := runSCP(ctx, scpArgs)
+
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+
+	if res.RunErr == nil {
+		return nil
+	}
+
+	return &ExecError{
+		Args:     []string{remotePath, localPath},
+		Stdout:   res.Stdout,
+		Stderr:   res.Stderr,
+		ExitCode: res.ExitCode,
+	}
+}
+
 // shellQuote returns s wrapped for safe inclusion as a single literal
 // argument on a POSIX shell command line: wrapped in single quotes, with
 // any embedded single quote replaced by '\'' (close the quote, emit an
