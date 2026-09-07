@@ -17,6 +17,7 @@ import (
 	"github.com/open-gsd/gsd-test-runner/internal/report"
 	"github.com/open-gsd/gsd-test-runner/internal/runspec"
 	"github.com/open-gsd/gsd-test-runner/internal/schedule"
+	"github.com/open-gsd/gsd-test-runner/internal/tartpipeline"
 	"github.com/open-gsd/gsd-test-runner/internal/worktree"
 )
 
@@ -159,6 +160,21 @@ func Run(ctx context.Context, opts Options) int {
 	}
 	work := func(ctx context.Context, b bench.Bench, u schedule.Unit) any {
 		jp := u.Payload.(*jobPayload)
+		// RuntimeTart branch (ADR-0030 Decision 6): the only fork point between
+		// the Docker and Tart execution paths — everything upstream (scheduling,
+		// renderer, report aggregation, CLI) needs zero Tart-specific knowledge
+		// beyond this constructor choice.
+		if b.Runtime == bench.RuntimeTart {
+			if ensureErr := images.EnsurePresentTart(ctx, b, jp.run.ImageID); ensureErr != nil {
+				fmt.Fprintf(stderr, "EnsurePresentTart(bench=%s, image=%s): %v\n", b.Name, jp.run.ImageID, ensureErr)
+				return pipelineResult{streamKey: jp.streamKey, err: ensureErr}
+			}
+			ident := buildContainerIdentity(branchSlug, runID, jp.run, deadlineMs)
+			tp := tartpipeline.New(b, jp.run.ImageID, jp.run.Version, wt.Path(), cfg.Testing.Command, jp.run.NodeMajor, jp.events, ident)
+			rep, runErr := tp.RunAll(ctx)
+			rep.NodeMajor = jp.run.NodeMajor
+			return pipelineResult{streamKey: jp.streamKey, rep: rep, err: runErr, drained: tp.DrainedPath()}
+		}
 		if ensureErr := images.EnsurePresent(ctx, b, jp.run.ImageID, images.EnsurePresentOptions{
 			FallbackDockerfile: "dockerfiles/" + jp.run.OS + ".Dockerfile",
 			FallbackContextDir: ".",
