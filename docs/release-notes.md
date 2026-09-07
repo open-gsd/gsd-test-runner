@@ -14,10 +14,33 @@ This page summarizes the recent releases so you can quickly decide what to adopt
 - `v1.6.2`: internal architecture cleanup (ADRs 0027/0028) — consolidated image/worktree prep, testable runner policy, pipeline god-file split, streaming-leg dedup; run-and-die now pulls the explicit `:<version>` Tester Image tag
 - `v1.7.0`: branch-derived container names — `docker ps` on a Bench shows `gsd-test-<branch>-<runId>` instead of `keen_euclid`, and the Tier-2 reaper reaps only containers from the branch it is working on
 - `v1.8.0`: extends that to the standard `gsd-test` path (v1.7.0 covered run-and-die only) and fixes the leak behind it — Pipeline containers were unlabeled, so nothing ever reaped the ones a crashed run left behind
+- `v1.9.0`: macOS Bench via Tart (`runtime = "tart"`) — a real macOS guest with a hypervisor-enforced memory cap, additive alongside Docker-on-macOS — plus automated leak cleanup for both runtimes, a liveness signal for long Tart runs, and a manual `gsd-test sweep` command
 
 ## Unreleased
 
 _Nothing yet — changes land here before the next tagged release._
+
+## v1.9.0
+
+### Added
+
+- **macOS Bench via Tart** ([ADR-0030](adr/0030-macos-bench-via-tart.md)). A new `runtime = "tart"` Bench option runs tests inside a real macOS guest (Apple's Virtualization.framework, via the [Tart](https://github.com/cirruslabs/tart) CLI) instead of a Linux container on macOS hardware — the original ask behind issue #8, unreachable by Apple Containers (permanently Linux-guest-only) or Docker-on-macOS (still a Linux guest under the hood). It is additive and opt-in: Docker-on-macOS remains the zero-friction default, and `runtime = "tart"` is the upgrade path for projects that exercise macOS-native code paths. Every Tart-backed run sets a hard, hypervisor-enforced memory ceiling via `tart set --memory` before boot — the same protection the Linux/Windows Benches have had since ADR-0021, now fixing the bare-metal macOS Runner's recurring host-out-of-memory failure for anyone who opts in. See the [macOS via Tart guide](macos-tart.md).
+- **Automated cleanup for leaked Tart VMs** (ADR-0030 §7). Tart has no label/metadata mechanism at all — confirmed empirically, not assumed. `StartContainer` now writes a required (not best-effort) side-channel state file to the Bench before considering a VM started, giving the new `internal/tartreaper` package the same "reap on next contact" durability the Docker/Windows Tier-2 reaper has had since ADR-0029.
+- **A liveness signal during long Tart test runs** (ADR-0030 §8). `RunTests`'s single long guest-exec call used to produce total silence until the whole suite finished — indistinguishable from a hung VM. A periodic probe (`tart get`, every 20s) now reports whether the VM is still confirmed running, registered but stopped, or gone entirely, shown in the live output.
+- **`gsd-test sweep [--bench <name>] [--branch <slug>|--all]`** — a manual front door onto the Tier-2 reaper, the operator escape hatch ADR-0029 always supported in code but never exposed as a command. Destructive by design (it kills running containers/VMs); defaults to the current branch only, same as the automatic sweep. Covers both Docker and Tart Benches transparently in one invocation.
+
+### Fixed
+
+- **The Docker/Windows Tier-2 reaper no longer leaves cross-branch leaks unreaped indefinitely** ([ADR-0029](adr/0029-container-name-from-branch.md) §6). Branch-scoped reaping was working as designed, but a container leaked on branch A was never automatically reaped unless branch A was worked again on the exact same Bench — a normal workflow of bouncing between branches on shared hardware meant leaks could sit for a day or more. A new safety-net tier now reaps any container more than `reaper.SafetyNetGrace` (6h) past its own deadline, regardless of branch, closing the gap while still giving a human a real diagnostic window before an unrelated invocation reaps it.
+
+### Upgrade notes
+
+- `runtime = "tart"` is opt-in per Bench and requires Tart installed on the Bench (`brew install cirruslabs/cli/tart`) plus a `gsd-tester-macos-tart` image, built via the new `publish-macos-tart` CI job. Existing Docker-on-macOS Benches are entirely unaffected.
+- The reaper safety-net fix applies automatically on the next `gsd-test` invocation against any Bench — no action needed.
+
+### Why it matters
+
+Two things converge here. gsd-test-runner finally answers the original ask behind issue #8 — exercising macOS-native code on a real macOS guest, not just filesystem isolation inside a Linux container — with the same memory-safety guarantee the Linux/Windows Benches have had for a while. And the operational gaps that would have made that untrustworthy in practice — leaked containers or VMs sitting for a day, a hung run indistinguishable from a slow one — are closed in the same release, not left as documented "known limitations."
 
 ## v1.8.0
 
