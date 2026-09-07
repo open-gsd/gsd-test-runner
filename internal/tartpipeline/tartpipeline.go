@@ -19,6 +19,7 @@ package tartpipeline
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -33,6 +34,7 @@ import (
 	"github.com/open-gsd/gsd-test-runner/internal/pipeline"
 	"github.com/open-gsd/gsd-test-runner/internal/report"
 	"github.com/open-gsd/gsd-test-runner/internal/tartexec"
+	"github.com/open-gsd/gsd-test-runner/internal/tartreaper"
 )
 
 // DefaultMemoryMB is the hard per-VM memory ceiling (ADR-0030 Decision 5)
@@ -119,7 +121,48 @@ var (
 	execGuest     = tartexec.Exec
 	copyToBench   = tartexec.CopyToBench
 	copyFromBench = tartexec.CopyFromBench
+	// runShellOnBench is the test seam for the tartreaper state-file write
+	// (StartContainer) and best-effort removal (Cleanup), mirroring the vars
+	// above. Real implementation delegates to tartexec.RunShell — the "run an
+	// arbitrary one-hop shell command on the Bench" primitive RunTart cannot
+	// express (RunTart always prepends "tart ").
+	runShellOnBench = tartexec.RunShell
 )
+
+// tartReaperState is the JSON shape written to
+// tartreaper.StateDir/<vmName>.json by StartContainer's write_state step, and
+// read back by internal/tartreaper.List/Sweep. Field names/JSON tags must
+// match tartreaper's own (unexported, duplicated for the same "two packages,
+// one shared shape via a documented contract, not a Go type import" reason
+// tartreaper.StateDir is the single source of truth for the PATH while the
+// JSON SHAPE itself is just a plain contract both sides implement).
+type tartReaperState struct {
+	RunID      string `json:"run_id"`
+	BranchSlug string `json:"branch_slug"`
+	DeadlineMs int64  `json:"deadline_ms"`
+}
+
+// writeReaperState marshals p.ident into the tartreaper JSON state-file shape
+// and writes it to tartreaper.StateDir/<p.vmName>.json on the Bench via a
+// single one-hop RunShell call: `mkdir -p <stateDir> && printf '%s' <quoted
+// JSON> > <stateDir>/<vmName>.json`. See StartContainer's doc comment for why
+// this step is REQUIRED (not best-effort).
+func (p *Pipeline) writeReaperState(ctx context.Context) error {
+	state := tartReaperState{
+		RunID:      p.ident.RunID,
+		BranchSlug: p.ident.BranchSlug,
+		DeadlineMs: p.ident.DeadlineMs,
+	}
+	payload, err := json.Marshal(state)
+	if err != nil {
+		return err
+	}
+	statePath := tartreaper.StateDir + "/" + p.vmName + ".json"
+	script := fmt.Sprintf("mkdir -p %s && printf '%%s' %s > %s",
+		shellQuote(tartreaper.StateDir), shellQuote(string(payload)), shellQuote(statePath))
+	_, err = runShellOnBench(ctx, p.bench, script)
+	return err
+}
 
 // bootResult mirrors tartexec's own unexported sshResult shape. Duplicated
 // here (not imported — it's unexported in tartexec) for runBootDetached's
@@ -335,23 +378,45 @@ func (p *Pipeline) CopyWorktree(ctx context.Context) error {
 	})
 }
 
-// StartContainer clones the Tart VM from the Tester Image, applies the
-// ADR-0030 Decision 5 memory ceiling, boots it detached with the scratch
-// directory --dir-mounted (CopyWorktree must have already populated it —
-// see CopyWorktree's doc comment), then waits for the guest to become
-// SSH-reachable via `tart ip --wait`. All four sub-steps are reported under
-// this one leg (ADR-0030 Decision 6: "StartContainer and CopyWorktree are
-// not just reorderable for Tart, they're the same operation" — clone/set/
-// boot/wait-ip is the Tart analogue of Docker's single `docker run -d`).
+// StartContainer clones the Tart VM from the Tester Image, writes a
+// tartreaper-visible JSON state file to the Bench (see the write_state
+// sub-step below), applies the ADR-0030 Decision 5 memory ceiling, boots it
+// detached with the scratch directory --dir-mounted (CopyWorktree must have
+// already populated it — see CopyWorktree's doc comment), then waits for the
+// guest to become SSH-reachable via `tart ip --wait`. All five sub-steps are
+// reported under this one leg (ADR-0030 Decision 6: "StartContainer and
+// CopyWorktree are not just reorderable for Tart, they're the same
+// operation" — clone/write-state/set/boot/wait-ip is the Tart analogue of
+// Docker's single `docker run -d`).
+//
+// write_state is REQUIRED, not best-effort: Tart has no label/tag mechanism
+// (confirmed empirically — `tart get`/`tart list --format json` carry no
+// metadata field, docs/adr/0030-macos-bench-via-tart.md), so
+// internal/tartreaper's Tier-2-equivalent sweep can only ever attribute a
+// leaked VM to a branch/run/deadline via this side-channel state file. If the
+// write fails, StartContainer fails the leg — but because p.vmStarted is
+// already true (clone succeeded), Cleanup still fires in the SAME run and
+// removes the VM immediately. This is the by-construction invariant
+// internal/tartreaper's Sweep depends on: any gsd-tart-* VM found WITHOUT a
+// readable state file cannot have leaked via this pipeline's normal path (the
+// write either succeeded, in which case a state file exists, or failed, in
+// which case Cleanup already removed the VM in-run) — see
+// internal/tartreaper's package doc comment for the sweep-side half of this
+// contract.
 func (p *Pipeline) StartContainer(ctx context.Context) error {
 	return p.runLeg(ctx, pipeline.LegStartContainer, func(ctx context.Context) (string, error) {
 		if _, err := runTart(ctx, p.bench, []string{"clone", string(p.image), p.vmName}); err != nil {
 			return "", &VMStartError{Stage: "clone", VMName: p.vmName, Cause: err}
 		}
 		// vmStarted flips true here (not after boot) so Cleanup still attempts
-		// stop+delete if a later sub-step (set-memory/boot/wait-ip) fails —
-		// clone already left a VM registered on the Bench that needs removing.
+		// stop+delete if a later sub-step (write-state/set-memory/boot/wait-ip)
+		// fails — clone already left a VM registered on the Bench that needs
+		// removing.
 		p.vmStarted = true
+
+		if err := p.writeReaperState(ctx); err != nil {
+			return "", &VMStartError{Stage: "write_state", VMName: p.vmName, Cause: err}
+		}
 
 		if _, err := runTart(ctx, p.bench, []string{"set", p.vmName, "--memory", strconv.Itoa(p.memoryMB)}); err != nil {
 			return "", &VMStartError{Stage: "set_memory", VMName: p.vmName, Cause: err}
@@ -666,21 +731,30 @@ func (p *Pipeline) DrainedPath() string { return p.drainedPath }
 // sweep for either leaked Tart VMs or their scratch directories — see the
 // package's known-limitations list in the PR description.
 //
-// KNOWN LIMITATION: unlike Docker's ADR-0029 --name/--label scheme (which
-// the Tier-2 reaper in internal/reaper sweeps by branch + deadline), Tart
-// VMs started by this Pipeline carry no equivalent reaper-visible identity.
-// A run that crashes before RunAll's deferred Cleanup fires (process killed,
-// host rebooted) leaks a running Tart VM with no automated sweep to catch
-// it. This first cut deliberately does not implement Tart VM naming/
-// labeling parity with ADR-0029 (see deriveVMName's doc comment) or a
-// Tart-aware reaper sweep — both are real gaps flagged for follow-up, not
-// silently dropped.
+// REAPER PARITY (fixed — see StartContainer's write_state sub-step and
+// internal/tartreaper): Tart has no --name/--label scheme the way Docker's
+// ADR-0029 containers do (Tart carries no metadata field at all, confirmed
+// empirically — docs/adr/0030-macos-bench-via-tart.md), so
+// StartContainer instead writes a side-channel JSON state file
+// (tartreaper.StateDir/<vmName>.json) that internal/tartreaper.Sweep reads to
+// attribute a leaked VM to a branch/run/deadline, mirroring
+// internal/reaper's Tier-2 "reap on next contact" sweep for Docker
+// containers. A run that crashes before this deferred Cleanup fires (process
+// killed, host rebooted) still leaks a running Tart VM — but the state file
+// it wrote survives on the Bench, so internal/tartreaper.Sweep (wired into
+// internal/runner's automatic pre-run sweep and the manual `gsd-test sweep`
+// command) will reap it once its deadline passes, the same "reap on next
+// contact" durability Docker Benches already have. See
+// internal/tartreaper's package doc comment for the full mechanism and the
+// by-construction invariant it depends on.
 func (p *Pipeline) Cleanup(ctx context.Context) {
 	if !p.vmStarted {
 		return
 	}
 	_, _ = runTart(ctx, p.bench, []string{"stop", p.vmName})
 	_, _ = runTart(ctx, p.bench, []string{"delete", p.vmName})
+	statePath := tartreaper.StateDir + "/" + p.vmName + ".json"
+	_, _ = runShellOnBench(ctx, p.bench, "rm -f "+shellQuote(statePath))
 }
 
 // RunAll executes all 8 legs, short-circuiting on the first LegError.

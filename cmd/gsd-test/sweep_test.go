@@ -9,7 +9,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/open-gsd/gsd-test-runner/internal/bench"
 	"github.com/open-gsd/gsd-test-runner/internal/runspec"
+	"github.com/open-gsd/gsd-test-runner/internal/tartreaper"
 )
 
 // ── flag parsing / dispatch (no Docker required) ────────────────────────────
@@ -87,6 +89,155 @@ func TestRunSweep_NoBenchesConfigured(t *testing.T) {
 		t.Errorf("stderr: got %q, want a no-Benches message", errOut)
 	}
 }
+
+// ── dispatch-by-runtime (Tart path, fakes only — no real Tart/SSH hardware) ─
+
+// stubTartSweep swaps the package-level tartSweep var. Restored via
+// t.Cleanup, mirroring the stubbable-var pattern used throughout this
+// codebase (there is no real Tart/SSH hardware available to test against).
+func stubTartSweep(t *testing.T, fn func(ctx context.Context, b bench.Bench, nowMs int64, branchSlug string) ([]tartreaper.VM, error)) {
+	t.Helper()
+	orig := tartSweep
+	tartSweep = fn
+	t.Cleanup(func() { tartSweep = orig })
+}
+
+// TestRunSweep_TartBench_DispatchesToTartSweep verifies a Bench configured
+// with runtime="tart" is routed through tartSweep (internal/tartreaper.Sweep
+// in production), not the Docker/reaper.Sweep path, and reaped VMs are
+// reported in the same "bench=...: reaped id=... name=... branch=..." shape
+// the Docker path uses.
+func TestRunSweep_TartBench_DispatchesToTartSweep(t *testing.T) {
+	cfgPath := strings.TrimSuffix(t.TempDir(), "/") + "/config.toml"
+	cfg := "[[benches]]\nname = \"mac-tart-1\"\nhost = \"tart-bench.local\"\nos = \"macos\"\nruntime = \"tart\"\n"
+	if err := os.WriteFile(cfgPath, []byte(cfg), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var gotBench bench.Bench
+	var gotBranch string
+	stubTartSweep(t, func(_ context.Context, b bench.Bench, _ int64, branchSlug string) ([]tartreaper.VM, error) {
+		gotBench = b
+		gotBranch = branchSlug
+		return []tartreaper.VM{{Name: "gsd-tart-macos-run1", BranchSlug: branchSlug, HasState: true}}, nil
+	})
+
+	rOut, wOut, _ := os.Pipe()
+	code := run([]string{"sweep", "--config", cfgPath, "--all"}, wOut, os.Stderr)
+	wOut.Close()
+	out := readPipe(rOut)
+
+	if code != 0 {
+		t.Fatalf("sweep exit = %d, want 0; output:\n%s", code, out)
+	}
+	if gotBench.Name != "mac-tart-1" {
+		t.Errorf("tartSweep called with bench %q, want mac-tart-1", gotBench.Name)
+	}
+	if gotBranch != "" {
+		t.Errorf("expected --all to pass branchSlug=\"\", got %q", gotBranch)
+	}
+	if !strings.Contains(out, "reaped id=gsd-tart-macos-run1 name=gsd-tart-macos-run1") {
+		t.Errorf("stdout did not report the reaped VM in the expected shape; output:\n%s", out)
+	}
+}
+
+// TestRunSweep_TartBench_NothingToCleanUp verifies the "nothing to clean up"
+// message is printed for a Tart Bench exactly like the Docker path, when
+// tartSweep returns no reaped VMs and no error.
+func TestRunSweep_TartBench_NothingToCleanUp(t *testing.T) {
+	cfgPath := strings.TrimSuffix(t.TempDir(), "/") + "/config.toml"
+	cfg := "[[benches]]\nname = \"mac-tart-1\"\nhost = \"tart-bench.local\"\nos = \"macos\"\nruntime = \"tart\"\n"
+	if err := os.WriteFile(cfgPath, []byte(cfg), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	stubTartSweep(t, func(context.Context, bench.Bench, int64, string) ([]tartreaper.VM, error) {
+		return nil, nil
+	})
+
+	rOut, wOut, _ := os.Pipe()
+	code := run([]string{"sweep", "--config", cfgPath, "--all"}, wOut, os.Stderr)
+	wOut.Close()
+	out := readPipe(rOut)
+
+	if code != 0 {
+		t.Fatalf("sweep exit = %d, want 0; output:\n%s", code, out)
+	}
+	if !strings.Contains(out, "bench=mac-tart-1: nothing to clean up") {
+		t.Errorf("expected a nothing-to-clean-up message; output:\n%s", out)
+	}
+}
+
+// TestRunSweep_TartBench_SweepError_ExitInconclusive verifies a tartSweep
+// error is reported to stderr and the command exits exitInconclusive, the
+// same behavior reaper.Sweep failures already have on the Docker path.
+func TestRunSweep_TartBench_SweepError_ExitInconclusive(t *testing.T) {
+	cfgPath := strings.TrimSuffix(t.TempDir(), "/") + "/config.toml"
+	cfg := "[[benches]]\nname = \"mac-tart-1\"\nhost = \"tart-bench.local\"\nos = \"macos\"\nruntime = \"tart\"\n"
+	if err := os.WriteFile(cfgPath, []byte(cfg), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	stubTartSweep(t, func(context.Context, bench.Bench, int64, string) ([]tartreaper.VM, error) {
+		return nil, errInjectedTartSweepFailure
+	})
+
+	rOut, wOut, _ := os.Pipe()
+	rErr, wErr, _ := os.Pipe()
+	code := run([]string{"sweep", "--config", cfgPath, "--all"}, wOut, wErr)
+	wOut.Close()
+	wErr.Close()
+	_ = readPipe(rOut)
+	errOut := readPipe(rErr)
+
+	if code != exitInconclusive {
+		t.Errorf("exit code: got %d, want %d", code, exitInconclusive)
+	}
+	if !strings.Contains(errOut, "sweep error") {
+		t.Errorf("stderr: got %q, want a sweep-error message", errOut)
+	}
+}
+
+// TestRunSweep_MultipleTartBenches_OnlyNamedBenchSwept verifies --bench still
+// scopes the dispatch loop to a single Tart Bench (not every configured
+// Bench), the same targeting behavior TestRunSweep_UnknownBench already
+// relies on for the Docker path.
+func TestRunSweep_MultipleTartBenches_OnlyNamedBenchSwept(t *testing.T) {
+	cfgPath := strings.TrimSuffix(t.TempDir(), "/") + "/config.toml"
+	cfg := "[[benches]]\nname = \"mac-tart-1\"\nhost = \"tart-bench-1.local\"\nos = \"macos\"\nruntime = \"tart\"\n" +
+		"[[benches]]\nname = \"mac-tart-2\"\nhost = \"tart-bench-2.local\"\nos = \"macos\"\nruntime = \"tart\"\n"
+	if err := os.WriteFile(cfgPath, []byte(cfg), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var calledBenches []string
+	stubTartSweep(t, func(_ context.Context, b bench.Bench, _ int64, _ string) ([]tartreaper.VM, error) {
+		calledBenches = append(calledBenches, b.Name)
+		return nil, nil
+	})
+
+	rOut, wOut, _ := os.Pipe()
+	code := run([]string{"sweep", "--config", cfgPath, "--bench", "mac-tart-2", "--all"}, wOut, os.Stderr)
+	wOut.Close()
+	_ = readPipe(rOut)
+
+	if code != 0 {
+		t.Fatalf("sweep exit = %d, want 0", code)
+	}
+	if len(calledBenches) != 1 || calledBenches[0] != "mac-tart-2" {
+		t.Errorf("tartSweep calls = %v, want exactly [mac-tart-2]", calledBenches)
+	}
+}
+
+var errInjectedTartSweepFailure = &tartSweepTestError{}
+
+// tartSweepTestError is a minimal error type for
+// TestRunSweep_TartBench_SweepError_ExitInconclusive — a plain
+// errors.New would work identically, but a named type keeps the test's
+// intent ("an injected failure, not a real one") obvious at the call site.
+type tartSweepTestError struct{}
+
+func (e *tartSweepTestError) Error() string { return "injected tart sweep failure" }
 
 // ── resolveSweepBranchSlug (pure git resolution, no Docker) ────────────────
 

@@ -196,6 +196,12 @@ func Run(ctx context.Context, opts Options) int {
 	// (e.g. leaked by a previous crashed run). Must run before schedule.Run so
 	// it never races a cell's own StartContainer on the same Bench.
 	sweepStaleContainers(ctx, benchesByOS, branchSlug, stderr)
+	// Tart-side analogue of the sweep above (internal/tartreaper): same
+	// "before any cell starts" timing requirement, covering any RuntimeTart
+	// Bench referenced by this invocation's targets — see StartContainer's
+	// write_state sub-step in internal/tartpipeline for the side-channel state
+	// file this sweep reads.
+	sweepStaleTartVMs(ctx, benchesByOS, branchSlug, stderr)
 
 	schedResults := schedule.Run(ctx, units, benchesByOS, capResolver.capacity, work)
 

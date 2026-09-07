@@ -14,6 +14,7 @@ import (
 	"github.com/open-gsd/gsd-test-runner/internal/plan"
 	"github.com/open-gsd/gsd-test-runner/internal/reaper"
 	"github.com/open-gsd/gsd-test-runner/internal/runspec"
+	"github.com/open-gsd/gsd-test-runner/internal/tartreaper"
 )
 
 // runGit runs `git <args...>` in dir, failing the test on error. Test-only
@@ -207,5 +208,99 @@ func TestSweepStaleContainers_ErrorDoesNotPanicOrStop(t *testing.T) {
 	}
 	if stderr.String() == "" {
 		t.Error("expected the sweep error to be logged to stderr")
+	}
+}
+
+// --- sweepStaleTartVMs ---
+
+// TestSweepStaleTartVMs_OnlyRuntimeTart_OncePerDistinctBench verifies the
+// tart sweep runs exactly once per distinct RuntimeTart Bench (deduped by
+// Name), and skips non-Tart Benches entirely — mirroring
+// TestSweepStaleContainers_OncePerDistinctBench's shape.
+func TestSweepStaleTartVMs_OnlyRuntimeTart_OncePerDistinctBench(t *testing.T) {
+	var calls []string
+	var gotBranch []string
+	original := sweepTartBench
+	sweepTartBench = func(ctx context.Context, b bench.Bench, nowMs int64, branchSlug string) ([]tartreaper.VM, error) {
+		calls = append(calls, b.Name)
+		gotBranch = append(gotBranch, branchSlug)
+		return nil, nil
+	}
+	t.Cleanup(func() { sweepTartBench = original })
+
+	benchesByOS := map[string][]bench.Bench{
+		"macos": {
+			{Name: "tart-a", OS: "macos", Runtime: bench.RuntimeTart},
+			{Name: "tart-a", OS: "macos", Runtime: bench.RuntimeTart}, // duplicate reference, same physical Bench
+			{Name: "docker-linux", OS: "macos", Runtime: bench.RuntimeDocker},
+		},
+		"linux": {
+			{Name: "docker-linux", OS: "linux", Runtime: bench.RuntimeDocker},
+		},
+	}
+
+	sweepStaleTartVMs(context.Background(), benchesByOS, "fix-foo", io.Discard)
+
+	if len(calls) != 1 || calls[0] != "tart-a" {
+		t.Fatalf("expected exactly 1 call for tart-a only, got %v", calls)
+	}
+	for _, branch := range gotBranch {
+		if branch != "fix-foo" {
+			t.Errorf("branchSlug passed to sweepTartBench = %q, want %q", branch, "fix-foo")
+		}
+	}
+}
+
+// TestSweepStaleTartVMs_ErrorDoesNotPanicOrStop verifies a sweep error on one
+// Tart Bench is logged and does not prevent sweeping the remaining Tart
+// Benches.
+func TestSweepStaleTartVMs_ErrorDoesNotPanicOrStop(t *testing.T) {
+	var calls []string
+	original := sweepTartBench
+	sweepTartBench = func(ctx context.Context, b bench.Bench, nowMs int64, branchSlug string) ([]tartreaper.VM, error) {
+		calls = append(calls, b.Name)
+		if b.Name == "tart-fail" {
+			return nil, errInjectedSweepFailure
+		}
+		return nil, nil
+	}
+	t.Cleanup(func() { sweepTartBench = original })
+
+	benchesByOS := map[string][]bench.Bench{
+		"macos": {
+			{Name: "tart-fail", OS: "macos", Runtime: bench.RuntimeTart},
+			{Name: "tart-ok", OS: "macos", Runtime: bench.RuntimeTart},
+		},
+	}
+
+	var stderr bytes.Buffer
+	sweepStaleTartVMs(context.Background(), benchesByOS, "fix-foo", &stderr)
+
+	if len(calls) != 2 {
+		t.Fatalf("expected both Tart benches attempted despite one failing, got %d calls: %v", len(calls), calls)
+	}
+	if stderr.String() == "" {
+		t.Error("expected the sweep error to be logged to stderr")
+	}
+}
+
+// TestSweepStaleTartVMs_ReportsReapedCount verifies a non-empty reaped slice
+// is reported to stderr, mirroring sweepStaleContainers' reporting.
+func TestSweepStaleTartVMs_ReportsReapedCount(t *testing.T) {
+	original := sweepTartBench
+	sweepTartBench = func(ctx context.Context, b bench.Bench, nowMs int64, branchSlug string) ([]tartreaper.VM, error) {
+		return []tartreaper.VM{{Name: "gsd-tart-a-run1", HasState: true}}, nil
+	}
+	t.Cleanup(func() { sweepTartBench = original })
+
+	benchesByOS := map[string][]bench.Bench{
+		"macos": {{Name: "tart-a", OS: "macos", Runtime: bench.RuntimeTart}},
+	}
+
+	var stderr bytes.Buffer
+	sweepStaleTartVMs(context.Background(), benchesByOS, "fix-foo", &stderr)
+
+	if !bytes.Contains(stderr.Bytes(), []byte("reaped 1 stale tart VM")) {
+		t.Errorf("expected reaped-count message in stderr, got %q", stderr.String())
 	}
 }

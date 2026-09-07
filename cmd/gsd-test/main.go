@@ -43,6 +43,7 @@ import (
 	"github.com/open-gsd/gsd-test-runner/internal/runrender"
 	"github.com/open-gsd/gsd-test-runner/internal/runspec"
 	"github.com/open-gsd/gsd-test-runner/internal/runstate"
+	"github.com/open-gsd/gsd-test-runner/internal/tartreaper"
 	"github.com/open-gsd/gsd-test-runner/internal/telemetry"
 	"github.com/open-gsd/gsd-test-runner/internal/worktree"
 )
@@ -765,13 +766,34 @@ func sweepScopeLabel(branchSlug string) string {
 	return branchSlug
 }
 
+// tartSweep is a package-level test seam for the internal/tartreaper.Sweep
+// call in runSweep's RuntimeTart branch, mirroring the stubbable-var pattern
+// used throughout this codebase (internal/tartpipeline's
+// runTart/execGuest/..., internal/runner's sweepBench/sweepTartBench). No
+// real Tart/SSH hardware is available in this repo's test environment, so
+// runSweep's dispatch-by-runtime logic is tested by swapping this var, not
+// against a real Bench. Real implementation delegates straight to
+// tartreaper.Sweep.
+var tartSweep = tartreaper.Sweep
+
 // runSweep implements `gsd-test sweep`: the manual front door onto the Tier-2
 // reaper's operator escape hatch (ADR-0029 §6 amendment) — `reaper.Sweep`
 // always supported an unscoped branchSlug="" mode, but nothing in the shipped
 // binary ever invoked it. This command is DESTRUCTIVE (it kills running
-// containers), so --all is never the default: with no flags, sweep is scoped
-// to the current branch only, the same safety property the automatic
-// on-next-contact sweep (dispatchRun, sweepStaleContainers) already has.
+// containers/VMs), so --all is never the default: with no flags, sweep is
+// scoped to the current branch only, the same safety property the automatic
+// on-next-contact sweep (dispatchRun, sweepStaleContainers, sweepStaleTartVMs)
+// already has.
+//
+// Covers BOTH runtimes in one invocation: each targeted Bench is dispatched
+// by b.Runtime — bench.RuntimeTart goes through internal/tartreaper.Sweep;
+// every other Runtime value (bench.RuntimeDocker, bench.RuntimeContainer, or
+// the unset/empty zero value, which bench.Bench.RuntimeBin documents as
+// defaulting to Docker) goes through the existing internal/reaper.Sweep +
+// dockerexec adapter path, unchanged. A human running `gsd-test sweep` does
+// not need to know or care which runtime backs which Bench — same reported
+// output shape/style (bench name, what was found/reaped, "nothing to clean
+// up", errors) for both.
 //
 // Exit codes: exitAllPass (0) when every targeted Bench's sweep completed
 // without error, even if nothing was reaped ("nothing to clean up" is
@@ -851,23 +873,45 @@ Flags:
 
 	exitCode := exitAllPass
 	for _, b := range targets {
-		runnerFn := func(ctx context.Context, args ...string) ([]byte, error) {
-			out, runErr := dockerexec.Run(ctx, b, args)
-			return []byte(out), runErr
-		}
 		fmt.Fprintf(stdout, "bench=%s: sweeping (branch=%s)...\n", b.Name, sweepScopeLabel(branchSlug))
-		reaped, sweepErr := reaper.Sweep(ctx, runnerFn, time.Now().UnixMilli(), branchSlug)
+		var sweepErr error
+		switch b.Runtime {
+		case bench.RuntimeTart:
+			var reaped []tartreaper.VM
+			reaped, sweepErr = tartSweep(ctx, b, time.Now().UnixMilli(), branchSlug)
+			if len(reaped) == 0 && sweepErr == nil {
+				fmt.Fprintf(stdout, "bench=%s: nothing to clean up\n", b.Name)
+			}
+			for _, v := range reaped {
+				// Tart VMs have no separate ID the way Docker containers do —
+				// Name is the identity — so it is reported in both the id= and
+				// name= fields to keep the exact same output shape as the
+				// Docker path below.
+				fmt.Fprintf(stdout, "bench=%s: reaped id=%s name=%s branch=%s\n", b.Name, v.Name, v.Name, v.BranchSlug)
+			}
+		default:
+			// bench.RuntimeDocker, bench.RuntimeContainer, or the unset/empty
+			// zero value — bench.Bench.RuntimeBin documents the zero value as
+			// defaulting to "docker", so an unset Runtime must not be skipped
+			// here.
+			runnerFn := func(ctx context.Context, args ...string) ([]byte, error) {
+				out, runErr := dockerexec.Run(ctx, b, args)
+				return []byte(out), runErr
+			}
+			var reaped []reaper.Container
+			reaped, sweepErr = reaper.Sweep(ctx, runnerFn, time.Now().UnixMilli(), branchSlug)
+			if len(reaped) == 0 && sweepErr == nil {
+				fmt.Fprintf(stdout, "bench=%s: nothing to clean up\n", b.Name)
+			}
+			for _, c := range reaped {
+				fmt.Fprintf(stdout, "bench=%s: reaped id=%s name=%s branch=%s\n", b.Name, c.ID, c.Name, c.BranchSlug)
+			}
+		}
 		if sweepErr != nil {
 			fmt.Fprintf(stderr, "bench=%s: sweep error: %v\n", b.Name, sweepErr)
 			exitCode = exitInconclusive
-			// Still report any successfully reaped containers below before moving on.
-		}
-		if len(reaped) == 0 {
-			fmt.Fprintf(stdout, "bench=%s: nothing to clean up\n", b.Name)
-			continue
-		}
-		for _, c := range reaped {
-			fmt.Fprintf(stdout, "bench=%s: reaped id=%s name=%s branch=%s\n", b.Name, c.ID, c.Name, c.BranchSlug)
+			// Still report any successfully reaped containers/VMs above before
+			// moving on.
 		}
 	}
 	return exitCode

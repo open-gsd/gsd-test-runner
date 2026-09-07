@@ -12,6 +12,7 @@ import (
 	"github.com/open-gsd/gsd-test-runner/internal/images"
 	"github.com/open-gsd/gsd-test-runner/internal/pipeline"
 	"github.com/open-gsd/gsd-test-runner/internal/tartexec"
+	"github.com/open-gsd/gsd-test-runner/internal/tartreaper"
 )
 
 // --- test seams -------------------------------------------------------
@@ -56,6 +57,15 @@ func stubRunSSHRaw(t *testing.T, fn func(ctx context.Context, sshArgs []string) 
 	t.Cleanup(func() { runSSHRaw = orig })
 }
 
+// stubRunShellOnBench swaps the package-level runShellOnBench var (used by
+// writeReaperState and Cleanup's state-file removal).
+func stubRunShellOnBench(t *testing.T, fn func(ctx context.Context, b bench.Bench, script string) (string, error)) {
+	t.Helper()
+	orig := runShellOnBench
+	runShellOnBench = fn
+	t.Cleanup(func() { runShellOnBench = orig })
+}
+
 // allGood wires every seam to a no-op success, so tests can override just
 // the one seam they care about.
 func allGood(t *testing.T) {
@@ -75,6 +85,7 @@ func allGood(t *testing.T) {
 		return "", nil
 	})
 	stubCopyFromBench(t, func(context.Context, bench.Bench, string, string) error { return nil })
+	stubRunShellOnBench(t, func(context.Context, bench.Bench, string) (string, error) { return "", nil })
 }
 
 func testBench() bench.Bench {
@@ -279,6 +290,90 @@ func TestStartContainer_WaitIPEmpty_VMStartError(t *testing.T) {
 	}
 	if vse.Stage != "wait_ip" {
 		t.Errorf("expected stage=wait_ip, got %q", vse.Stage)
+	}
+}
+
+// --- StartContainer: write_state (tartreaper state-file write) -----------
+
+func TestStartContainer_WritesReaperStateFile(t *testing.T) {
+	allGood(t)
+	var gotScript string
+	stubRunShellOnBench(t, func(_ context.Context, _ bench.Bench, script string) (string, error) {
+		gotScript = script
+		return "", nil
+	})
+	p, _ := newTestPipeline(t, 16)
+	p.ident = pipeline.ContainerIdentity{RunID: "run-123", BranchSlug: "fix-foo", DeadlineMs: 999000}
+	if err := p.StartContainer(context.Background()); err != nil {
+		t.Fatalf("expected nil, got %v", err)
+	}
+	if gotScript == "" {
+		t.Fatal("expected runShellOnBench to be called with a non-empty script")
+	}
+	if !strings.Contains(gotScript, "mkdir -p") || !strings.Contains(gotScript, tartreaper.StateDir) {
+		t.Errorf("expected script to mkdir -p the state dir, got %q", gotScript)
+	}
+	if !strings.Contains(gotScript, p.vmName+".json") {
+		t.Errorf("expected script to reference %s.json, got %q", p.vmName, gotScript)
+	}
+	// The JSON payload is single-quote-shell-escaped inside the script; a
+	// simple substring check on the (unquoted) field values is sufficient to
+	// verify the right identity was marshaled in.
+	if !strings.Contains(gotScript, `\"run_id\":\"run-123\"`) && !strings.Contains(gotScript, `"run_id":"run-123"`) {
+		t.Errorf("expected script to embed run_id=run-123, got %q", gotScript)
+	}
+	if !strings.Contains(gotScript, "fix-foo") {
+		t.Errorf("expected script to embed branch_slug=fix-foo, got %q", gotScript)
+	}
+	if !strings.Contains(gotScript, "999000") {
+		t.Errorf("expected script to embed deadline_ms=999000, got %q", gotScript)
+	}
+}
+
+func TestStartContainer_WriteStateFails_VMStartErrorStageWriteState_TriggersCleanup(t *testing.T) {
+	allGood(t)
+	stubRunShellOnBench(t, func(_ context.Context, _ bench.Bench, script string) (string, error) {
+		return "", &tartexec.ExecError{Stderr: "no space left on device", ExitCode: 1}
+	})
+	var seen []string
+	stubRunTart(t, func(_ context.Context, _ bench.Bench, args []string) (string, error) {
+		if len(args) > 0 {
+			seen = append(seen, args[0])
+		}
+		if len(args) > 0 && args[0] == "ip" {
+			return "10.0.0.5\n", nil
+		}
+		return "", nil
+	})
+	p, _ := newTestPipeline(t, 16)
+	err := p.StartContainer(context.Background())
+	var legErr *pipeline.LegError
+	if !errors.As(err, &legErr) {
+		t.Fatalf("expected *pipeline.LegError, got %T: %v", err, err)
+	}
+	var vse *VMStartError
+	if !errors.As(legErr.Cause, &vse) {
+		t.Fatalf("expected Cause=*VMStartError, got %T", legErr.Cause)
+	}
+	if vse.Stage != "write_state" {
+		t.Errorf("expected stage=write_state, got %q", vse.Stage)
+	}
+	if !p.vmStarted {
+		t.Fatal("expected vmStarted=true so Cleanup still attempts stop+delete after clone succeeded")
+	}
+	// set/boot/ip must NOT have run past the write_state failure.
+	for _, s := range seen {
+		if s == "set" || s == "ip" {
+			t.Errorf("expected StartContainer to stop at write_state, but saw tart %q invoked", s)
+		}
+	}
+
+	// Now exercise Cleanup directly (mirroring how RunAll's defer would call
+	// it) and assert stop+delete still fire.
+	seen = nil
+	p.Cleanup(context.Background())
+	if len(seen) != 2 || seen[0] != "stop" || seen[1] != "delete" {
+		t.Errorf("expected Cleanup to invoke [stop delete], got %v", seen)
 	}
 }
 
@@ -567,11 +662,44 @@ func TestCleanup_Started_StopsAndDeletes(t *testing.T) {
 		}
 		return "", nil
 	})
+	stubRunShellOnBench(t, func(context.Context, bench.Bench, string) (string, error) { return "", nil })
 	p, _ := newTestPipeline(t, 16)
 	p.vmStarted = true
 	p.Cleanup(context.Background())
 	if len(seen) != 2 || seen[0] != "stop" || seen[1] != "delete" {
 		t.Errorf("expected [stop delete], got %v", seen)
+	}
+}
+
+func TestCleanup_Started_RemovesStateFileAfterStopDelete(t *testing.T) {
+	var order []string
+	stubRunTart(t, func(_ context.Context, _ bench.Bench, args []string) (string, error) {
+		if len(args) > 0 {
+			order = append(order, "tart:"+args[0])
+		}
+		return "", nil
+	})
+	var gotScript string
+	stubRunShellOnBench(t, func(_ context.Context, _ bench.Bench, script string) (string, error) {
+		order = append(order, "shell")
+		gotScript = script
+		return "", nil
+	})
+	p, _ := newTestPipeline(t, 16)
+	p.vmStarted = true
+	p.Cleanup(context.Background())
+
+	want := []string{"tart:stop", "tart:delete", "shell"}
+	if len(order) != len(want) {
+		t.Fatalf("call order = %v, want %v", order, want)
+	}
+	for i := range want {
+		if order[i] != want[i] {
+			t.Fatalf("call order = %v, want %v", order, want)
+		}
+	}
+	if !strings.Contains(gotScript, "rm -f") || !strings.Contains(gotScript, tartreaper.StateDir) || !strings.Contains(gotScript, p.vmName+".json") {
+		t.Errorf("expected an `rm -f <stateDir>/%s.json` script, got %q", p.vmName, gotScript)
 	}
 }
 
