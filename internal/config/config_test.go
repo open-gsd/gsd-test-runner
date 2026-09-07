@@ -483,6 +483,31 @@ os = "linux"
 	}
 }
 
+func TestLoad_BenchWithTartRuntimeField(t *testing.T) {
+	path := writeTOML(t, `
+[[benches]]
+name = "bench-macos-tart"
+host = "mac-rig.local"
+os = "macos"
+runtime = "tart"
+`)
+
+	cfg, err := Load(path, LoadOptions{})
+	if err != nil {
+		t.Fatalf("Load returned error: %v", err)
+	}
+	if len(cfg.Registry) != 1 {
+		t.Fatalf("Registry len = %d, want 1", len(cfg.Registry))
+	}
+
+	if cfg.Registry[0].Runtime != bench.RuntimeTart {
+		t.Errorf("Registry[0].Runtime = %q, want %q (bench.RuntimeTart)", cfg.Registry[0].Runtime, bench.RuntimeTart)
+	}
+	if bench.RuntimeTart != "tart" {
+		t.Errorf("bench.RuntimeTart = %q, want %q", bench.RuntimeTart, "tart")
+	}
+}
+
 // --- Table-driven validation tests ---
 
 func TestValidateAndTransform_Errors(t *testing.T) {

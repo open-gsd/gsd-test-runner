@@ -20,6 +20,13 @@ const (
 	// Invokes the "container" binary (Apple's native container CLI, distinct
 	// from Docker). See ADR-0020.
 	RuntimeContainer = "container"
+
+	// RuntimeTart is the Tart runtime for macOS Benches. Invokes the "tart"
+	// binary (Cirrus Labs' Virtualization.framework-based CLI), which runs a
+	// real macOS guest VM — unlike RuntimeContainer (Apple Containers), which
+	// only supports Linux guests and was confirmed and rejected for macOS use
+	// in ADR-0030. See ADR-0030.
+	RuntimeTart = "tart"
 )
 
 // Bench is a remote SSH-reachable machine that runs containerized
@@ -45,8 +52,10 @@ type Bench struct {
 
 	// Runtime selects the container CLI binary for this Bench.
 	// Use RuntimeDocker (default, empty string maps to "docker") for Linux
-	// and Windows Benches. Use RuntimeContainer ("container") for macOS
-	// Benches running Apple Containers (macOS 26+). See ADR-0020 dec 2.
+	// and Windows Benches. RuntimeContainer ("container") is reserved and
+	// unused — Apple Containers only supports Linux guests, not macOS (see
+	// ADR-0020, ADR-0030). Use RuntimeTart ("tart") for macOS Benches
+	// running Tart, a real macOS-native guest runtime (ADR-0030).
 	Runtime string
 
 	// Platform optionally pins the OCI platform for container runs, e.g.
@@ -78,11 +87,21 @@ func (b Bench) DockerHost() string {
 // requires macOS 26 + a macos-26 GH Actions runner — see ADR-0020 amendment
 // (2026-05-24). Until then, macOS Benches use runtime="docker" with Docker
 // Desktop or colima providing the container runtime on the Mac.
+//
+// "tart" (RuntimeTart) is the ADR-0030 path that IS meant to be used for
+// macOS-native Bench execution, and is still under active implementation:
+// as of this change (#134 Phase 2), only config/selection plumbing exists —
+// no actual "tart" binary invocation is wired up anywhere in the codebase
+// yet.
 func (b Bench) RuntimeBin() string {
-	if b.Runtime == RuntimeContainer {
+	switch b.Runtime {
+	case RuntimeContainer:
 		return "container"
+	case RuntimeTart:
+		return "tart"
+	default:
+		return "docker"
 	}
-	return "docker"
 }
 
 // BenchDockerError is returned by any package that invokes docker against

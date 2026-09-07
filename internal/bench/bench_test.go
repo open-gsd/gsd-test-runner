@@ -78,6 +78,13 @@ func TestRuntimeBin_Container(t *testing.T) {
 	}
 }
 
+func TestRuntimeBin_Tart(t *testing.T) {
+	b := Bench{Name: "bench-macos-2", OS: "macos", Runtime: RuntimeTart}
+	if got := b.RuntimeBin(); got != "tart" {
+		t.Errorf("RuntimeBin() = %q, want %q", got, "tart")
+	}
+}
+
 func TestBench_Capacity_ZeroValueMeansUnset(t *testing.T) {
 	b := Bench{Name: "bench-linux-1", OS: "linux"}
 	if b.Capacity != 0 {

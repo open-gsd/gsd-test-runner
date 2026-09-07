@@ -145,7 +145,7 @@ A macOS Bench is a Mac with Docker installed — either Docker Desktop or colima
 
 > **Why isolation matters**: `npm ci` populates a node_modules directory; tests can write to disk; npm caches accumulate. Running these directly on your Mac clobbers your local state. The Linux container keeps the test environment ephemeral and reproducible — your Mac stays clean.
 >
-> **Why not native macOS containers?** Apple Containers (macOS-native sandboxing) requires macOS 26 and isn't yet available on GitHub Actions runners or most developer Macs. When it ships broadly, the `Runtime` field on `bench.Bench` is reserved to switch to it. See [ADR-0020](adr/0020-macos-bench-via-apple-containers.md).
+> **Why not native macOS containers?** Apple Containers (macOS-native sandboxing) was evaluated and permanently rejected as a path to macOS-native Bench execution: it only runs Linux containers as guests, not macOS, confirmed via Apple's own documentation — see [ADR-0020](adr/0020-macos-bench-via-apple-containers.md) and [ADR-0030](adr/0030-macos-bench-via-tart.md). The real path to macOS-native Bench execution is [Tart](adr/0030-macos-bench-via-tart.md) — set `runtime = "tart"` on a `[[benches]]` entry. This is in progress (issue #134): config/selection support exists as of this change, but full execution support does not yet.
 
 ### Install Docker on your Mac
 
