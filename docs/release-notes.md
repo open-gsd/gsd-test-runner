@@ -16,10 +16,21 @@ This page summarizes the recent releases so you can quickly decide what to adopt
 - `v1.8.0`: extends that to the standard `gsd-test` path (v1.7.0 covered run-and-die only) and fixes the leak behind it — Pipeline containers were unlabeled, so nothing ever reaped the ones a crashed run left behind
 - `v1.9.0`: macOS Bench via Tart (`runtime = "tart"`) — a real macOS guest with a hypervisor-enforced memory cap, additive alongside Docker-on-macOS — plus automated leak cleanup for both runtimes, a liveness signal for long Tart runs, and a manual `gsd-test sweep` command
 - `v1.9.1`: run containers no longer accumulate unreaped zombie processes over the course of a run
+- `v1.9.2`: the Linux Tester Image now includes `curl` and `jq`, so consumer bash-block tests that need them run instead of silently skipping
 
 ## Unreleased
 
 _Nothing yet — changes land here before the next tagged release._
+
+## v1.9.2
+
+### Changed
+
+- **The Linux Tester Image now ships `curl` and `jq`** (issue #154). Consumer test suites that run documented bash blocks gate on those tools and skip when they are missing. On the previous image every such suite skipped, and the `gsd-test` summary still showed `skipped 0`, so a green verdict did not exercise them. Both packages are added to the image's existing `apt-get install --no-install-recommends` line; the image grows by a few megabytes.
+
+### Why it matters
+
+Unlike v1.9.1, this release changes the **Tester Image**, not only the binary. To pick it up, set the Bench's expected `linux` image version to `v1.9.2` (the binary pulls the matching `:v1.9.2` tag). The Windows and macOS images are unchanged.
 
 ## v1.9.1
 
